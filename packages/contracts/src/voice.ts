@@ -39,6 +39,8 @@ export const voiceCallRecordSchema = z
     providerCallSid: providerCallSidSchema,
     accountSid: providerAccountSidSchema,
     version: z.number().int().positive(),
+    // Existing version-two records predate durable policy; their epoch is one.
+    policyVersion: z.number().int().positive().optional(),
     state: voiceCallStateSchema,
     generation: id,
     leaseExpiresAt: instant,

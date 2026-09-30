@@ -3101,3 +3101,164 @@ input.switch:checked::before {
     transition-duration: 0.01ms !important;
   }
 }
+
+.phone-operations {
+  display: grid;
+  gap: 24px;
+}
+.sidebar {
+  overflow-y: auto;
+}
+.phone-policy-form,
+.phone-detail-status,
+.phone-context {
+  padding: 0 26px 26px;
+}
+.phone-policy-note {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.8;
+  margin: 0 0 24px;
+}
+.phone-policy-form .toggle-row {
+  margin-bottom: 20px;
+  padding-bottom: 20px;
+}
+.phone-policy-form .phone-feature-status {
+  color: #667b60;
+  font-size: 11px;
+}
+.phone-policy-form .switch {
+  flex-shrink: 0;
+}
+.phone-policy-footer,
+.phone-call-actions,
+.phone-reconcile {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.phone-policy-footer {
+  justify-content: space-between;
+  margin-top: 22px;
+}
+.phone-call-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.phone-call-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 23px 26px;
+  border-top: 1px solid var(--border);
+}
+.phone-call-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  min-width: 0;
+}
+.phone-call-main > svg {
+  flex-shrink: 0;
+  color: #809579;
+  margin-top: 2px;
+}
+.phone-call-main strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+.phone-call-main p,
+.phone-detail-status > p,
+.phone-context-block > p {
+  font-size: 13px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+  margin: 9px 0;
+}
+.phone-call-main p {
+  color: var(--muted);
+}
+.phone-call-actions {
+  align-items: flex-end;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 12px;
+}
+.phone-call-actions .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.phone-detail-status .notice {
+  margin-top: 18px;
+  margin-bottom: 0;
+}
+.phone-detail-card > .notice {
+  margin-left: 26px;
+  margin-right: 26px;
+}
+.phone-reconcile {
+  margin-top: 19px;
+  flex-wrap: wrap;
+}
+.phone-context {
+  display: grid;
+  gap: 18px;
+}
+.phone-context-block {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #fcfdf9;
+  padding: 22px;
+  overflow-wrap: anywhere;
+}
+.phone-context-block h3 {
+  margin: 0 0 13px;
+  font: 22px/1.3 var(--serif);
+}
+.phone-context-block .text-button {
+  display: inline-flex;
+  gap: 7px;
+  align-items: center;
+  margin-top: 8px;
+}
+.phone-context-block.phone-unconfirmed {
+  background: #fdfbf5;
+  border-color: #ebe4d4;
+}
+.phone-context-block .phone-readback {
+  border-left: 2px solid #d9caad;
+  padding-left: 15px;
+  white-space: pre-wrap;
+}
+@media (max-width: 700px) {
+  .phone-policy-form,
+  .phone-detail-status,
+  .phone-context {
+    padding: 0 20px 22px;
+  }
+  .phone-call-row {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 22px 20px;
+  }
+  .phone-call-actions {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 15px;
+  }
+  .phone-policy-footer {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .phone-context-block {
+    padding: 19px;
+  }
+  .phone-policy-card .section-heading {
+    flex-wrap: wrap;
+  }
+}

@@ -5,6 +5,7 @@ import { loadVoiceConfig, type EnabledVoiceConfig } from '../apps/voice-gateway/
 import { createVoiceGateway, type ProviderSocket } from '../apps/voice-gateway/src/gateway.js';
 import { AudioRelay, type AudioPeer } from '../apps/voice-gateway/src/relay.js';
 import type { VoiceApiClient } from '../apps/voice-gateway/src/client.js';
+import type { CallController } from '../apps/voice-gateway/src/control.js';
 import { CallRegistry } from '../apps/voice-gateway/src/registry.js';
 import { voiceInstructions } from '../apps/voice-gateway/src/context.js';
 import type { Restaurant } from '../packages/contracts/src/index.js';
@@ -162,8 +163,15 @@ function fixtureApi(): VoiceApiClient {
         outcome: null,
         actionsEnabled: false,
         transfersEnabled: false,
+        configurationVersion: restaurant.version,
       };
     }),
+    policy: vi.fn<VoiceApiClient['policy']>(async () => ({
+      allowed: true,
+      configurationVersion: restaurant.version,
+      actionsEnabled: true,
+      transfersEnabled: true,
+    })),
     end: vi.fn<VoiceApiClient['end']>(async ({ providerCallSid }) => {
       const entry = entries.get(providerCallSid);
       if (entry) entry.ended = true;
@@ -194,6 +202,360 @@ function fixtureApi(): VoiceApiClient {
     }),
   };
 }
+
+async function openTestStream(
+  api: VoiceApiClient,
+  clock?: () => number,
+  cfg = config(),
+  controller?: CallController,
+) {
+  const provider = new Peer();
+  const connect = vi.fn(() => provider);
+  const app = await createVoiceGateway(cfg, {
+    api,
+    connectProvider: connect,
+    ...(clock ? { now: clock } : {}),
+    ...(controller ? { controller } : {}),
+  });
+  await app.ready();
+  const admission = await app.inject(callback());
+  const socket = await app.injectWS('/twilio/media', { headers: socketHeaders });
+  const playback: Array<Record<string, unknown>> = [];
+  socket.on('message', (data) => playback.push(JSON.parse(data.toString())));
+  socket.send(connected);
+  socket.send(JSON.stringify(start(grant(admission.body))));
+  await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
+  provider.emit('open');
+  provider.emit('message', JSON.stringify({ type: 'session.updated' }), false);
+  const response = (id = 'policy-response') =>
+    provider.emit('message', JSON.stringify({ type: 'response.created', response: { id } }), false);
+  const audio = (bytes = 800, id = 'policy-response') =>
+    provider.emit(
+      'message',
+      JSON.stringify({
+        type: 'response.output_audio.delta',
+        response_id: id,
+        item_id: 'policy-item',
+        content_index: 0,
+        delta: Buffer.alloc(bytes).toString('base64'),
+      }),
+      false,
+    );
+  return { app, socket, provider, connect, playback, response, audio };
+}
+
+describe('current phone policy and knowledge boundaries', () => {
+  it.each(['revoked', 'revision', 'outage'] as const)(
+    'stops both peers and clears queued playback after heartbeat %s',
+    async (scenario) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true, advanceTimeDelta: 10 });
+      const api = fixtureApi();
+      const originalPolicy = api.policy;
+      let policyChecks = 0;
+      api.policy = vi.fn<VoiceApiClient['policy']>(async (binding, signal) => {
+        if (++policyChecks === 1) return originalPolicy(binding, signal);
+        if (scenario === 'outage') throw new Error('Private service diagnostic');
+        return {
+          allowed: scenario !== 'revoked',
+          configurationVersion: scenario === 'revision' ? 2 : 1,
+          actionsEnabled: true,
+          transfersEnabled: true,
+        };
+      });
+      const f = await openTestStream(api);
+      try {
+        f.response();
+        f.audio();
+        await vi.waitFor(() =>
+          expect(f.playback.some((event) => event.event === 'media')).toBe(true),
+        );
+        await vi.advanceTimersByTimeAsync(5000);
+        await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
+        expect(f.playback.some((event) => event.event === 'clear')).toBe(true);
+        expect(api.end).toHaveBeenCalledWith(
+          expect.objectContaining({ providerCallSid: call, reason: 'stream_closed' }),
+        );
+        const providerEvents = f.provider.events.length;
+        const checks = policyChecks;
+        f.response('late-response');
+        f.audio(800, 'late-response');
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(f.provider.events).toHaveLength(providerEvents);
+        expect(policyChecks).toBe(checks);
+      } finally {
+        vi.useRealTimers();
+        await f.app.close();
+      }
+    },
+  );
+
+  it('does not open an AI provider when current policy is denied after grant redemption', async () => {
+    const api = fixtureApi();
+    api.policy = vi.fn<VoiceApiClient['policy']>(async () => ({
+      allowed: false,
+      configurationVersion: 1,
+      actionsEnabled: false,
+      transfersEnabled: false,
+    }));
+    const connect = vi.fn(() => new Peer());
+    const app = await createVoiceGateway(config(), { api, connectProvider: connect });
+    await app.ready();
+    try {
+      const admission = await app.inject(callback());
+      const socket = await app.injectWS('/twilio/media', { headers: socketHeaders });
+      const closed = once(socket, 'close');
+      socket.send(connected);
+      socket.send(JSON.stringify(start(grant(admission.body))));
+      await closed;
+      expect(connect).not.toHaveBeenCalled();
+      expect(api.end).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'stream_closed', generation: expect.any(String) }),
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it.each(['allowed', 'denied', 'terminal', 'overflow', 'interrupted'] as const)(
+    'buffers a new response until current policy resolves (%s)',
+    async (scenario) => {
+      let clock = Date.now();
+      const api = fixtureApi();
+      const originalPolicy = api.policy;
+      let release: ((policy: Awaited<ReturnType<VoiceApiClient['policy']>>) => void) | undefined;
+      let pendingSignal: AbortSignal | undefined;
+      let checks = 0;
+      api.policy = vi.fn<VoiceApiClient['policy']>(async (binding, signal) => {
+        if (++checks === 1) return originalPolicy(binding, signal);
+        pendingSignal = signal;
+        return new Promise<Awaited<ReturnType<VoiceApiClient['policy']>>>((resolve) => {
+          release = resolve;
+        });
+      });
+      const f = await openTestStream(api, () => clock);
+      try {
+        clock += 1001;
+        f.response();
+        f.audio(scenario === 'overflow' ? 16_001 : 800);
+        if (scenario === 'overflow') {
+          await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
+          expect(f.playback.some((event) => event.event === 'media')).toBe(false);
+          return;
+        }
+        await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+        expect(f.playback.some((event) => event.event === 'media')).toBe(false);
+        expect(api.policy).toHaveBeenCalledTimes(2);
+        if (scenario === 'terminal') {
+          await f.app.inject(
+            callback('/twilio/status', { ...callbackParams(), CallStatus: 'completed' }),
+          );
+          expect(pendingSignal?.aborted).toBe(true);
+        }
+        if (scenario === 'interrupted') {
+          f.provider.emit(
+            'message',
+            JSON.stringify({ type: 'input_audio_buffer.speech_started' }),
+            false,
+          );
+          expect(f.provider.events).toContainEqual({
+            type: 'response.cancel',
+            response_id: 'policy-response',
+          });
+        }
+        release?.({
+          allowed: scenario !== 'denied',
+          configurationVersion: 1,
+          actionsEnabled: true,
+          transfersEnabled: true,
+        });
+        if (scenario === 'allowed')
+          await vi.waitFor(() =>
+            expect(f.playback.some((event) => event.event === 'media')).toBe(true),
+          );
+        else if (scenario === 'interrupted') {
+          f.provider.emit(
+            'message',
+            JSON.stringify({
+              type: 'response.done',
+              response: { id: 'policy-response', status: 'cancelled' },
+            }),
+            false,
+          );
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          await vi.waitFor(() => expect(f.provider.readyState).toBe(1));
+          expect(f.playback.some((event) => event.event === 'media')).toBe(false);
+        } else {
+          await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
+          expect(f.playback.some((event) => event.event === 'media')).toBe(false);
+        }
+        expect(api.policy).toHaveBeenCalledTimes(2);
+      } finally {
+        await f.app.close();
+      }
+    },
+  );
+
+  it('bounds an unresponsive policy check and aborts remaining work on close', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true, advanceTimeDelta: 10 });
+    const api = fixtureApi();
+    const originalPolicy = api.policy;
+    let checks = 0;
+    let pendingSignal: AbortSignal | undefined;
+    api.policy = vi.fn<VoiceApiClient['policy']>(async (binding, signal) => {
+      if (++checks === 1) return originalPolicy(binding, signal);
+      pendingSignal = signal;
+      return new Promise<Awaited<ReturnType<VoiceApiClient['policy']>>>(() => {});
+    });
+    const f = await openTestStream(api);
+    try {
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(api.policy).toHaveBeenCalledTimes(2);
+      expect(f.provider.readyState).toBe(1);
+      await vi.advanceTimersByTimeAsync(3000);
+      await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
+      expect(pendingSignal?.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(api.policy).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+      await f.app.close();
+    }
+  });
+
+  it.each(['denied', 'outage', 'rejected_resume'] as const)(
+    'preserves controlled dispatch and closes a denied resume after a late audio heartbeat (%s)',
+    async (scenario) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true, advanceTimeDelta: 10 });
+      const cfg = loadVoiceConfig({ ...environment, VOICE_ACTIONS_ENABLED: 'true' });
+      if (!cfg.enabled) throw new Error('disabled');
+      const api = fixtureApi();
+      const originalRedeem = api.redeem;
+      api.redeem = vi.fn(async (input) => ({
+        ...(await originalRedeem(input)),
+        actionsEnabled: true,
+      }));
+      const originalPolicy = api.policy;
+      let checks = 0;
+      let finishPolicy: (() => void) | undefined;
+      api.policy = vi.fn<VoiceApiClient['policy']>(async (binding, signal) => {
+        if (++checks <= 2) return originalPolicy(binding, signal);
+        if (checks > 3) throw new Error('Voice policy remains unavailable');
+        await new Promise<void>((resolve) => {
+          finishPolicy = resolve;
+        });
+        if (scenario !== 'denied') throw new Error('Private service diagnostic');
+        return {
+          allowed: false,
+          configurationVersion: 1,
+          actionsEnabled: false,
+          transfersEnabled: false,
+        };
+      });
+      const controlId = randomUUID();
+      api.propose = vi.fn(async () => ({ controlId, twiml: '<Response/>' }));
+      api.dispatch = vi.fn(async () => ({
+        dispatch: true,
+        twiml: '<Response><Say>Canonical controlled readback</Say></Response>',
+        unavailable: false,
+      }));
+      if (scenario === 'rejected_resume')
+        api.dispatched = vi.fn(async () => {
+          // Let the old heartbeat's failure settle during the known-unsent
+          // rejection transition, before its in-flight handle is cleared.
+          await Promise.resolve();
+          return { state: 'STREAMING' as const };
+        });
+      let finishDispatch: (() => void) | undefined;
+      const controller: CallController = {
+        dispatch: vi.fn<CallController['dispatch']>(async () => {
+          await new Promise<void>((resolve) => {
+            finishDispatch = resolve;
+          });
+          if (scenario === 'rejected_resume')
+            return { outcome: 'rejected', code: 'PROVIDER_REJECTED' };
+          return { outcome: 'accepted' };
+        }),
+      };
+      let clock = Date.now();
+      const f = await openTestStream(api, () => clock, cfg, controller);
+      try {
+        f.socket.send(
+          JSON.stringify({
+            event: 'media',
+            sequenceNumber: '2',
+            streamSid: stream,
+            media: {
+              track: 'inbound',
+              timestamp: '0',
+              chunk: '1',
+              payload: Buffer.alloc(160).toString('base64'),
+            },
+          }),
+        );
+        await vi.waitFor(() =>
+          expect(
+            f.provider.events.some((event) => event.type === 'input_audio_buffer.append'),
+          ).toBe(true),
+        );
+        for (const event of [
+          { type: 'input_audio_buffer.speech_started', item_id: 'message1', audio_start_ms: 0 },
+          { type: 'input_audio_buffer.speech_stopped', item_id: 'message1', audio_end_ms: 20 },
+          { type: 'conversation.item.added', item: { id: 'message1', role: 'user' } },
+        ])
+          f.provider.emit('message', JSON.stringify(event), false);
+        clock += 1001;
+        f.response();
+        await vi.waitFor(() => expect(api.policy).toHaveBeenCalledTimes(2));
+        await vi.advanceTimersByTimeAsync(5000);
+        await vi.waitFor(() => expect(finishPolicy).toBeTypeOf('function'));
+        f.provider.emit(
+          'message',
+          JSON.stringify({
+            type: 'response.function_call_arguments.done',
+            response_id: 'policy-response',
+            call_id: 'message-tool',
+            name: 'prepare_message',
+            arguments: JSON.stringify({
+              name: 'Synthetic Guest',
+              callbackNumber: '+12125550111',
+              message: 'Please call about a private dinner.',
+            }),
+          }),
+          false,
+        );
+        await vi.waitFor(() => expect(finishDispatch).toBeTypeOf('function'));
+        finishPolicy?.();
+        if (scenario !== 'rejected_resume') {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(f.provider.readyState).toBe(1);
+          expect(api.end).not.toHaveBeenCalled();
+          expect(controller.dispatch).toHaveBeenCalledOnce();
+        }
+        finishDispatch?.();
+        await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
+        expect(api.dispatched).toHaveBeenCalledWith(
+          expect.objectContaining({
+            controlId,
+            outcome: scenario === 'rejected_resume' ? 'rejected' : 'accepted',
+          }),
+        );
+        expect(controller.dispatch).toHaveBeenCalledOnce();
+        if (scenario === 'rejected_resume') {
+          expect(api.policy).toHaveBeenCalledTimes(3);
+          expect(api.end).toHaveBeenCalledWith(
+            expect.objectContaining({ reason: 'stream_closed' }),
+          );
+          expect(JSON.stringify(f.provider.events)).not.toContain('The server could not begin');
+        }
+      } finally {
+        finishPolicy?.();
+        finishDispatch?.();
+        vi.useRealTimers();
+        await f.app.close();
+      }
+    },
+  );
+});
 
 describe('voice admission and limits', () => {
   it('is disabled without secrets and refuses incomplete or production activation', async () => {

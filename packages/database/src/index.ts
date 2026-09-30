@@ -9,11 +9,15 @@ import {
   callSummarySchema,
   idSchema,
   inboxItemSchema,
+  handoffSchema,
+  phonePolicySchema,
   restaurantSchema,
   voiceCallRecordSchema,
   type CallSession,
   type CallSummary,
   type InboxItem,
+  type Handoff,
+  type PhonePolicy,
   type Restaurant,
   type VoiceCallRecord,
 } from '@hostline/contracts';
@@ -43,6 +47,8 @@ export class PersistenceError extends Error {
 export interface TenantTransaction {
   getRestaurant(): Promise<Restaurant>;
   saveRestaurant(value: Restaurant, expectedVersion: number): Promise<void>;
+  getPhonePolicy(): Promise<PhonePolicy>;
+  savePhonePolicy(value: PhonePolicy, expectedVersion: number): Promise<void>;
   listInbox(options?: { offset?: number; limit?: number }): Promise<InboxItem[]>;
   getInbox(id: string): Promise<InboxItem | null>;
   insertInbox(item: InboxItem): Promise<void>;
@@ -53,10 +59,13 @@ export interface TenantTransaction {
   saveCall(call: CallSession, expectedVersion: number): Promise<void>;
   getVoiceCall(providerCallSid: string): Promise<VoiceCallRecord | null>;
   getVoiceCallById(id: string): Promise<VoiceCallRecord | null>;
+  listVoiceCalls(options?: { offset?: number; limit?: number }): Promise<VoiceCallRecord[]>;
   insertVoiceCall(call: VoiceCallRecord): Promise<void>;
   saveVoiceCall(call: VoiceCallRecord, expectedVersion: number): Promise<void>;
   countActiveVoiceCalls(now: Date): Promise<number>;
   lockVoiceAdmission(): Promise<void>;
+  getHandoff(callId: string): Promise<Handoff | null>;
+  saveHandoff(value: Handoff): Promise<void>;
   getReceipt(key: string): Promise<{ fingerprint: string; result: unknown } | null>;
   putReceipt(key: string, fingerprint: string, result: unknown): Promise<void>;
   audit(actorId: string, action: string, resourceId: string): Promise<void>;
@@ -161,6 +170,51 @@ class Transaction implements TenantTransaction {
       await this.query(
         'UPDATE restaurants SET version = $2, document = $3::jsonb WHERE tenant_id = $1 AND version = $4',
         [this.tenantId, restaurant.version, JSON.stringify(restaurant), expectedVersion],
+      ),
+    );
+  }
+  async getPhonePolicy(): Promise<PhonePolicy> {
+    const read = async () =>
+      (await this.query('SELECT document FROM phone_policies WHERE tenant_id=$1', [this.tenantId]))
+        .rows[0];
+    let row = await read();
+    if (!row) {
+      // A tenant provisioned after migration may not yet have a policy row.
+      // Serialize initialization on its existing restaurant before inserting;
+      // do not lock a missing row or race an owner policy update.
+      await this.lockVoiceAdmission();
+      const policy: PhonePolicy = {
+        version: 1,
+        voiceEnabled: true,
+        requestsEnabled: true,
+        transfersEnabled: true,
+        updatedAt: new Date().toISOString(),
+      };
+      await this.query(
+        'INSERT INTO phone_policies(tenant_id,version,voice_enabled,requests_enabled,transfers_enabled,updated_at,document) VALUES($1,1,true,true,true,$2,$3::jsonb) ON CONFLICT(tenant_id) DO NOTHING',
+        [this.tenantId, policy.updatedAt, JSON.stringify(policy)],
+      );
+      row = await read();
+    }
+    if (!row) throw new PersistenceError('NOT_FOUND', 404, 'Restaurant policy not found.');
+    return phonePolicySchema.parse(documentSchema.parse(row).document);
+  }
+  async savePhonePolicy(value: PhonePolicy, expectedVersion: number): Promise<void> {
+    const policy = phonePolicySchema.parse(value);
+    nextVersion(policy.version, expectedVersion);
+    requireUpdated(
+      await this.query(
+        'UPDATE phone_policies SET version=$2,voice_enabled=$3,requests_enabled=$4,transfers_enabled=$5,updated_at=$6,document=$7::jsonb WHERE tenant_id=$1 AND version=$8',
+        [
+          this.tenantId,
+          policy.version,
+          policy.voiceEnabled,
+          policy.requestsEnabled,
+          policy.transfersEnabled,
+          policy.updatedAt,
+          JSON.stringify(policy),
+          expectedVersion,
+        ],
       ),
     );
   }
@@ -273,6 +327,24 @@ class Transaction implements TenantTransaction {
     ).rows[0];
     return row ? voiceCallRecordSchema.parse(documentSchema.parse(row).document) : null;
   }
+  async listVoiceCalls(
+    options: { offset?: number; limit?: number } = {},
+  ): Promise<VoiceCallRecord[]> {
+    const pagination = z
+      .object({
+        offset: z.number().int().min(0).max(100_000).default(0),
+        limit: z.number().int().min(1).max(100).default(50),
+      })
+      .strict()
+      .parse(options);
+    const result = await this.query(
+      'SELECT v.document FROM voice_calls v JOIN calls c ON(c.tenant_id=v.tenant_id AND c.id=v.id) WHERE v.tenant_id=$1 ORDER BY c.created_at DESC,v.id LIMIT $2 OFFSET $3',
+      [this.tenantId, pagination.limit, pagination.offset],
+    );
+    return result.rows.map((row) =>
+      voiceCallRecordSchema.parse(documentSchema.parse(row).document),
+    );
+  }
   async insertVoiceCall(value: VoiceCallRecord): Promise<void> {
     const call = voiceCallRecordSchema.parse(value);
     await this.query(
@@ -330,6 +402,37 @@ class Transaction implements TenantTransaction {
       ])
     ).rows[0];
     if (!row) throw new PersistenceError('NOT_FOUND', 404, 'Restaurant not found.');
+  }
+  async getHandoff(callId: string): Promise<Handoff | null> {
+    const row = (
+      await this.query('SELECT document FROM phone_handoffs WHERE tenant_id=$1 AND call_id=$2', [
+        this.tenantId,
+        idSchema.parse(callId),
+      ])
+    ).rows[0];
+    return row ? handoffSchema.parse(documentSchema.parse(row).document) : null;
+  }
+  async saveHandoff(value: Handoff): Promise<void> {
+    const handoff = handoffSchema.parse(value);
+    // The API first persists its transfer control under the restaurant admission
+    // lock. A stale control cannot replace that call's current staff context.
+    requireUpdated(
+      await this.query(
+        `INSERT INTO phone_handoffs(tenant_id,call_id,control_id,reason,summary,created_at,document)
+        SELECT tenant_id,id,$3::uuid,$4,$5,$6::timestamptz,$7::jsonb FROM voice_calls
+        WHERE tenant_id=$1 AND id=$2 AND document->>'controlKind'='transfer' AND document->>'controlId'=$3::uuid::text
+        ON CONFLICT(tenant_id,call_id) DO UPDATE SET control_id=EXCLUDED.control_id,reason=EXCLUDED.reason,summary=EXCLUDED.summary,created_at=EXCLUDED.created_at,document=EXCLUDED.document`,
+        [
+          this.tenantId,
+          handoff.callId,
+          handoff.controlId,
+          handoff.reason,
+          handoff.summary,
+          handoff.createdAt,
+          JSON.stringify(handoff),
+        ],
+      ),
+    );
   }
   async getReceipt(key: string): Promise<{ fingerprint: string; result: unknown } | null> {
     const row = (
@@ -414,6 +517,7 @@ function pgClient(client: pg.PoolClient): SqlClient {
 const migrations = [
   { version: 1, file: '001_initial.sql' },
   { version: 2, file: '002_voice_calls.sql' },
+  { version: 3, file: '003_phone_operations.sql' },
 ] as const;
 
 async function readMigration(file: string): Promise<string> {
@@ -532,7 +636,7 @@ export async function createDatabase(
         await client.query("SET LOCAL lock_timeout = '2000ms'");
         await client.query("SELECT set_config('hostline.tenant_id', $1, true)", [tenantId ?? '']);
         const safety = await client.query(
-          "SELECT rolsuper, rolbypassrls, EXISTS (SELECT FROM pg_class WHERE relname IN ('restaurants','calls','inbox','voice_calls','receipts','audit_events','outbox','jobs') AND relowner = pg_roles.oid) AS owns_tables FROM pg_roles WHERE rolname = current_user",
+          "SELECT rolsuper, rolbypassrls, EXISTS (SELECT FROM pg_class WHERE relname IN ('restaurants','calls','inbox','voice_calls','phone_policies','phone_handoffs','receipts','audit_events','outbox','jobs') AND relowner = pg_roles.oid) AS owns_tables FROM pg_roles WHERE rolname = current_user",
         );
         if (
           safety.rows[0]?.rolsuper !== false ||
@@ -590,6 +694,8 @@ export async function createDatabase(
       await withTenant(seed.restaurant.id, async (tx) => {
         const client = new TransactionClient(tx);
         await client.insertSeedRestaurant(seed.restaurant);
+        await tx.lockVoiceAdmission();
+        await tx.getPhonePolicy();
         for (const call of seed.calls) if (!(await tx.getCall(call.id))) await tx.insertCall(call);
         for (const item of seed.inbox)
           if (!(await tx.getInbox(item.id))) await tx.insertInbox(item);

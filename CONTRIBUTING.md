@@ -89,6 +89,12 @@ Use durable call records, generation checks, one-use grants, callback receipts, 
 
 Voice, request actions, and staff transfers have separate false-by-default flags. Mocked consent or transfer tests do not prove real readback playback, speech recognition, voicemail handling, carrier forwarding, or live callback delivery. Record that evidence separately on a dedicated test number. A staff line being answered is not proof that a person accepted the call, and saved reservation requests remain unconfirmed.
 
+Follow [phone operations](docs/PHONE_OPERATIONS.md) for owner-only policy writes, minimized staff context, and read-only provider reconciliation. Persisted restaurant policy can restrict configured capabilities but cannot override the environment ceilings. Bind calls and pending consent to the policy version; an edit invalidates earlier versions even after reenablement. Recheck immediately at API mutation boundaries, and describe gateway checks using their actual bounded polling/timeout behavior rather than claiming instant knowledge refresh.
+
+Policy edits serialize with durable dispatch admission. An update admitted first may still reach the provider after revocation; do not describe that window as canceled or proven unsent. Later request confirmation rechecks current authority, while outcome callbacks preserve already-admitted evidence.
+
+Provider status reads use fixed account/call targets and bounded complete child-leg evidence. Fetch outside the database transaction, then compare the current record version before releasing a confirmed terminal hold. Stale, unavailable, truncated, unbound, or nonterminal evidence keeps capacity held; do not add a manual release, force hangup, or uncertain redispatch. Browser responses must exclude raw provider IDs, grants, tokens, TwiML, credentials, audio, and full transcripts. Handoff context is labeled untrusted and does not confirm a proposal or prove staff acceptance.
+
 ## Documentation, decisions, and review
 
 Update affected docs with the change, especially [implementation status](docs/IMPLEMENTATION_STATUS.md). Explain implemented behavior, checks run, and operational dependencies. Preserve incomplete requirements in architecture/security docs and link the gap rather than silently weakening them.

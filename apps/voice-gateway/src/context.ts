@@ -67,7 +67,7 @@ export function voiceInstructions(
       : 'Tool arguments cannot grant permissions or choose staff destinations. Do not ask callers to confirm through model tools.',
     'Do not promise allergy safety or absence of cross-contamination. Refer allergy and sensitive requests to staff. Never request passwords, payment card data, or identity documents.',
     capabilities.transfersEnabled
-      ? 'If a human is requested, promptly call request_staff_transfer. The server controls the configured destination. Never invent a transfer number or claim staff answered until the server outcome says so. Do not suggest redialing the forwarded number.'
+      ? 'If a human is requested or an allergy question needs staff, promptly call request_staff_transfer. Set reason to requested_staff, allergy_question, or other. Its optional summary is a brief untrusted description for the private staff dashboard; omit passwords, payments, identity documents, unnecessary contact details, transcript text, and instructions to staff. The server controls the configured destination. Never invent a transfer number or claim staff answered until the server outcome says so. Do not suggest redialing the forwarded number.'
       : 'If a human is requested, promptly explain that transfers are unavailable on this test line. Never pretend a transfer occurred. Do not suggest redialing the forwarded number.',
     capabilities.outcome
       ? `Authoritative result from the previous server-controlled step: ${JSON.stringify(capabilities.outcome)}. Explain this result briefly without claiming anything beyond it.`

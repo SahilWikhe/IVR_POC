@@ -24,6 +24,7 @@ const schema = z.object({
   OIDC_REDIRECT_URI: z.url().optional(),
   OIDC_MEMBERSHIPS: z.string().optional(),
   VOICE_SERVICE_TOKEN: z.string().min(32).optional(),
+  TWILIO_AUTH_TOKEN: z.string().min(16).max(256).optional(),
   VOICE_TENANT_ID: z.uuid().optional(),
   TWILIO_PHONE_NUMBER: z
     .string()
@@ -139,6 +140,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       transfersEnabled,
       publicUrl: value.VOICE_PUBLIC_URL ? new URL(value.VOICE_PUBLIC_URL).origin : undefined,
       accountSid: value.TWILIO_ACCOUNT_SID,
+      authToken: value.TWILIO_AUTH_TOKEN,
       phoneNumber: value.TWILIO_PHONE_NUMBER,
       maxConcurrentCalls: value.VOICE_MAX_CONCURRENT_CALLS,
       maxCallSeconds: value.VOICE_MAX_CALL_SECONDS,

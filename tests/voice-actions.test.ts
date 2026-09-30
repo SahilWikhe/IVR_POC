@@ -262,6 +262,42 @@ describe('voice proposal boundaries and trusted date references', () => {
     f.event({ type: 'input_audio_buffer.speech_started', item_id: 'u1', audio_start_ms: 5000 });
     expect(f.close).toHaveBeenCalledOnce();
   });
+
+  it.each([
+    { args: {}, context: { reason: 'requested_staff', summary: '' } },
+    {
+      args: { reason: 'allergy_question', summary: 'Caller asks about cross-contamination.' },
+      context: { reason: 'allergy_question', summary: 'Caller asks about cross-contamination.' },
+    },
+  ])(
+    'passes bounded staff context only to deterministic call control ($context.reason)',
+    async ({ args, context }) => {
+      const onTool = vi.fn(async (_request: VoiceToolRequest) => 'controlled' as const);
+      const f = fixture(onTool);
+      f.input();
+      f.utterance('staff-request', 0, 300);
+      f.tool('request_staff_transfer', args);
+      await vi.waitFor(() => expect(onTool).toHaveBeenCalledOnce());
+      expect(onTool.mock.calls[0]?.[0]).toMatchObject({ kind: 'transfer', context });
+      expect(JSON.stringify(f.provider.events)).not.toContain(context.summary || 'no-such-context');
+      f.relay.close();
+    },
+  );
+
+  it.each([
+    { reason: 'unsupported' },
+    { summary: 'x'.repeat(301) },
+    { destination: '+12125550100' },
+    { tenantId: environment.VOICE_TENANT_ID },
+  ])('rejects invalid or authority-expanding transfer context ($reason)', (args) => {
+    const onTool = vi.fn(async (_request: VoiceToolRequest) => 'controlled' as const);
+    const f = fixture(onTool);
+    f.input();
+    f.utterance('staff-request', 0, 300);
+    f.tool('request_staff_transfer', args);
+    expect(onTool).not.toHaveBeenCalled();
+    f.relay.close();
+  });
 });
 
 describe('bounded scoped internal voice client', () => {
@@ -317,5 +353,51 @@ describe('bounded scoped internal voice client', () => {
       'Invalid voice activation',
     );
     expect(loadVoiceConfig({})).toEqual({ enabled: false, port: 3002 });
+  });
+
+  it('validates current-policy responses and carries call cancellation through the client', async () => {
+    const cfg = config();
+    const cancellation = new AbortController();
+    const transport = vi.fn(
+      async (_input: Parameters<typeof fetch>[0], _init?: Parameters<typeof fetch>[1]) =>
+        new Response(
+          JSON.stringify({
+            allowed: true,
+            configurationVersion: 3,
+            actionsEnabled: false,
+            transfersEnabled: true,
+          }),
+        ),
+    );
+    const api = createVoiceApiClient(cfg, transport);
+    await expect(
+      api.policy(
+        { providerCallSid: `CA${'b'.repeat(32)}`, generation: cfg.tenantId },
+        cancellation.signal,
+      ),
+    ).resolves.toMatchObject({ configurationVersion: 3, actionsEnabled: false });
+    const signal = transport.mock.calls[0]?.[1]?.signal;
+    expect(signal?.aborted).toBe(false);
+    cancellation.abort();
+    expect(signal?.aborted).toBe(true);
+    for (const invalid of [
+      { allowed: true, configurationVersion: 0, actionsEnabled: true, transfersEnabled: true },
+      { allowed: true, configurationVersion: 1, actionsEnabled: 'true', transfersEnabled: true },
+      {
+        allowed: true,
+        configurationVersion: 1,
+        actionsEnabled: true,
+        transfersEnabled: true,
+        tenantId: '22222222-2222-4222-8222-222222222222',
+      },
+    ]) {
+      const invalidClient = createVoiceApiClient(
+        cfg,
+        async () => new Response(JSON.stringify(invalid)),
+      );
+      await expect(
+        invalidClient.policy({ providerCallSid: `CA${'b'.repeat(32)}`, generation: cfg.tenantId }),
+      ).rejects.toThrow();
+    }
   });
 });

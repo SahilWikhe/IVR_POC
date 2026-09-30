@@ -4,6 +4,8 @@ Hostline is a runnable local prototype for a restaurant phone receptionist. Its 
 
 The separate Twilio/OpenAI Realtime gateway includes a durable phone-action foundation: restaurant FAQs, caller-confirmed requests/messages, and transfers to a configured staff number. Voice, request actions, and transfers are disabled by default and have not been verified through a real provider call. Production startup remains blocked. [Implementation status](docs/IMPLEMENTATION_STATUS.md) separates implemented behavior, verification evidence, and remaining work.
 
+The **Phone operations** dashboard adds owner-controlled restaurant permissions, minimized staff context, and a read-only provider-status check for unresolved calls. Restaurant controls cannot enable capabilities disabled in the environment. Unknown provider outcomes keep their capacity hold; the dashboard has no manual release or redial control. See [phone operations](docs/PHONE_OPERATIONS.md) for roles, policy freshness, and recovery limits.
+
 ## Run the local demo
 
 Use Node.js **24.19.0** and pnpm **11.19.0**. The versions are recorded in `.node-version` and `package.json`.
@@ -60,6 +62,7 @@ Direct booking, reservation changes/lookups, ordering, payments, voiceprints, an
 | [Integrations](docs/INTEGRATIONS.md)                                                                                     | Request fulfillment and optional provider foundations         |
 | [Voice setup](docs/VOICE_SETUP.md)                                                                                       | Disabled-by-default phone sandbox configuration               |
 | [Twilio call control](docs/TWILIO_CALL_CONTROL.md)                                                                       | Canonical readback, bounded dispatch, and transfer behavior   |
+| [Phone operations](docs/PHONE_OPERATIONS.md)                                                                             | Owner policy, staff context, and conservative status checks   |
 | [Security design](docs/SECURITY.md)                                                                                      | Threat model, privacy rules, and required controls            |
 | [Engineering standards](docs/ENGINEERING.md)                                                                             | Coding and review standards                                   |
 | [Testing strategy](docs/TESTING.md)                                                                                      | Functional, security, connector, and voice scenarios          |

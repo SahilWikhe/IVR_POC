@@ -8,6 +8,7 @@ import {
   Menu,
   MessageSquare,
   Phone,
+  PhoneIncoming,
   Plug,
   Sparkles,
   X,
@@ -27,11 +28,13 @@ import { Inbox } from './features/Inbox';
 import { Simulator } from './features/Simulator';
 import { Settings } from './features/Settings';
 import { Integrations } from './features/Integrations';
+import { PhoneOperations } from './features/PhoneOperations';
 
-export type View = 'overview' | 'requests' | 'simulator' | 'settings' | 'integrations';
+export type View = 'overview' | 'requests' | 'phone' | 'simulator' | 'settings' | 'integrations';
 const navigation = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
   { id: 'requests', label: 'Guest requests', icon: MessageSquare },
+  { id: 'phone', label: 'Phone operations', icon: PhoneIncoming },
   { id: 'simulator', label: 'Call simulator', icon: Phone },
   { id: 'settings', label: 'Knowledge & settings', icon: BookOpen },
   { id: 'integrations', label: 'Integrations', icon: Plug },
@@ -457,6 +460,16 @@ function Workspace({
                   csrf={session.csrfToken}
                   writable={writable}
                   onChange={refresh}
+                  onInbox={(id) => navigate('requests', id)}
+                />
+              )}
+              {view === 'phone' && (
+                <PhoneOperations
+                  timezone={data.restaurant.timezone}
+                  csrf={session.csrfToken}
+                  role={session.user?.role ?? 'viewer'}
+                  selectedId={requestId}
+                  onSelect={(id) => navigate('phone', id ?? undefined)}
                   onInbox={(id) => navigate('requests', id)}
                 />
               )}

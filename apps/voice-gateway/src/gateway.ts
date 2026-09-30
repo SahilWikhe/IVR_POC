@@ -351,6 +351,17 @@ export async function createVoiceGateway(
       let pendingBytes = 0;
       let providerTimer: ReturnType<typeof setTimeout> | undefined;
       let durationTimer: ReturnType<typeof setTimeout> | undefined;
+      let policyTimer: ReturnType<typeof setTimeout> | undefined;
+      let policyDeadline: ReturnType<typeof setTimeout> | undefined;
+      let initialConfigurationVersion: number | undefined;
+      let policyCapabilities: { actionsEnabled: boolean; transfersEnabled: boolean } | undefined;
+      let policyCheckedAt = Number.NEGATIVE_INFINITY;
+      let policyInFlight: Promise<boolean> | undefined;
+      let controlOwned = false;
+      let validatingResponse = false;
+      let responseQueue: string[] = [];
+      let responseQueueBytes = 0;
+      let responseQueueAudioBytes = 0;
       const close = () => {
         if (closed) return;
         closed = true;
@@ -358,7 +369,12 @@ export async function createVoiceGateway(
         clearTimeout(startTimer);
         if (providerTimer) clearTimeout(providerTimer);
         if (durationTimer) clearTimeout(durationTimer);
+        if (policyTimer) clearTimeout(policyTimer);
+        if (policyDeadline) clearTimeout(policyDeadline);
         pending = [];
+        responseQueue = [];
+        responseQueueBytes = 0;
+        responseQueueAudioBytes = 0;
         relay?.close();
         // terminate a pending connection instead of leaving handshake work alive.
         if (provider?.readyState === WebSocket.CONNECTING) provider.terminate();
@@ -380,7 +396,140 @@ export async function createVoiceGateway(
       const startTimer = setTimeout(close, 5000);
       startTimer.unref();
 
-      const executeTool = async (
+      const checkPolicy = (force = false): Promise<boolean> => {
+        if (closed || !callSid || !generation || initialConfigurationVersion === undefined)
+          return Promise.resolve(false);
+        if (policyInFlight) return policyInFlight;
+        // Response bursts may reuse at most one second of successful policy
+        // knowledge; this caps request frequency without claiming instant revocation.
+        const policyAge = now() - policyCheckedAt;
+        if (!force && policyAge >= 0 && policyAge < 1000) return Promise.resolve(true);
+        const binding = { providerCallSid: callSid, generation };
+        let rejectCancelled: (() => void) | undefined;
+        const cancelled = new Promise<never>((_resolve, reject) => {
+          rejectCancelled = () => reject(new Error('Voice policy cancelled'));
+          controlCancellation.signal.addEventListener('abort', rejectCancelled, { once: true });
+        });
+        const deadline = new Promise<never>((_resolve, reject) => {
+          policyDeadline = setTimeout(() => reject(new Error('Voice policy deadline')), 3000);
+          policyDeadline.unref();
+        });
+        policyInFlight = Promise.race([
+          Promise.resolve().then(() => {
+            if (closed) throw new Error('Voice policy cancelled');
+            return api.policy(binding, controlCancellation.signal);
+          }),
+          cancelled,
+          deadline,
+        ])
+          .then((policy) => {
+            if (closed) return false;
+            // A tool hands ownership to deterministic API/provider control.
+            // Its own current-policy checks fence preparation and dispatch.
+            if (controlOwned) return true;
+            if (
+              !policy.allowed ||
+              policy.configurationVersion !== initialConfigurationVersion ||
+              (policyCapabilities?.actionsEnabled && !policy.actionsEnabled) ||
+              (policyCapabilities?.transfersEnabled && !policy.transfersEnabled)
+            ) {
+              close();
+              return false;
+            }
+            policyCheckedAt = now();
+            return true;
+          })
+          .catch(() => {
+            // A heartbeat that began during audio must not cancel a control
+            // already owned and reauthorized by the API's dispatch boundary.
+            if (!controlOwned) close();
+            return false;
+          })
+          .finally(() => {
+            if (policyDeadline) clearTimeout(policyDeadline);
+            if (rejectCancelled)
+              controlCancellation.signal.removeEventListener('abort', rejectCancelled);
+            policyDeadline = undefined;
+            policyInFlight = undefined;
+          });
+        return policyInFlight;
+      };
+
+      const schedulePolicy = () => {
+        if (closed || controlOwned) return;
+        if (policyTimer) clearTimeout(policyTimer);
+        // Each request has a three-second deadline, so failure/change detection
+        // is bounded by roughly eight seconds, plus event-loop scheduling.
+        policyTimer = setTimeout(() => {
+          void checkPolicy(true).then((allowed) => {
+            if (allowed) schedulePolicy();
+          });
+        }, 5000);
+        policyTimer.unref();
+      };
+
+      const receiveProviderEvent = (raw: string) => {
+        if (closed) return;
+        const bytes = Buffer.byteLength(raw);
+        if (bytes > 192 * 1024) return close();
+        let type: string;
+        try {
+          const event = z
+            .object({ type: z.string().max(120) })
+            .passthrough()
+            .parse(JSON.parse(raw));
+          type = event.type;
+          if (validatingResponse && type === 'input_audio_buffer.speech_started') {
+            // Barge-in must clear/cancel promptly even while output permission
+            // is being checked. The response metadata was registered below.
+            relay?.providerEvent(raw);
+            return;
+          }
+          if (type === 'response.created' && !controlOwned && !validatingResponse) {
+            // Register metadata immediately so interruption can cancel this
+            // response; no output or tool execution crosses the policy gate.
+            relay?.providerEvent(raw);
+            if (closed) return;
+            validatingResponse = true;
+            void checkPolicy().then((allowed) => {
+              if (!allowed || closed) return;
+              const events = responseQueue;
+              responseQueue = [];
+              responseQueueBytes = 0;
+              responseQueueAudioBytes = 0;
+              validatingResponse = false;
+              for (const eventRaw of events) {
+                if (closed) break;
+                relay?.providerEvent(eventRaw);
+              }
+            });
+            return;
+          }
+          if (validatingResponse) {
+            responseQueueBytes += bytes;
+            if (type === 'response.output_audio.delta') {
+              const audio = z.object({ delta: z.string().max(128 * 1024) }).parse(event);
+              const decoded = decodeAudio(audio.delta, 96 * 1024);
+              if (!decoded) return close();
+              responseQueueAudioBytes += decoded.length;
+            }
+            if (
+              responseQueue.length >= 64 ||
+              responseQueueBytes > 192 * 1024 ||
+              responseQueueAudioBytes > 16_000
+            )
+              return close();
+            responseQueue.push(raw);
+            return;
+          }
+        } catch {
+          return close();
+        }
+        relay?.providerEvent(raw);
+        if (relay?.isReady && providerTimer) clearTimeout(providerTimer);
+      };
+
+      const performTool = async (
         request: VoiceToolRequest,
       ): Promise<'controlled' | 'unavailable'> => {
         if (closed || !callSid || !generation) return 'unavailable';
@@ -395,7 +544,11 @@ export async function createVoiceGateway(
                   utteranceStartedAt: request.utteranceStartedAt,
                   proposal: request.proposal,
                 })
-              : await api.transfer({ ...binding, toolCallId: request.toolCallId });
+              : await api.transfer({
+                  ...binding,
+                  toolCallId: request.toolCallId,
+                  context: request.context,
+                });
         } catch {
           return 'unavailable';
         }
@@ -452,6 +605,23 @@ export async function createVoiceGateway(
         return 'controlled';
       };
 
+      const executeTool = async (
+        request: VoiceToolRequest,
+      ): Promise<'controlled' | 'unavailable'> => {
+        controlOwned = true;
+        if (policyTimer) clearTimeout(policyTimer);
+        const result = await performTool(request);
+        if (result === 'unavailable' && !closed) {
+          controlOwned = false;
+          if (!(await checkPolicy(true))) {
+            close();
+            return 'controlled';
+          }
+          schedulePolicy();
+        }
+        return result;
+      };
+
       const startProvider = async (
         startCallSid: string,
         startStreamSid: string,
@@ -469,14 +639,20 @@ export async function createVoiceGateway(
             return;
           }
           callExpiresAt = Date.parse(context.expiresAt);
+          initialConfigurationVersion = context.configurationVersion;
+          policyCapabilities = {
+            actionsEnabled: config.actionsEnabled && context.actionsEnabled,
+            transfersEnabled: config.transfersEnabled && context.transfersEnabled,
+          };
           const remainingMs = callExpiresAt - now();
           if (remainingMs <= 0) return close();
           if (durationTimer) clearTimeout(durationTimer);
           durationTimer = setTimeout(close, Math.min(remainingMs, config.maxCallSeconds * 1000));
           durationTimer.unref();
+          if (!(await checkPolicy(true)) || closed) return;
+          schedulePolicy();
           const capabilities = {
-            actionsEnabled: config.actionsEnabled && context.actionsEnabled,
-            transfersEnabled: config.transfersEnabled && context.transfersEnabled,
+            ...policyCapabilities,
             outcome: context.outcome,
           };
           provider = connect(config);
@@ -493,9 +669,7 @@ export async function createVoiceGateway(
           );
           provider.on('message', (data, binary) => {
             if (binary) return close();
-            const raw = data.toString();
-            relay?.providerEvent(raw);
-            if (relay?.isReady && providerTimer) clearTimeout(providerTimer);
+            receiveProviderEvent(data.toString());
           });
           provider.on('close', close);
           provider.on('error', close);

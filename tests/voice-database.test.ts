@@ -229,7 +229,7 @@ it('upgrades an existing v1 database once and preserves terminal replay tombston
     await sql.waitReady;
     expect(
       (await sql.query('SELECT version FROM schema_migrations ORDER BY version')).rows,
-    ).toEqual([{ version: 1 }, { version: 2 }]);
+    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
     expect(
       (await sql.query('SELECT applied_at FROM schema_migrations WHERE version=1')).rows,
     ).toEqual(priorVersion);

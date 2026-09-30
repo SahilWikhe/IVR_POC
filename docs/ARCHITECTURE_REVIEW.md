@@ -2,7 +2,7 @@
 
 Review date: September 30, 2026. Scope: the proposed restaurant receptionist, including request-only pilot, future connector foundation, security, operations, engineering practices, and contributor/agent instructions.
 
-This was a documentation review by an agent independent of the primary document authors, followed by author cross-checks and coordinated revisions. It examined trust boundaries, lifecycle consistency, concurrency, truthful caller status, failure/restore behavior, and delivery gates. There is no application to security-test; this is not a penetration test, provider verification, legal assessment, or certification. “Addressed” below means the design was corrected, not that the control exists in code.
+The original review covered documentation, with an agent independent of the primary authors, followed by cross-checks and coordinated revisions. It examined trust boundaries, lifecycle consistency, concurrency, truthful caller status, failure/restore behavior, and delivery gates. A runnable local application and later implementation reviews now exist; their scope and test evidence are recorded in [implementation status](IMPLEMENTATION_STATUS.md). This is not a penetration test, provider verification, legal assessment, or certification. “Addressed” in the original findings below means the design was corrected, rather than establishing that every control exists in code.
 
 ## Findings and resolutions
 
@@ -47,7 +47,7 @@ The original documentation publication validation checked all 16 Markdown files 
 
 The R-13/R-14 follow-up passed an independent consistency review and repeated documentation validation across 16 Markdown files and 127 local relative links, with no missing targets, unclosed fences, trailing whitespace, or selected credential-pattern matches. Git whitespace checks passed. The new acceptance scenarios are specifications for future tests; no application or live-provider tests ran.
 
-External vendor capabilities and documentation links have not been fetched or verified during this task. The capability matrix intentionally records this uncertainty. Diagram content was reviewed as part of the architecture; no browser rendering or Mermaid renderer verification is claimed.
+External vendor capabilities and documentation links were not fetched or verified during the original documentation review. Its capability matrix records that historical uncertainty. Later inspected provider references are identified in [ADR-010](adr/010-phone-actions.md) and [voice setup](VOICE_SETUP.md); actual Resy/OpenTable access remains unverified. Diagram content was reviewed as part of the architecture; no browser rendering or Mermaid renderer verification is claimed for that review.
 
 ## Local prototype implementation review — 2026-09-30
 
@@ -63,3 +63,11 @@ An independent code review of the implementation identified and rechecked these 
 | Failed Realtime responses could leave a silent call open           | Failed/incomplete responses close both peers; expected interruption cancellation remains usable                    | Failed-response and interruption regressions                                                            |
 
 The fresh-checkout database directory bug found in browser testing is also fixed and covered by a nested-directory persistence test. Production remains blocked: real voice acceptance, spoken write confirmation, actual staff transfers, distributed identity/call recovery, retention, and restore-independent evidence are not satisfied by the local prototype.
+
+## Later phone-action and operations review
+
+The durable phone-action foundation and subsequent phone-operations controls received separate implementation review. The operations review checked admission policy-version fencing across disable/reenable, current-configuration checks, bounded gateway revocation detection, staff-context labeling and role minimization, read-only parent/child evidence, stale reconciliation, and retaining capacity on uncertainty.
+
+Review fixes require explicit provider pagination completeness and normalize the SDK's child array, retain terminal callback token binding for harmless late callbacks, clear stale displayed proposals, distinguish staff-reported booking evidence from guest communication, and close both peers when authority cannot be restored after a known-unsent rejection. Documentation now defines durable dispatch admission as the serialized authorization boundary: an update admitted first may still reach the provider after revocation, while a later request confirmation rechecks policy before saving. The independent review found no remaining blocker for the local milestone.
+
+Implemented behavior is described in [phone operations](PHONE_OPERATIONS.md); complete current check results and unresolved gaps are in [implementation status](IMPLEMENTATION_STATUS.md). Earlier documentation and prototype review outcomes do not establish verification of a later revision. Native PostgreSQL concurrency, real Twilio/OpenAI behavior, production identity/recovery, and customer forwarding require separate evidence.

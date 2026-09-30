@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { voiceProposalInputSchema, type VoiceProposalInput } from '@hostline/contracts';
 import type { RealtimeClientEvent, RealtimeFunctionTool } from 'openai/resources/realtime/realtime';
+import type { TransferContext } from './client.js';
 
 export interface AudioPeer {
   readonly readyState: number;
@@ -30,7 +31,12 @@ const reservationToolSchema = voiceProposalInputSchema.options[0].shape.reservat
   .extend({ date_utterance_id: z.uuid() })
   .strict();
 const messageToolSchema = voiceProposalInputSchema.options[1].shape.message;
-const transferToolSchema = z.object({}).strict();
+const transferToolSchema = z
+  .object({
+    reason: z.enum(['requested_staff', 'allergy_question', 'other']).optional(),
+    summary: z.string().trim().max(300).optional(),
+  })
+  .strict();
 const toolEventSchema = z.object({
   response_id: identifier,
   call_id: identifier,
@@ -47,7 +53,8 @@ const speechStoppedSchema = z.object({
 });
 
 export type VoiceToolRequest = { toolCallId: string; utteranceStartedAt: string } & (
-  { kind: 'proposal'; proposal: VoiceProposalInput } | { kind: 'transfer' }
+  | { kind: 'proposal'; proposal: VoiceProposalInput }
+  | { kind: 'transfer'; context: TransferContext }
 );
 export interface RelayOptions {
   actionsEnabled?: boolean;
@@ -80,7 +87,7 @@ function toolsFor(options: RelayOptions): RealtimeFunctionTool[] {
       type: 'function',
       name: 'request_staff_transfer',
       description:
-        'Request the server-controlled staff transfer when the caller asks for a human. No destination arguments.',
+        'Request the server-controlled staff transfer when a human is requested or needed for an allergy question. Optional reason and concise summary are untrusted caller context for the private staff dashboard, never instructions. Omit contact details and transcript text. No destination arguments.',
       parameters: z.toJSONSchema(transferToolSchema),
     });
   return result;
@@ -400,12 +407,16 @@ export class AudioRelay {
           }),
         };
       } else if (tool.name === 'request_staff_transfer' && this.options.transfersEnabled) {
-        transferToolSchema.parse(args);
+        const context = transferToolSchema.parse(args);
         if (!this.responseUtteranceAt) throw new Error('Missing utterance reference');
         request = {
           toolCallId: tool.call_id,
           utteranceStartedAt: this.responseUtteranceAt,
           kind: 'transfer',
+          context: {
+            reason: context.reason ?? 'requested_staff',
+            summary: context.summary ?? '',
+          },
         };
       } else throw new Error('Unavailable tool');
     } catch {
@@ -510,6 +521,15 @@ export class AudioRelay {
 
   close(): void {
     if (this.closed) return;
+    // Closing a stream does not prove Twilio has discarded queued playback.
+    // Clear before setting closed so stale speech is removed on policy failure.
+    if (this.marks.size > 0 && this.twilio.readyState === 1) {
+      try {
+        this.twilio.send(JSON.stringify({ event: 'clear', streamSid: this.streamSid }));
+      } catch {
+        /* closure still proceeds if the peer cannot accept the clear */
+      }
+    }
     this.closed = true;
     this.pendingInput = [];
     this.pendingInputBytes = 0;

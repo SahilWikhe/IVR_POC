@@ -23,6 +23,7 @@ const redemptionResponse = z
     outcome: z.string().max(500).nullable(),
     actionsEnabled: z.boolean(),
     transfersEnabled: z.boolean(),
+    configurationVersion: z.number().int().positive(),
   })
   .strict();
 const preparationResponse = z.object({ controlId: uuid, twiml }).strict();
@@ -32,6 +33,19 @@ const dispatchResponse = z
 const callbackResponse = z
   .object({ ...scope, twiml, outcome: z.string().max(500).nullable() })
   .strict();
+const policyResponse = z
+  .object({
+    allowed: z.boolean(),
+    configurationVersion: z.number().int().positive(),
+    actionsEnabled: z.boolean(),
+    transfersEnabled: z.boolean(),
+  })
+  .strict();
+
+export interface TransferContext {
+  reason: 'requested_staff' | 'allergy_question' | 'other';
+  summary: string;
+}
 
 export interface CallBinding {
   providerCallSid: string;
@@ -52,6 +66,7 @@ export interface VoiceApiClient {
     generation?: string;
     reason: 'stream_closed' | 'provider_terminal';
   }): Promise<z.infer<typeof stateResponse>>;
+  policy(input: CallBinding, signal?: AbortSignal): Promise<z.infer<typeof policyResponse>>;
   propose(
     input: CallBinding & {
       toolCallId: string;
@@ -60,7 +75,7 @@ export interface VoiceApiClient {
     },
   ): Promise<z.infer<typeof preparationResponse>>;
   transfer(
-    input: CallBinding & { toolCallId: string },
+    input: CallBinding & { toolCallId: string; context?: TransferContext },
   ): Promise<z.infer<typeof preparationResponse>>;
   dispatch(input: CallBinding & { controlId: string }): Promise<z.infer<typeof dispatchResponse>>;
   dispatched(
@@ -92,7 +107,12 @@ export function createVoiceApiClient(
   config: EnabledVoiceConfig,
   transport: typeof fetch = fetch,
 ): VoiceApiClient {
-  const post = async <T>(path: string, input: object, schema: z.ZodType<T>): Promise<T> => {
+  const post = async <T>(
+    path: string,
+    input: object,
+    schema: z.ZodType<T>,
+    signal?: AbortSignal,
+  ): Promise<T> => {
     const response = await transport(`${config.apiUrl}/internal/voice/${path}`, {
       method: 'POST',
       headers: {
@@ -100,7 +120,9 @@ export function createVoiceApiClient(
         'content-type': 'application/json',
       },
       body: JSON.stringify(input),
-      signal: AbortSignal.timeout(3000),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(3000)])
+        : AbortSignal.timeout(3000),
       redirect: 'error',
     });
     if (!response.ok || !response.body) throw new Error('Voice control unavailable');
@@ -136,6 +158,7 @@ export function createVoiceApiClient(
       return result;
     },
     end: (input) => post('end', input, stateResponse),
+    policy: (input, signal) => post('policy', input, policyResponse, signal),
     propose: (input) => post('propose', input, preparationResponse),
     transfer: (input) => post('transfer', input, preparationResponse),
     dispatch: (input) => post('dispatch', input, dispatchResponse),

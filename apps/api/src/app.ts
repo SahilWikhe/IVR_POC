@@ -17,12 +17,13 @@ import {
   createSimulationSession,
   transitionInbox,
 } from '@hostline/domain';
-import { getIntegrationStatuses } from '@hostline/connectors';
+import { getIntegrationStatuses, type CallStatusReader } from '@hostline/connectors';
 import type { Database, TenantTransaction } from '@hostline/database';
 import type { AppConfig } from '@hostline/config';
 import { logEvent } from '@hostline/observability';
 import { registerAuth } from './auth.js';
 import { registerVoiceActions } from './voice.js';
+import { registerPhoneOperations } from './phone-operations.js';
 
 class ApiError extends Error {
   constructor(
@@ -60,7 +61,11 @@ async function requiredCall(tx: TenantTransaction, id: string) {
   return call;
 }
 
-export async function createApp(config: AppConfig, db: Database) {
+export async function createApp(
+  config: AppConfig,
+  db: Database,
+  dependencies: { callStatusReader?: CallStatusReader } = {},
+) {
   const app = Fastify({
     logger: false,
     bodyLimit: 64 * 1024,
@@ -295,5 +300,6 @@ export async function createApp(config: AppConfig, db: Database) {
     }));
   });
   await registerVoiceActions(app, config, db);
+  await registerPhoneOperations(app, config, db, auth, dependencies);
   return app;
 }

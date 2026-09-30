@@ -9,6 +9,7 @@ import {
   voiceProposalInputSchema,
   type CallSession,
   type Restaurant,
+  type PhonePolicy,
   type VoiceCallRecord,
 } from '@hostline/contracts';
 import {
@@ -175,6 +176,19 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
     if (!record) throw new VoiceError('CALL_NOT_FOUND', 404, 'Phone call not found.');
     return record;
   };
+  const currentPolicy = async (
+    tx: TenantTransaction,
+    record?: VoiceCallRecord,
+  ): Promise<PhonePolicy> => {
+    const policy = await tx.getPhonePolicy();
+    if (!policy.voiceEnabled || (record && (record.policyVersion ?? 1) !== policy.version))
+      throw new VoiceError(
+        'PHONE_POLICY_REVOKED',
+        403,
+        'This phone session has been disabled. Please start a new call after restaurant approval.',
+      );
+    return policy;
+  };
   const tenantId = () => z.uuid().parse(config.voiceTenantId);
   const publicUrl = () => z.url().parse(config.voice.publicUrl);
   const deadline = (record: VoiceCallRecord) =>
@@ -189,6 +203,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
       providerCallSid: sid,
       accountSid: providerAccountSidSchema.parse(config.voice.accountSid),
       version: 1,
+      policyVersion: (await tx.getPhonePolicy()).version,
       state: terminal ? 'ENDED' : 'WAITING_FOR_STREAM',
       generation: randomUUID(),
       leaseExpiresAt: new Date(now.getTime() + config.voice.maxCallSeconds * 1000).toISOString(),
@@ -236,7 +251,12 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
     outcome: string,
   ) => {
     if (record.state === 'ENDED') return callbackResult(record, hangup());
-    if (remaining(record, now) < 15) {
+    const policy = await tx.getPhonePolicy();
+    if (
+      remaining(record, now) < 15 ||
+      !policy.voiceEnabled ||
+      (record.policyVersion ?? 1) !== policy.version
+    ) {
       const next = await saveRecord(
         tx,
         record,
@@ -286,6 +306,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
       if (input.accountSid !== config.voice.accountSid)
         throw new VoiceError('ACCOUNT_MISMATCH', 403, 'Phone account mismatch.');
       let record = await boundRecord(tx, input.providerCallSid);
+      if (record?.state !== 'ENDED') await currentPolicy(tx, record ?? undefined);
       if (!record) {
         if ((await tx.countActiveVoiceCalls(now)) >= config.voice.maxConcurrentCalls)
           throw new VoiceError('CAPACITY_EXCEEDED', 429, 'The assistant is at capacity.');
@@ -311,6 +332,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         .strict()
         .parse(request.body);
       const record = await recordFor(tx, input.providerCallSid);
+      const policy = await currentPolicy(tx, record);
       if (
         record.state !== 'WAITING_FOR_STREAM' ||
         Date.parse(record.streamGrantExpiresAt) <= now.getTime() ||
@@ -324,17 +346,53 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         { state: 'STREAMING', streamSid: input.streamSid },
         now,
       );
+      const restaurant = await tx.getRestaurant();
+      const call = await callFor(tx, next);
       return {
         voiceCallId: next.id,
         generation: next.generation,
         expiresAt: next.leaseExpiresAt,
         tenantId: tenantId(),
-        restaurant: await tx.getRestaurant(),
+        restaurant,
+        configurationVersion: restaurant.version,
         outcome: next.outcome,
-        actionsEnabled: config.voice.actionsEnabled,
-        transfersEnabled: config.voice.transfersEnabled,
+        actionsEnabled:
+          config.voice.actionsEnabled && policy.requestsEnabled && call.inboxItemId === null,
+        transfersEnabled: config.voice.transfersEnabled && policy.transfersEnabled,
       };
     }),
+  );
+  app.post(
+    '/internal/voice/policy',
+    {
+      config: {
+        rateLimit: { max: config.voice.maxConcurrentCalls * 90 + 60, timeWindow: '1 minute' },
+      },
+    },
+    (request) =>
+      scoped(request, async (tx, now) => {
+        const input = z.object(binding).strict().parse(request.body);
+        const record = await recordFor(tx, input.providerCallSid);
+        const policy = await tx.getPhonePolicy();
+        const restaurant = await tx.getRestaurant();
+        const call = await callFor(tx, record);
+        const allowed =
+          policy.voiceEnabled &&
+          (record.policyVersion ?? 1) === policy.version &&
+          record.generation === input.generation &&
+          record.state === 'STREAMING' &&
+          remaining(record, now) > 0;
+        return {
+          allowed,
+          configurationVersion: restaurant.version,
+          actionsEnabled:
+            allowed &&
+            config.voice.actionsEnabled &&
+            policy.requestsEnabled &&
+            call.inboxItemId === null,
+          transfersEnabled: allowed && config.voice.transfersEnabled && policy.transfersEnabled,
+        };
+      }),
   );
   app.post('/internal/voice/end', (request) =>
     scoped(request, async (tx, now) => {
@@ -429,6 +487,9 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
       if (!config.voice.actionsEnabled)
         throw new VoiceError('ACTIONS_DISABLED', 403, 'Phone request submission is disabled.');
       const record = await recordFor(tx, input.providerCallSid);
+      const policy = await currentPolicy(tx, record);
+      if (!policy.requestsEnabled)
+        throw new VoiceError('ACTIONS_DISABLED', 403, 'Phone request submission is disabled.');
       assertGeneration(record, input.generation);
       const key = `voice:tool:${record.id}:${input.toolCallId}`;
       const receipt = await receiptResult(tx, key, input);
@@ -499,10 +560,25 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
   app.post('/internal/voice/transfer', (request) =>
     scoped(request, async (tx, now) => {
       const input = z
-        .object({ ...binding, toolCallId: toolId })
+        .object({
+          ...binding,
+          toolCallId: toolId,
+          context: z
+            .object({
+              reason: z
+                .enum(['requested_staff', 'allergy_question', 'other'])
+                .default('requested_staff'),
+              summary: z.string().trim().max(300).default(''),
+            })
+            .strict()
+            .optional(),
+        })
         .strict()
         .parse(request.body);
       const record = await recordFor(tx, input.providerCallSid);
+      const policy = await currentPolicy(tx, record);
+      if (!policy.transfersEnabled)
+        throw new VoiceError('TRANSFER_UNAVAILABLE', 403, 'Staff transfer is disabled.');
       assertGeneration(record, input.generation);
       const key = `voice:tool:${record.id}:${input.toolCallId}`;
       const receipt = await receiptResult(tx, key, input);
@@ -546,6 +622,13 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
       await tx.putReceipt(`voice:transfer-grant:${hash(grant)}`, hash(grant), {
         providerCallSid: record.providerCallSid,
         controlId,
+      });
+      await tx.saveHandoff({
+        callId: record.id,
+        controlId,
+        reason: input.context?.reason ?? 'requested_staff',
+        summary: input.context?.summary ?? '',
+        createdAt: now.toISOString(),
       });
       const result = { controlId, twiml };
       await tx.putReceipt(key, fingerprint(input), result);
@@ -592,10 +675,13 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         );
         return { dispatch: false, twiml: null, unavailable: true };
       };
+      const policy = await tx.getPhonePolicy();
+      if (!policy.voiceEnabled || (record.policyVersion ?? 1) !== policy.version) return abandon();
       let twiml = record.controlTwiml;
       if (record.controlKind === 'readback') {
         if (
           !config.voice.actionsEnabled ||
+          !policy.requestsEnabled ||
           !call.proposal ||
           call.proposal.id !== record.proposalId ||
           call.proposal.configVersion !== restaurant.version ||
@@ -604,6 +690,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         )
           return abandon();
       } else {
+        if (!policy.transfersEnabled) return abandon();
         let destination: string;
         try {
           destination = permittedDestination(restaurant, config);
@@ -725,6 +812,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         throw new VoiceError('CALLBACK_COMPLETED', 409, 'This confirmation has already completed.');
       const call = await callFor(tx, record),
         restaurant = await tx.getRestaurant();
+      const policy = await tx.getPhonePolicy();
       let outcome = 'No new request was saved. You may repeat the details or ask for staff.';
       const affirmed =
         [
@@ -739,6 +827,9 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
       if (
         affirmed &&
         config.voice.actionsEnabled &&
+        policy.voiceEnabled &&
+        policy.requestsEnabled &&
+        (record.policyVersion ?? 1) === policy.version &&
         record.proposalId &&
         call.proposal?.id === record.proposalId &&
         record.confirmationExpiresAt &&
