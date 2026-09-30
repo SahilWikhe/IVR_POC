@@ -1,5 +1,7 @@
 # Integration design and enablement
 
+Implementation evidence: see [current prototype status](IMPLEMENTATION_STATUS.md) and [ADR-009](adr/009-local-prototype.md). The requirements below include later pilot and production work; they are not all implemented.
+
 Status: **design for implementation; no provider integrations are implemented or enabled.**
 
 The first restaurant pilot accepts reservation **requests** for staff review. A request does not hold a table, show live inventory, or become a reservation when a staff member acknowledges it. The platform will have shared adapter contracts so an authorized Resy or OpenTable connection can be added for individual restaurant locations later. There is no assumption that either vendor currently offers the required access, operations, sandbox, or commercial permission to this project.
@@ -10,11 +12,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md), [DATA_MODEL.md](DATA_MODEL.md), [SECURIT
 
 Each tenant location has one explicitly selected reservation mode:
 
-| Mode | What the caller can do | Meaning of success | Deployment rule |
-| --- | --- | --- | --- |
-| `REQUEST_ONLY` | Submit a reservation request after reading back the details and obtaining agreement | Request persisted in the restaurant's dashboard inbox; table remains unconfirmed | Initial production pilot mode after launch gates pass |
-| `DETERMINISTIC_FAKE` | Exercise simulated availability, writes, conflicts, and failures using seeded fixtures | Synthetic test result; no real table or vendor account is affected | Development and isolated test tenants only; UI, logs, and conversations visibly say simulation |
-| `AUTHORIZED_LIVE` | Use only enabled, verified capabilities of an official vendor connection | Vendor result accepted under the confirmation rules below | Disabled until every applicable enablement gate passes |
+| Mode                 | What the caller can do                                                                 | Meaning of success                                                               | Deployment rule                                                                                |
+| -------------------- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `REQUEST_ONLY`       | Submit a reservation request after reading back the details and obtaining agreement    | Request persisted in the restaurant's dashboard inbox; table remains unconfirmed | Initial production pilot mode after launch gates pass                                          |
+| `DETERMINISTIC_FAKE` | Exercise simulated availability, writes, conflicts, and failures using seeded fixtures | Synthetic test result; no real table or vendor account is affected               | Development and isolated test tenants only; UI, logs, and conversations visibly say simulation |
+| `AUTHORIZED_LIVE`    | Use only enabled, verified capabilities of an official vendor connection               | Vendor result accepted under the confirmation rules below                        | Disabled until every applicable enablement gate passes                                         |
 
 The request adapter advertises `submitRequest`, not `createReservation` or `checkAvailability`. It must never return a fake provider reservation reference. The deterministic fake is a separate adapter, cannot be selected for a real restaurant, and cannot use production telephone routing or provider secrets. Simulated booking success is not evidence that a live adapter works.
 
@@ -24,20 +26,20 @@ The restaurant's reservation system remains authoritative for inventory, availab
 
 `UNKNOWN / NOT VERIFIED` means no product promise or live capability can be enabled on the basis of this document. It is different from a verified `UNSUPPORTED` result.
 
-| Capability | Request-only adapter | Deterministic fake | Resy live adapter | OpenTable live adapter |
-| --- | --- | --- | --- | --- |
-| Save request in staff dashboard | Planned MVP | Simulated | Platform workflow, independent of vendor | Platform workflow, independent of vendor |
-| Read live availability | Unsupported | Simulated | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
-| Create reservation | Unsupported | Simulated | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
-| Find write by idempotency/correlation key | Not a vendor write | Simulated | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
-| Read reservation details | Staff workflow only | Simulated | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
-| Change or cancel reservation | Unsupported in MVP | Simulated if fixture exists | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
-| Vendor-side idempotency | Not applicable | Controlled test behavior | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
-| Reservation change webhooks | Not applicable | Simulated | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
-| Customer record access | Unsupported in MVP | Synthetic fixtures only | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
-| Table hold/offer expiry | No holds | Simulated | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
-| Official API access and restaurant permission | Not needed for dashboard request | Not needed | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
-| Sandbox, quotas, production approval | Not applicable | Local fixtures | **UNKNOWN / NOT VERIFIED** | **UNKNOWN / NOT VERIFIED** |
+| Capability                                    | Request-only adapter             | Deterministic fake          | Resy live adapter                        | OpenTable live adapter                   |
+| --------------------------------------------- | -------------------------------- | --------------------------- | ---------------------------------------- | ---------------------------------------- |
+| Save request in staff dashboard               | Planned MVP                      | Simulated                   | Platform workflow, independent of vendor | Platform workflow, independent of vendor |
+| Read live availability                        | Unsupported                      | Simulated                   | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
+| Create reservation                            | Unsupported                      | Simulated                   | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
+| Find write by idempotency/correlation key     | Not a vendor write               | Simulated                   | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
+| Read reservation details                      | Staff workflow only              | Simulated                   | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
+| Change or cancel reservation                  | Unsupported in MVP               | Simulated if fixture exists | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
+| Vendor-side idempotency                       | Not applicable                   | Controlled test behavior    | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
+| Reservation change webhooks                   | Not applicable                   | Simulated                   | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
+| Customer record access                        | Unsupported in MVP               | Synthetic fixtures only     | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
+| Table hold/offer expiry                       | No holds                         | Simulated                   | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
+| Official API access and restaurant permission | Not needed for dashboard request | Not needed                  | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
+| Sandbox, quotas, production approval          | Not applicable                   | Local fixtures              | **UNKNOWN / NOT VERIFIED**               | **UNKNOWN / NOT VERIFIED**               |
 
 Maintain a versioned capability manifest for each adapter release and an installation-specific allowlist for each tenant location. Effective permissions are the intersection of product scope, adapter verified support, installation permission, restaurant policy, caller authorization, and current health. Neither a model nor a dashboard label can add a capability. Provider health can remove permission to start an action, but cannot change the meaning of an already attempted write.
 
@@ -63,37 +65,32 @@ The following type-only sketch is a proposed contract, not shipped functionality
 
 ```ts
 export type ReservationCapability =
-  | "checkAvailability"
-  | "createReservation"
-  | "readReservation"
-  | "reconcileWrite";
+  'checkAvailability' | 'createReservation' | 'readReservation' | 'reconcileWrite';
 
 export type CapabilityEvidence =
-  | { readonly state: "UNKNOWN" }
-  | { readonly state: "UNSUPPORTED"; readonly reason: string }
+  | { readonly state: 'UNKNOWN' }
+  | { readonly state: 'UNSUPPORTED'; readonly reason: string }
   | {
-      readonly state: "VERIFIED";
+      readonly state: 'VERIFIED';
       readonly evidenceId: string;
       readonly reviewedAt: string;
     };
 
 export interface AdapterManifest {
-  readonly provider: "resy" | "opentable" | "deterministic-fake";
+  readonly provider: 'resy' | 'opentable' | 'deterministic-fake';
   readonly version: string;
-  readonly environment: "sandbox" | "production" | "simulation";
-  readonly capabilities: Readonly<
-    Record<ReservationCapability, CapabilityEvidence>
-  >;
+  readonly environment: 'sandbox' | 'production' | 'simulation';
+  readonly capabilities: Readonly<Record<ReservationCapability, CapabilityEvidence>>;
 }
 
 export type TrustedActor =
   | {
-      readonly kind: "CALL";
+      readonly kind: 'CALL';
       readonly callId: string;
       readonly callGeneration: number;
     }
   | {
-      readonly kind: "STAFF";
+      readonly kind: 'STAFF';
       readonly userId: string;
       readonly membershipVersion: string;
     };
@@ -132,7 +129,7 @@ export interface ReservationOffer {
 export interface ReservationReference {
   readonly internalReservationId: string;
   readonly providerReference: string;
-  readonly status: "CONFIRMED";
+  readonly status: 'CONFIRMED';
   readonly startsAt: string;
   readonly partySize: number;
 }
@@ -140,36 +137,36 @@ export interface ReservationReference {
 // Planned future reservation-read result; lookup remains disabled in the MVP.
 export type ReservationRead =
   | {
-      readonly status: "CONFIRMED";
+      readonly status: 'CONFIRMED';
       readonly reservation: ReservationReference;
       readonly observedAt: string;
     }
   | {
-      readonly status: "CANCELLED";
+      readonly status: 'CANCELLED';
       readonly internalReservationId: string;
       readonly providerReference: string;
       readonly evidenceId: string;
       readonly observedAt: string;
     }
   | {
-      readonly status: "UNKNOWN";
+      readonly status: 'UNKNOWN';
       readonly internalReservationId: string;
       readonly observedAt: string;
     };
 
 export type AdapterFailure =
-  | "INVALID_INPUT"
-  | "UNSUPPORTED"
-  | "NOT_AUTHORIZED"
-  | "UNAVAILABLE_SLOT"
-  | "NOT_FOUND"
-  | "RATE_LIMITED"
-  | "PROVIDER_UNAVAILABLE";
+  | 'INVALID_INPUT'
+  | 'UNSUPPORTED'
+  | 'NOT_AUTHORIZED'
+  | 'UNAVAILABLE_SLOT'
+  | 'NOT_FOUND'
+  | 'RATE_LIMITED'
+  | 'PROVIDER_UNAVAILABLE';
 
 export type ReadResult<T> =
-  | { readonly kind: "OK"; readonly value: T }
+  | { readonly kind: 'OK'; readonly value: T }
   | {
-      readonly kind: "ERROR";
+      readonly kind: 'ERROR';
       readonly code: AdapterFailure;
       readonly retryAfterSeconds?: number;
     };
@@ -184,26 +181,26 @@ export interface AuthorizedWrite {
 }
 
 export type WriteResult =
-  | { readonly kind: "CONFIRMED"; readonly value: ReservationReference }
+  | { readonly kind: 'CONFIRMED'; readonly value: ReservationReference }
   | {
-      readonly kind: "REJECTED";
+      readonly kind: 'REJECTED';
       readonly code: AdapterFailure;
       readonly evidenceId: string; // Definitive evidence of no booking.
     }
   | {
-      readonly kind: "UNKNOWN";
+      readonly kind: 'UNKNOWN';
       readonly operationId: string;
-      readonly reason: "TIMEOUT" | "DISCONNECTED" | "AMBIGUOUS_RESPONSE";
+      readonly reason: 'TIMEOUT' | 'DISCONNECTED' | 'AMBIGUOUS_RESPONSE';
     };
 
 export type ReconciliationResult =
-  | { readonly kind: "CONFIRMED"; readonly value: ReservationReference }
-  | { readonly kind: "NOT_CREATED"; readonly evidenceId: string }
-  | { readonly kind: "STILL_UNKNOWN"; readonly nextReviewAt: string }
+  | { readonly kind: 'CONFIRMED'; readonly value: ReservationReference }
+  | { readonly kind: 'NOT_CREATED'; readonly evidenceId: string }
+  | { readonly kind: 'STILL_UNKNOWN'; readonly nextReviewAt: string }
   | {
-      readonly kind: "ERROR";
+      readonly kind: 'ERROR';
       readonly code: AdapterFailure;
-      readonly mutationOutcome: "UNKNOWN";
+      readonly mutationOutcome: 'UNKNOWN';
       readonly nextReviewAt: string;
     };
 
@@ -213,30 +210,24 @@ export interface ReservationAdapter {
     context: TrustedActionContext,
     query: AvailabilityQuery,
   ): Promise<ReadResult<readonly ReservationOffer[]>>;
-  createReservation(
-    context: TrustedActionContext,
-    write: AuthorizedWrite,
-  ): Promise<WriteResult>;
+  createReservation(context: TrustedActionContext, write: AuthorizedWrite): Promise<WriteResult>;
   readReservation(
     context: TrustedActionContext,
     internalReservationId: string,
   ): Promise<ReadResult<ReservationRead>>;
-  reconcileWrite(
-    context: TrustedActionContext,
-    operationId: string,
-  ): Promise<ReconciliationResult>;
+  reconcileWrite(context: TrustedActionContext, operationId: string): Promise<ReconciliationResult>;
 }
 
 export interface ReservationRequestReceipt {
   readonly requestId: string;
-  readonly status: "PENDING_STAFF_REVIEW";
+  readonly status: 'PENDING_STAFF_REVIEW';
   readonly tableConfirmed: false;
 }
 
 export interface RequestOnlyAdapter {
-  readonly mode: "REQUEST_ONLY";
+  readonly mode: 'REQUEST_ONLY';
   submitRequest(
-    context: Omit<TrustedActionContext, "installationId">,
+    context: Omit<TrustedActionContext, 'installationId'>,
     operationId: string,
     intent: ReservationIntent,
   ): Promise<ReservationRequestReceipt>;
@@ -364,7 +355,7 @@ Offline contract fixtures must be sanitized, versioned, and clearly identified a
 
 ## 11. Dependencies and unresolved decisions
 
-The docs-only change does not require vendor credentials or live access. The implementation plan can proceed with the request-only workflow and isolated simulation while these dependencies remain open:
+The local prototype does not require vendor credentials or live access. The implementation plan can proceed with the request-only workflow and isolated simulation while these dependencies remain open:
 
 1. Pilot restaurant location, current reservation process, timezone, approved follow-up expectation, authorized administrators, and staff inbox ownership.
 2. Resy **and** OpenTable eligibility, official access, contractual permissions, schemas, capabilities, test environments, and reconciliation semantics; all remain unverified independently.

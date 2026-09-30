@@ -1,5 +1,7 @@
 # Proposed system architecture
 
+Implementation evidence: see [current prototype status](IMPLEMENTATION_STATUS.md) and [ADR-009](adr/009-local-prototype.md). The requirements below include later pilot and production work; they are not all implemented.
+
 Status: design for implementation; no application, deployed infrastructure, provider access, or production behavior is implied. The restaurant pilot accepts **reservation requests for staff review**. A saved or delivered request is never a confirmed reservation.
 
 Read this with [the product brief](../BUILD_BRIEF.md), [the implementation plan](IMPLEMENTATION_PLAN.md), [integration contracts](INTEGRATIONS.md), [the data model](DATA_MODEL.md), [security requirements](SECURITY.md), [operations](OPERATIONS.md), [testing](TESTING.md), and [engineering conventions](ENGINEERING.md). Provider-specific details remain subject to documented capability checks.
@@ -10,17 +12,17 @@ The initial product serves a restaurant location through four workflows: approve
 
 The same core serves multiple restaurants. A business is a tenant; a tenant can own multiple locations. Start with one pilot location, but retain explicit location ownership in configuration, calls, requests, and connectors. A location has its own timezone, called number, hours, approved information, staff destinations, and action policy.
 
-| Decision | Reason and consequence |
-| --- | --- |
-| TypeScript, pnpm workspace | Shared validated contracts across services; compile-time types supplement runtime validation. |
-| React/Vite dashboard | Staff can configure the location, publish approved knowledge, and review requests without coupling the UI to media processing. |
-| Fastify API | Owns authentication, authorization, policy, transactional business changes, and staff APIs. |
-| Separate Node voice gateway | Long-lived authenticated WebSocket audio sessions need a suitable persistent process and bounded low-latency work. |
-| Separate Node worker | Internal inbox events, reconciliation, and future connector/delivery calls survive call disconnects and process restarts. |
-| PostgreSQL with outbox and leased jobs | Durable state, tenant constraints, and atomic enqueueing without requiring Redis in the pilot. |
-| External OIDC identity provider | Staff identity, MFA, and login lifecycle are delegated; application roles remain enforced locally. |
-| Provider adapters | Keep telephony, realtime voice, delivery, and reservation vendors replaceable. Twilio and OpenAI Realtime are provisional candidates, not verified implementation commitments. |
-| Capability-gated reservation connectors | The future OpenTable and Resy infrastructure uses official authorized access; unsupported or unverified capabilities remain unavailable. |
+| Decision                                | Reason and consequence                                                                                                                                                                                                                |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript, pnpm workspace              | Shared validated contracts across services; compile-time types supplement runtime validation.                                                                                                                                         |
+| React/Vite dashboard                    | Staff can configure the location, publish approved knowledge, and review requests without coupling the UI to media processing.                                                                                                        |
+| Fastify API                             | Owns authentication, authorization, policy, transactional business changes, and staff APIs.                                                                                                                                           |
+| Separate Node voice gateway             | Long-lived authenticated WebSocket audio sessions need a suitable persistent process and bounded low-latency work.                                                                                                                    |
+| Separate Node worker                    | Internal inbox events, reconciliation, and future connector/delivery calls survive call disconnects and process restarts.                                                                                                             |
+| PostgreSQL with outbox and leased jobs  | Durable state, tenant constraints, and atomic enqueueing without requiring Redis in the pilot.                                                                                                                                        |
+| External OIDC identity provider         | Staff identity, MFA, and login lifecycle are delegated; application roles remain enforced locally.                                                                                                                                    |
+| Provider adapters                       | Keep telephony, realtime voice, delivery, and reservation vendors replaceable. Twilio Media Streams and OpenAI Realtime are implemented as a gated sandbox bridge; account interoperability and live-call behavior remain unverified. |
+| Capability-gated reservation connectors | The future OpenTable and Resy infrastructure uses official authorized access; unsupported or unverified capabilities remain unavailable.                                                                                              |
 
 Proposed source layout:
 
@@ -67,16 +69,16 @@ flowchart TD
 
 The diagram shows logical trust boundaries, not deployment permissions. Implement least-privilege network and database permissions per component.
 
-| Boundary | Required controls |
-| --- | --- |
-| Public caller to platform | Caller speech, caller ID, uploaded audio, and prompted tool arguments are untrusted. Caller ID selects no tenant permissions and proves no identity. |
-| Phone provider to API | Verify the provider's documented signature over its required raw input/canonical URL, expected account, freshness where available, and replay identity before processing. Configure trusted proxies explicitly. |
+| Boundary                        | Required controls                                                                                                                                                                                                                                      |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Public caller to platform       | Caller speech, caller ID, uploaded audio, and prompted tool arguments are untrusted. Caller ID selects no tenant permissions and proves no identity.                                                                                                   |
+| Phone provider to API           | Verify the provider's documented signature over its required raw input/canonical URL, expected account, freshness where available, and replay identity before processing. Configure trusted proxies explicitly.                                        |
 | Phone provider to media gateway | Use the selected adapter's documented stream authentication. When supported, add short-lived, one-use stream grants bound to provider account, call ID, tenant, location, and session generation; never trust a tenant ID supplied in stream metadata. |
-| Gateway to voice provider | Server-held credentials, configured endpoint allowlist, minimal approved context, validated events, bounded payloads, and no direct database or arbitrary HTTP tools. |
-| Gateway/worker to API/database | Distinct service identities and audiences, scoped actions, tenant context derived from authenticated call/job records, and current policy checks. Internal traffic is authenticated even on a private network. |
-| Staff browser to API | OIDC validation, secure application session, CSRF protection for cookie authentication, local active membership and role checks, tenant resource ownership, and rate limits. |
-| API/worker to external vendors | Approved credential reference and restaurant scope, narrow adapter capabilities, timeouts, response validation, SSRF defenses, retry classification, and an operation ledger. |
-| Runtime to operators | Redacted telemetry; production access restricted and audited. Access to one tenant does not grant production-wide support access. |
+| Gateway to voice provider       | Server-held credentials, configured endpoint allowlist, minimal approved context, validated events, bounded payloads, and no direct database or arbitrary HTTP tools.                                                                                  |
+| Gateway/worker to API/database  | Distinct service identities and audiences, scoped actions, tenant context derived from authenticated call/job records, and current policy checks. Internal traffic is authenticated even on a private network.                                         |
+| Staff browser to API            | OIDC validation, secure application session, CSRF protection for cookie authentication, local active membership and role checks, tenant resource ownership, and rate limits.                                                                           |
+| API/worker to external vendors  | Approved credential reference and restaurant scope, narrow adapter capabilities, timeouts, response validation, SSRF defenses, retry classification, and an operation ledger.                                                                          |
+| Runtime to operators            | Redacted telemetry; production access restricted and audited. Access to one tenant does not grant production-wide support access.                                                                                                                      |
 
 Provider tenant resolution is a privileged lookup: match an authenticated provider account and an active, canonical dedicated called number to a provisioned location. Reject unknown or ambiguous mappings. Implement this as a narrowly scoped control-plane registry/function returning only mapping and tenant/location references, not unrestricted runtime access to tenant tables. Pin `search_path` and restrict `EXECUTE` for any security-definer function. Do not use a caller-supplied tenant header, model output, or an unverified forwarded-from number for this lookup. Number provisioning and reassignment must require verified restaurant ownership and preserve mapping history; active call records retain their original location.
 
@@ -177,13 +179,13 @@ Spoken agreement is product consent to the specified action, not customer identi
 
 The voice response follows durable state:
 
-| Known state | Allowed wording |
-| --- | --- |
-| Request committed and available in staff inbox | “I've saved your reservation request for staff review. Your table is not confirmed.” |
+| Known state                                                 | Allowed wording                                                                                                          |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Request committed and available in staff inbox              | “I've saved your reservation request for staff review. Your table is not confirmed.”                                     |
 | Future external delivery acknowledged by configured channel | “I've sent your request to the restaurant. Your table is not confirmed; staff will follow up according to their policy.” |
-| Database submission failed | “I couldn't save the request. I can connect you to staff or take another approved next step.” |
-| Future booking outcome unknown | “I don't yet have confirmation. Please don't submit another booking while we check; I can arrange staff help.” |
-| Future booking authoritatively confirmed | State only the confirmed details and returned reservation reference permitted by policy. |
+| Database submission failed                                  | “I couldn't save the request. I can connect you to staff or take another approved next step.”                            |
+| Future booking outcome unknown                              | “I don't yet have confirmation. Please don't submit another booking while we check; I can arrange staff help.”           |
+| Future booking authoritatively confirmed                    | State only the confirmed details and returned reservation reference permitted by policy.                                 |
 
 Use server-authored outcome wording for action status, including the mandatory unconfirmed-request distinction; the model may not paraphrase a saved request into a confirmed booking. Delivery acknowledgement is not staff attention. Never promise a callback window without a configured and realistic restaurant commitment. Disconnect after commit does not delete the request; disconnect before confirmed submission does not silently submit a draft.
 
@@ -235,13 +237,13 @@ Persist a transfer attempt and minimal approved handoff summary before issuing p
 
 Use provider-supported supervised transfer/bridge behavior only after verification. Establish and observe the staff leg before releasing AI control when the provider supports this. Stop AI playback and further caller tools once the staff leg is bridged. A provider leg `answered` can mean voicemail or an IVR; report a connected leg, not proven human receipt. Unsupported warm transfer features must have an explicit simpler tested fallback.
 
-| Transfer outcome | Behavior |
-| --- | --- |
-| Staff leg connected | Complete supported handoff and end AI participation; record provider evidence. |
-| Busy, rejected, or no answer | Retain/resume caller session if supported; offer a message or an approved alternate. |
-| Outcome uncertain | Observe/reconcile before a new leg; never create a second simultaneous transfer by assuming failure. |
-| Caller disconnects | Stop dialing/cancel unconnected staff leg where supported; retain audit and committed messages. |
-| Platform failure | Use provider-configured fallback; no dependency on the failed model or database for its destination. |
+| Transfer outcome             | Behavior                                                                                             |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Staff leg connected          | Complete supported handoff and end AI participation; record provider evidence.                       |
+| Busy, rejected, or no answer | Retain/resume caller session if supported; offer a message or an approved alternate.                 |
+| Outcome uncertain            | Observe/reconcile before a new leg; never create a second simultaneous transfer by assuming failure. |
+| Caller disconnects           | Stop dialing/cancel unconnected staff leg where supported; retain audit and committed messages.      |
+| Platform failure             | Use provider-configured fallback; no dependency on the failed model or database for its destination. |
 
 A staff summary may contain caller-provided details only within the location's configured delivery policy. The pilot stores this context in the authenticated dashboard; no external messaging channel or private spoken whisper is assumed. Do not speak a private staff summary on the shared caller leg. Future handoff channels must verify staff-only access; omit sensitive details when that channel cannot establish recipient access. An unavailable summary must not prevent a requested human transfer when the transfer itself is possible.
 
@@ -257,20 +259,20 @@ Require application ownership checks plus PostgreSQL row-level security for tena
 
 Proposed first-party API contracts, subject to implementation review:
 
-| Surface | Representative contract | Authorization and behavior |
-| --- | --- | --- |
-| Staff | `GET /v1/tenants/:tenantId/locations/:locationId` | Active membership plus location scope; approved response fields only. |
-| Staff | `POST .../config-revisions`, `POST .../config-revisions/:id/publish` | Separate edit/publish permissions; optimistic version check and approval audit. |
-| Staff | `GET .../reservation-requests`, `PATCH .../reservation-requests/:id` | Scoped role; versioned disposition update; no vendor reservation implication. |
-| Staff | `GET .../messages`, `PATCH .../messages/:id` | Scoped host/manager actions; redacted response where role requires it. |
-| Staff | `GET .../integrations` | Capability/health status only; never return credential values. |
-| Internal | `POST /internal/v1/calls/:callId/proposals` | Authenticated gateway, active generation, call-derived tenant/location, typed action. |
-| Internal | `POST /internal/v1/calls/:callId/confirmations` | Valid proposal and linked readback/agreement turn; bound expiry. |
-| Internal | `POST /internal/v1/calls/:callId/actions` | Current policy, unused confirmation where required, stable idempotency key. |
-| Internal | `POST /internal/v1/calls/:callId/actions/:actionId/cancel-pending` | Future vendor actions only: same active call/current generation; atomic race with first dispatch admission. Saved request changes remain a staff workflow. |
-| Internal | `GET /internal/v1/calls/:callId/actions/:actionId` | Same service/call scope; typed durable outcome, minimal fields. |
-| Provider webhook | Adapter-specific public route | Vendor-documented verification, account binding, deduplication, body limits. |
-| Media | Adapter-specific WebSocket route | Provider authentication and bound stream grant; strict schema, frame limits. |
+| Surface          | Representative contract                                              | Authorization and behavior                                                                                                                                 |
+| ---------------- | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Staff            | `GET /v1/tenants/:tenantId/locations/:locationId`                    | Active membership plus location scope; approved response fields only.                                                                                      |
+| Staff            | `POST .../config-revisions`, `POST .../config-revisions/:id/publish` | Separate edit/publish permissions; optimistic version check and approval audit.                                                                            |
+| Staff            | `GET .../reservation-requests`, `PATCH .../reservation-requests/:id` | Scoped role; versioned disposition update; no vendor reservation implication.                                                                              |
+| Staff            | `GET .../messages`, `PATCH .../messages/:id`                         | Scoped host/manager actions; redacted response where role requires it.                                                                                     |
+| Staff            | `GET .../integrations`                                               | Capability/health status only; never return credential values.                                                                                             |
+| Internal         | `POST /internal/v1/calls/:callId/proposals`                          | Authenticated gateway, active generation, call-derived tenant/location, typed action.                                                                      |
+| Internal         | `POST /internal/v1/calls/:callId/confirmations`                      | Valid proposal and linked readback/agreement turn; bound expiry.                                                                                           |
+| Internal         | `POST /internal/v1/calls/:callId/actions`                            | Current policy, unused confirmation where required, stable idempotency key.                                                                                |
+| Internal         | `POST /internal/v1/calls/:callId/actions/:actionId/cancel-pending`   | Future vendor actions only: same active call/current generation; atomic race with first dispatch admission. Saved request changes remain a staff workflow. |
+| Internal         | `GET /internal/v1/calls/:callId/actions/:actionId`                   | Same service/call scope; typed durable outcome, minimal fields.                                                                                            |
+| Provider webhook | Adapter-specific public route                                        | Vendor-documented verification, account binding, deduplication, body limits.                                                                               |
+| Media            | Adapter-specific WebSocket route                                     | Provider authentication and bound stream grant; strict schema, frame limits.                                                                               |
 
 These are platform API examples, not Resy, OpenTable, Twilio, or OpenAI endpoints. Use an OpenAPI document and shared schemas when implementing. Public staff errors avoid revealing cross-tenant resource existence. Internal action responses use an explicit discriminated outcome, such as `saved_pending_staff_review`, `confirmed_reservation`, `expired_before_dispatch`, `blocked`, `failed`, or `unknown`; future external delivery has its own outcome. Do not flatten them to a misleading `success: true`.
 
@@ -294,19 +296,19 @@ Deployment readiness requires an actual provider proof for signatures, media for
 
 This design closes several common gaps by making business state authoritative, separating request delivery from confirmation, fencing call owners, using atomic outbox writes, and treating unknown external outcomes as reconciliation work. Implementation must prove these controls; prose alone does not provide them.
 
-| Dependency or gap | Required resolution before relevant release |
-| --- | --- |
-| Pilot restaurant and operating region | Approve actual hours, request rules, languages, follow-up process, transfer numbers, disclosure, and retention. |
-| Phone/media provider capabilities | Demonstrate signed webhooks, authenticated media, forwarding/caller-ID behavior, interruption handling, leg state, no-answer recovery, and outage fallback in staging. |
-| Voice provider handling | Verify realtime event format, cancellation, latency, region, retention settings, data use terms, and reconnect behavior. |
-| Staff inbox fulfillment | Assign dashboard inbox owners and review targets; test acknowledgement, review claim, in-fulfillment holds, manual booking evidence, guest notice, and prolonged backlog. External delivery is a separate future gate. |
-| Exact confirmation recognition | Implement conservative turn-linked confirmation; test corrections, interruptions, ambiguity, stale turns, and noisy audio before submitting caller requests. |
-| Authentication and RLS | Select OIDC provider, roles, service identities, tenant-context mechanism, and DB role privileges; prove cross-tenant denial and pool reuse behavior. |
-| OpenTable/Resy access | Obtain official authorized access per restaurant and document capability evidence; request-only mode remains usable without it. |
-| Sensitive reservation lookup/change | Define independent caller verification, scoped short-lived grants, abuse controls, and authorized connector behavior before enabling. |
-| Recording/transcript retention | Approve region-specific disclosure and consent, processor configuration, retention periods, deletion propagation, and backup treatment. |
-| Restore/security state | Establish independent recovery/auth epoch and evidence coverage; test session/grant invalidation, current-authority reauthorization, routing reassignment, cancellation/revocation rollback, deletion replay, and no automatic write redrive. |
-| Transfer and recovery races | Demonstrate exactly one active controller and no duplicate legs under reconnect, callback reordering, crash, or deployment drain. |
-| Capacity and cost | Set measurable latency, concurrent-call, worker backlog, and cost objectives after provider prototype; exercise backpressure and budget fallbacks. |
+| Dependency or gap                     | Required resolution before relevant release                                                                                                                                                                                                   |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pilot restaurant and operating region | Approve actual hours, request rules, languages, follow-up process, transfer numbers, disclosure, and retention.                                                                                                                               |
+| Phone/media provider capabilities     | Demonstrate signed webhooks, authenticated media, forwarding/caller-ID behavior, interruption handling, leg state, no-answer recovery, and outage fallback in staging.                                                                        |
+| Voice provider handling               | Verify realtime event format, cancellation, latency, region, retention settings, data use terms, and reconnect behavior.                                                                                                                      |
+| Staff inbox fulfillment               | Assign dashboard inbox owners and review targets; test acknowledgement, review claim, in-fulfillment holds, manual booking evidence, guest notice, and prolonged backlog. External delivery is a separate future gate.                        |
+| Exact confirmation recognition        | Implement conservative turn-linked confirmation; test corrections, interruptions, ambiguity, stale turns, and noisy audio before submitting caller requests.                                                                                  |
+| Authentication and RLS                | Select OIDC provider, roles, service identities, tenant-context mechanism, and DB role privileges; prove cross-tenant denial and pool reuse behavior.                                                                                         |
+| OpenTable/Resy access                 | Obtain official authorized access per restaurant and document capability evidence; request-only mode remains usable without it.                                                                                                               |
+| Sensitive reservation lookup/change   | Define independent caller verification, scoped short-lived grants, abuse controls, and authorized connector behavior before enabling.                                                                                                         |
+| Recording/transcript retention        | Approve region-specific disclosure and consent, processor configuration, retention periods, deletion propagation, and backup treatment.                                                                                                       |
+| Restore/security state                | Establish independent recovery/auth epoch and evidence coverage; test session/grant invalidation, current-authority reauthorization, routing reassignment, cancellation/revocation rollback, deletion replay, and no automatic write redrive. |
+| Transfer and recovery races           | Demonstrate exactly one active controller and no duplicate legs under reconnect, callback reordering, crash, or deployment drain.                                                                                                             |
+| Capacity and cost                     | Set measurable latency, concurrent-call, worker backlog, and cost objectives after provider prototype; exercise backpressure and budget fallbacks.                                                                                            |
 
 Defer voiceprints and synthetic-voice scoring until a separate threat model, verified enrollment/consent, revocation/deletion design, vendor evaluation, and false-match/spoofing assessment exist. Any such signal remains advisory and cannot authorize sensitive actions.

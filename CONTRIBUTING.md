@@ -1,79 +1,98 @@
 # Contributing
 
-This project is in its documentation phase. There is no runnable application, package manifest, test runner, CI workflow, database migration runner, or configured provider integration yet. The standards below describe how implementation work should proceed; they are not implemented controls.
-
-Start with [the build brief](BUILD_BRIEF.md), [architecture](docs/ARCHITECTURE.md), [implementation plan](docs/IMPLEMENTATION_PLAN.md), [security guidance](docs/SECURITY.md), and [engineering standards](docs/ENGINEERING.md). Coding agents must also follow [AGENTS.md](AGENTS.md).
+Hostline has a runnable local synthetic prototype. Start with [implementation status](docs/IMPLEMENTATION_STATUS.md), [the build brief](BUILD_BRIEF.md), [architecture](docs/ARCHITECTURE.md), [security guidance](docs/SECURITY.md), and [engineering standards](docs/ENGINEERING.md). Coding agents must also follow [AGENTS.md](AGENTS.md). Architecture and rollout documents contain requirements beyond the current implementation; code or a passing mock test does not establish a live integration.
 
 ## Scope and branch workflow
 
-Choose a small, independently reviewable task from the implementation plan. State its user-visible behavior and acceptance criteria before coding. The first pilot uses reservation requests for staff review, while mocks exercise future connector contracts. Building a provider adapter interface does not authorize live reservations or prove access to Resy or OpenTable.
+Choose an independently reviewable task from [the implementation plan](docs/IMPLEMENTATION_PLAN.md). State its observable behavior and acceptance criteria. The first pilot uses reservation requests for staff review; a saved request is never a confirmed table. Connector interfaces do not authorize live reservations or establish Resy/OpenTable access.
 
-Inspect `git status`, the current branch, remotes, and existing scripts first. Use a task branch when appropriate to the repository workflow; do not move or discard someone else's work to create one. Keep unrelated formatting, dependency upgrades, and refactors out of the change. Stage only explicit task paths and review the staged diff before committing. Commit and push when the user or established workflow authorizes them. Never force-push or rewrite shared history as a routine cleanup.
+Inspect `git status`, the current branch, remotes, and relevant scripts first. Use a task branch when appropriate. Preserve user changes and other agents' edits; do not reset, discard, stash, or reformat unrelated work. Stage explicit task paths and inspect the staged diff. Commit and push when requested or already authorized. Do not force-push or rewrite shared history without specific authorization.
 
-In shared workspaces, agree on file ownership before parallel edits. Avoid multiple agents editing a common manifest or migration sequence independently. The coordinating contributor resolves integration conflicts and checks the complete change.
+In a shared workspace, assign distinct file ownership before parallel edits. One contributor owns common manifests, lockfiles, migrations, integration, and final Git operations. Resolve ownership conflicts directly rather than overwriting another contributor's changes.
 
-## Planned development environment
+## Local development
 
-The implementation baseline is a pinned, supported Node.js LTS release, strict TypeScript, and `pnpm` workspaces with a committed lockfile. Select and record exact versions in the scaffold milestone; do not assume they are installed or configured today. Use the same pinned versions locally and in CI. Provide `.env.example` with placeholder values and explanations only; actual credentials belong in the approved secret store or ignored local configuration.
+Use Node.js **24.19.0** (`.node-version`) and pnpm **11.19.0** (`package.json`). Install the committed dependency graph, then run the demo:
 
-Planned layout:
-
-```text
-apps/dashboard/       React + Vite staff dashboard
-apps/api/             Fastify control API
-apps/voice-gateway/   Persistent WebSocket and call lifecycle service
-apps/worker/          Node.js delivery, reconciliation, retention jobs
-packages/domain/     Provider-independent business rules
-packages/contracts/  Runtime schemas and versioned API/event contracts
-packages/connectors/ Capability contracts, mock adapters, approved vendor adapters
-packages/config/     Configuration validation and environment loading
-packages/observability/ Redacted logs, metrics, traces
+```sh
+pnpm install --frozen-lockfile
+cp .env.example .env
+pnpm dev
 ```
 
-Each application's runtime dependencies and start command must be explicit. The voice gateway needs hosting that supports persistent audio connections, draining, and the provider's connection limits. Do not assume that a generic stateless function runtime meets those requirements.
+The dashboard is at `http://127.0.0.1:5173` and proxies `/api` to `127.0.0.1:3001`. Use the exact configured origin. Default demo authentication is allowed only on loopback and uses synthetic Harbor Table and Juniper Kitchen workspaces. No Twilio, OpenAI, OIDC, or database-server credentials are needed.
 
-## Proposed command contract
+The API stores data in `.data/hostline` using PGlite, PostgreSQL compiled to WebAssembly. Seeds are idempotent: restart preserves edited settings, requests, and receipts. Its transaction mutex prevents overlapping tenant contexts on the embedded connection. Run one API process per embedded data directory; do not start a separate worker against it. Internal jobs run in the API process. Session state is in memory and is lost on restart.
 
-The scaffold must define and document these scripts before contributors can use them. These commands are **planned, unavailable today**:
+API, voice gateway, migration, and worker entrypoints load a root `.env` when present. Keep secrets in environment configuration or ignored `.env`; never put them in chat, committed files, fixtures, screenshots, or frontend variables. Copying `.env.example` leaves the phone gateway disabled.
 
-| Proposed command | Required purpose |
-| --- | --- |
-| `pnpm install --frozen-lockfile` | Reproduce locked dependencies once the manifest and lockfile exist. |
-| `pnpm dev` | Start a documented local environment using mock connectors by default. |
-| `pnpm format:check` | Check formatting without modifying files. |
-| `pnpm lint` | Check source and dependency boundary rules. |
-| `pnpm typecheck` | Check every workspace with strict TypeScript. |
-| `pnpm test` | Run deterministic unit and behavioral tests without provider credentials. |
-| `pnpm test:integration` | Exercise real PostgreSQL isolation, constraints, jobs, and API contracts in a disposable test environment. |
-| `pnpm test:e2e` | Verify staff workflows and simulated calls against the local test environment. |
-| `pnpm build` | Build every deployable application and required packages. |
+```text
+apps/dashboard/         React/Vite staff dashboard
+apps/api/               Fastify auth, configuration, inbox, simulator APIs
+apps/voice-gateway/     Optional Twilio/OpenAI FAQ sandbox
+apps/worker/            Native PostgreSQL internal job worker
+packages/contracts/    Shared Zod schemas and TypeScript contracts
+packages/domain/       Conversation, time, confirmation, fulfillment rules
+packages/database/     PGlite/pg adapters, migrations, synthetic seed
+packages/connectors/   Capability gates, fake adapters, future-write rules
+packages/config/       Validated server environment and startup gates
+packages/observability/ Safe structured operational events
+tests/                 Credential-free behavioral and browser tests
+```
 
-When implementation adds a script, document its prerequisites, expected environment, and what it excludes. Provider sandbox checks must be separate from credential-free defaults and require authorized sandbox access. Production migrations and deployment are separate operational procedures, never an incidental side effect of `dev`, `test`, or `build`.
+## Commands and prerequisites
 
-Until the scaffold exists, documentation validation means inspecting the changes, verifying internal links, checking consistency across specifications, and checking Git whitespace. Do not report lint, typecheck, or tests as passed when those tools do not exist.
+| Command                               | What it does                                                                                  |
+| ------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `pnpm install --frozen-lockfile`      | Reproduce locked dependencies.                                                                |
+| `pnpm dev`                            | Start the local API and Vite dashboard together.                                              |
+| `pnpm dev:api` / `pnpm dev:dashboard` | Start one component when debugging. Avoid a second API on the same data directory.            |
+| `pnpm dev:voice`                      | Start the separate voice gateway; disabled without explicit sandbox configuration.            |
+| `pnpm format:check` / `pnpm format`   | Check formatting / rewrite formatting. Limit writes to owned files in shared work.            |
+| `pnpm lint`                           | Run ESLint on repository source.                                                              |
+| `pnpm typecheck`                      | Check workspace source and tests with strict TypeScript.                                      |
+| `pnpm test`                           | Run credential-free domain, connector, auth, API, PGlite, and mocked voice tests.             |
+| `pnpm test:e2e`                       | Run Playwright dashboard and simulated-workflow tests; requires Chromium.                     |
+| `pnpm build`                          | Bundle API, worker, and voice services; build the dashboard. No deployment occurs.            |
+| `pnpm check`                          | Run formatting, lint, typecheck, deterministic tests, and builds. Browser tests are separate. |
+| `pnpm start`                          | Start the built API. Does not serve or deploy the dashboard.                                  |
+| `pnpm db:migrate`                     | Apply checked-in migrations to `DATABASE_MIGRATION_URL` with a dedicated migration identity.  |
+| `pnpm worker`                         | Run internal jobs against provisioned native PostgreSQL using `DATABASE_URL`.                 |
 
-## Implementation and tests
+Install the browser with `pnpm exec playwright install chromium` (CI also installs OS dependencies). Inspect Playwright configuration before using a custom environment. Browser tests use synthetic workspaces and may modify demo records.
 
-Follow the [engineering standards](docs/ENGINEERING.md). Use deterministic validation and authorization outside model prompts. Keep restaurant requests distinct from confirmed provider bookings. Test outcomes including failures and retries, not only the happy path.
+Default database tests use PGlite's actual PostgreSQL engine for SQL constraints, RLS, transactions, and persistence. They do not exercise a native server's network pooling, TLS, identity grants, or operations. There is no separate `test:integration` script: credential-free database/API integration tests are part of `pnpm test`.
 
-Meaningful tests include another tenant attempting to read a message, duplicate webhooks attempting a second write, a connector timing out after committing a booking, a worker crashing between storage and delivery, an ambiguous daylight-saving time, a failed transfer, and staff handling a request concurrently. Use synthetic restaurants and callers. Do not add tests solely to mirror private helper implementation, snapshot large unimportant output, or inflate coverage. A typo or other low-impact documentation change usually needs review rather than a new test.
+Provider sandbox checks are separate. Do not initiate real calls, forward a restaurant number, submit real reservations, or contact customers as incidental verification. Follow [voice setup](docs/VOICE_SETUP.md) and record which real-provider scenarios were actually verified.
 
-For API or database changes, update schemas, migration notes, and compatibility handling. For authorization, connector write behavior, caller confirmation, retention, and time resolution, include tests that would fail if the intended invariant breaks. Review database migrations against a disposable database with representative synthetic data and the actual restricted application role.
+## Native PostgreSQL and development OIDC
 
-## Documentation and decisions
+The `pg` adapter and OIDC flow are implemented; deployment/provisioning remains an operator task. Use a disposable development database, migrate through `DATABASE_MIGRATION_URL`, and configure a separate `DATABASE_URL` runtime identity. That identity must be able to assume `hostline_app` and `hostline_worker`, must not own protected tables, and must not be a superuser or have `BYPASSRLS`. Verify actual grants and forced RLS on the target server. PostgreSQL-backed API startup does not migrate or insert demo tenants.
 
-Update affected documentation in the same change. Keep the build brief, architecture, security requirements, connector matrix, and implementation plan consistent. Document operational behavior when adding services, external dependencies, background jobs, or rollout steps.
+Provision authorized tenant configuration through a controlled operator procedure; a subject mapping alone does not create a restaurant. Configure an HTTPS OIDC issuer/client, the dashboard's exact HTTPS origin, callback `/api/auth/callback`, a strong persistent session secret, and explicit `OIDC_MEMBERSHIPS`. Each verified subject maps to one tenant and one `owner`, `staff`, or `viewer` role. Provider claims and browser tenant fields do not grant membership. OIDC code/PKCE/state/nonce composition is covered with a mocked provider; verify a real identity provider separately.
 
-The initial ADR-001 through ADR-008 records are in [docs/DECISIONS.md](docs/DECISIONS.md). Add subsequent architecture decision records under `docs/adr/` for decisions with lasting consequences, such as provider selection, identity provider, deployment runtime, data retention defaults, queue design, or a contract change; continue the numbering and link the relevant initial records. The future ADR directory is not yet required scaffolding. Each new record should contain status, context, decision, alternatives considered, consequences, validation, and links to related decisions. Mark superseded records explicitly rather than erasing the decision history.
+Sessions live in one API process for at most eight hours. Shared session storage, durable membership administration/revocation, MFA verification, and production deployment controls remain launch gates. `NODE_ENV=production` is deliberately rejected; removing its guard does not complete those gates.
 
-## Pull requests and review
+## Implementation and meaningful tests
 
-Use [.github/pull_request_template.md](.github/pull_request_template.md). Describe the behavior a reviewer can evaluate, the exact checks performed, and material limitations. Mark checks as not applicable or not run with a reason when appropriate; unchecked or documented controls do not establish safety.
+Keep business rules independent of Fastify, UI components, database drivers, and provider SDKs. Use strict TypeScript plus runtime schemas at trust boundaries. Derive tenant identity and permissions from verified server context. Use parameterized queries, explicit transaction scope, tenant-safe keys, optimistic versions, and supported capabilities.
 
-Reviewers should verify the intended behavior, tenant and role authorization, caller-facing claims, bounded retries and uncertain outcomes, failure recovery, data minimization, migration compatibility, and test evidence. Changes to authentication, tenant isolation, provider writes, phone routing, and retention need review by someone responsible for those areas once maintainers are assigned. Independent agent review is useful evidence, but does not substitute for required repository or release approvals.
+Prioritize tests for cross-tenant access, stale edits, duplicate confirmation, concurrent fulfillment, ambiguous dates/DST, failed callbacks, uncertain writes, expired leases, and attempts to expand model permissions. Use fake clocks or synchronization instead of arbitrary sleeps. Do not add tests solely to mirror private implementation or inflate coverage.
 
-Merge requirements and branch protection are planned, not configured. The scaffold/CI milestone must establish automated formatting, lint, typecheck, tests, builds, secret scanning, and dependency review, then document which are blocking. Do not claim these gates exist before configuration is verified.
+For database changes, include ordered migrations, runtime-role checks, compatibility notes, and recovery impact. For remote writes, require explicit confirmation, durable idempotency, bounded timeouts, and reconciliation. The existing future-write simulation is not a durable external operation service; keep live writes disabled until that service and provider contracts are verified.
 
-## Reporting security concerns
+Preserve truthful UI and caller status. Staff booking evidence is `STAFF_REPORTED`; guest communication is separate. Simulator confirmation uses a visible explicit button; it does not prove voice confirmation or audio readback delivery. Keep recordings, biometric enrollment, payments, and live customer messaging outside incidental development.
 
-Do not publish credentials, caller records, or exploit details in a public issue or PR. Use the repository's private reporting mechanism once it is configured. Until then, privately notify the project owner through an already authorized channel, describe the affected component and reproduction using synthetic data, and avoid broadcasting sensitive details. Do not use live customer data to demonstrate a vulnerability.
+## Documentation, decisions, and review
+
+Update affected docs with the change, especially [implementation status](docs/IMPLEMENTATION_STATUS.md). Explain implemented behavior, checks run, and operational dependencies. Preserve incomplete requirements in architecture/security docs and link the gap rather than silently weakening them.
+
+ADR-001 through ADR-008 are in [initial decisions](docs/DECISIONS.md). New records live under `docs/adr/`, beginning with [ADR-009](docs/adr/009-local-prototype.md). Record consequential decisions with context, alternatives, consequences, evidence, and reconsideration criteria. Mark superseded records explicitly.
+
+Use [the PR template](.github/pull_request_template.md). Lead with the concrete change and resulting behavior, then verification and limitations. Review tenant/role access, runtime validation, confirmed-field binding, retry uncertainty, privacy, migration impact, and failure recovery. Authentication, tenant isolation, provider-write, and phone-routing changes need independent review; agent review does not replace accountable launch approval.
+
+GitHub Actions is configured to install dependencies, run checks, and run browser tests. Report its result only after observing the run. Branch protection, required checks, secret scanning, dependency-review enforcement, and protected deployment environments need separate verification. A workflow file alone does not prove enforcement. Default CI must not receive production secrets or make provider writes.
+
+## Security reporting
+
+Follow [SECURITY.md](SECURITY.md). Do not put credentials, caller records, or sensitive exploit details in public issues or PRs. Use synthetic reproductions and an already authorized private reporting channel. Do not use live customer data to demonstrate a vulnerability.

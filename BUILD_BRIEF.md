@@ -1,6 +1,6 @@
 # AI phone receptionist: restaurant pilot
 
-Status: product brief for the accepted request-only pilot. See the [implementation plan](docs/IMPLEMENTATION_PLAN.md) and [architecture](docs/ARCHITECTURE.md) for the detailed design. No application is implemented yet.
+Status: product brief for the accepted request-only pilot. A local synthetic dashboard, simulator, staff inbox, and tenant-isolated persistence are implemented. The optional phone gateway is an FAQ-only sandbox awaiting real-provider verification; live request submission and staff transfers are still pending. The sections below describe the target pilot. See [implementation status](docs/IMPLEMENTATION_STATUS.md) for delivered behavior and [the implementation plan](docs/IMPLEMENTATION_PLAN.md) and [architecture](docs/ARCHITECTURE.md) for the detailed design.
 
 ## Product goal
 
@@ -59,7 +59,7 @@ flowchart TD
 - **Business dashboard:** Edit restaurant details, configure transfers and allowed actions, approve knowledge, review messages and call outcomes, fulfill reservation requests, and manage integration status. Initial request delivery is to this authenticated dashboard; additional staff notification channels are separately configured integrations.
 - **Storage and jobs:** Store restaurants, configuration revisions, calls, tool outcomes, reservation references, messages, and delivery status in a tenant-scoped database. Use background jobs for delivery and reconciliation. Keep provider credentials on the server.
 
-The proposed baseline is a TypeScript/pnpm monorepo with a React/Vite dashboard, Fastify API, separate Node.js voice gateway for persistent streaming connections, Node.js worker, external OIDC staff authentication, and PostgreSQL with a durable outbox. Select phone and realtime voice providers after checking their current capabilities, API access, and deployment requirements.
+The implemented baseline is a TypeScript/pnpm monorepo with a React/Vite dashboard, Fastify API, separate Node.js voice gateway for persistent streaming connections, Node.js worker, optional development OIDC staff authentication, and PostgreSQL with a durable outbox. PGlite supplies the embedded PostgreSQL engine for the local synthetic demo; a native `pg` adapter supports separately provisioned development environments. Twilio Media Streams and OpenAI Realtime supply the phone sandbox integration code. Actual account interoperability, audio behavior, provider limits, privacy settings, and deployment requirements still need verification before live rollout.
 
 ## Restaurant configuration
 
@@ -92,4 +92,6 @@ Measure confirmed reservation accuracy, transfer completion, message delivery, c
 
 ## Current workspace status
 
-This document is a build brief. No application or live phone service has been created. The managed workspace is running, but no phone, voice, or reservation provider credentials are configured for this task. The pilot workflow is staff-confirmed requests; provider discovery and the domain/simulator scaffold are the next implementation milestones. Detailed documentation in [README.md](README.md) guides the subsequent build.
+The local prototype now includes persistent synthetic restaurants, configuration editing, a deterministic conversation simulator, explicit request/message confirmation, and a staff fulfillment workflow. The selected phone and voice accounts will be configured through environment secrets; code and mocked tests do not establish a working live line. Resy/OpenTable access, OIDC provider selection, production infrastructure, and pilot approval remain external dependencies.
+
+Run the demo using [README.md](README.md), then consult [implementation status](docs/IMPLEMENTATION_STATUS.md) and [voice setup](docs/VOICE_SETUP.md) for the next verification milestone. Production startup is intentionally blocked until the outstanding security and operational requirements are implemented and reviewed.

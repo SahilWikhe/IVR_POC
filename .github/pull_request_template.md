@@ -4,7 +4,7 @@ Describe the concrete problem and resulting behavior. Link the relevant plan mil
 
 ## Validation
 
-List checks actually performed and their results. For any relevant check not run, explain why and its impact. During the documentation phase, application lint/typecheck/tests/build are unavailable.
+List checks actually performed and their results. For any relevant check not run, explain why and its impact. Refer to the implementation status for checks that remain gated on external systems.
 
 ## Security and reliability review
 

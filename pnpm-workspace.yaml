@@ -1,0 +1,12 @@
+packages:
+  - apps/*
+  - packages/*
+allowBuilds:
+  agent-browser: true
+  esbuild: true
+minimumReleaseAgeExclude:
+  - vitest@5.0.3
+  - '@vitest/mocker@5.0.3'
+  - '@vitest/spy@5.0.3'
+overrides:
+  esbuild: 0.28.2

@@ -1,0 +1,16 @@
+{
+  "name": "@hostline/database",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@hostline/contracts": "workspace:*",
+    "@hostline/domain": "workspace:*",
+    "@electric-sql/pglite": "0.5.8",
+    "pg": "^8.18.0",
+    "zod": "^4.3.0"
+  }
+}

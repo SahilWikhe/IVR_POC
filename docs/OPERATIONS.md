@@ -1,5 +1,7 @@
 # Deployment and operations
 
+Implementation evidence: see [current prototype status](IMPLEMENTATION_STATUS.md) and [ADR-009](adr/009-local-prototype.md). The requirements below include later pilot and production work; they are not all implemented.
+
 Status: intended production design and runbooks. No infrastructure is deployed and no measured service level is asserted. Hosting, vendors, region, and commercial plans must be chosen in implementation milestone 0.
 
 ## Deployment topology
@@ -26,16 +28,16 @@ Raw recording is off. Use a separate restricted durable recovery journal, such a
 
 These are initial engineering targets, subject to measured tests and restaurant agreement. They are not contractual guarantees.
 
-| Signal | Initial target / response |
-| --- | --- |
-| Caller turn to start of useful audio | p95 below 2 seconds for simple FAQ answers under defined pilot load; measure the full path |
-| Staff API availability | Aim for 99.5% monthly during pilot; agree coverage and exclusions before production commitments |
-| Request/message persistence | Never report saved until transaction commit; alert immediately on persistence failures |
-| Outbox processing lag | p95 below 30 seconds under pilot load; alert if oldest pending item exceeds 60 seconds; dashboard inbox visibility follows request commit directly |
-| Staff acknowledgment | Restaurant-defined business-hours target; dashboard alerts on stale unacknowledged requests |
-| Transfers | Record actual answered/no-answer/failure outcomes; do not set a success target until provider behavior is measured |
-| Booking outcome integrity | Zero known false confirmations or duplicate bookings; incident review for any occurrence |
-| Recovery point / recovery time | Proposed RPO at most 15 minutes and RTO at most 2 hours for durable records; verify backup/PITR capability and restoration drills before claiming support |
+| Signal                               | Initial target / response                                                                                                                                 |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Caller turn to start of useful audio | p95 below 2 seconds for simple FAQ answers under defined pilot load; measure the full path                                                                |
+| Staff API availability               | Aim for 99.5% monthly during pilot; agree coverage and exclusions before production commitments                                                           |
+| Request/message persistence          | Never report saved until transaction commit; alert immediately on persistence failures                                                                    |
+| Outbox processing lag                | p95 below 30 seconds under pilot load; alert if oldest pending item exceeds 60 seconds; dashboard inbox visibility follows request commit directly        |
+| Staff acknowledgment                 | Restaurant-defined business-hours target; dashboard alerts on stale unacknowledged requests                                                               |
+| Transfers                            | Record actual answered/no-answer/failure outcomes; do not set a success target until provider behavior is measured                                        |
+| Booking outcome integrity            | Zero known false confirmations or duplicate bookings; incident review for any occurrence                                                                  |
+| Recovery point / recovery time       | Proposed RPO at most 15 minutes and RTO at most 2 hours for durable records; verify backup/PITR capability and restoration drills before claiming support |
 
 Keep persistence correctness separate from uptime and conversational quality. Vendor unavailability must lead to an honest fallback even when the gateway itself is healthy.
 
@@ -57,19 +59,19 @@ Alerts need an assigned owner and runbook: persistence failure, unknown vendor w
 
 ## Failure and incident runbooks
 
-| Trigger | Immediate behavior | Recovery and verification |
-| --- | --- | --- |
-| Voice/model outage | Use tested carrier/provider fallback or transfer/message route; do not fabricate answers | Disable affected capability, verify test call, restore gradually |
-| Gateway/API outage | Carrier/provider-level fallback should work without the application if the chosen provider supports it | Route to configured staff/voicemail, repair service, verify no forwarding loop |
-| Database unavailable | Stop new writes; never claim a request/message was saved | Restore connectivity, reconcile completed actions, check jobs after recovery |
-| Reservation vendor unavailable before write | Explain limitation and offer a request with caller agreement | Circuit-break adapter; retry read probes within budgets |
-| Vendor write result unknown | Keep action unresolved; do not issue a second booking or fallback that may duplicate it | Reconcile by supported vendor evidence or assign staff resolution; record evidence |
-| Future booking waits beyond `execute_before` | Prevent first dispatch and record `EXPIRED_BEFORE_DISPATCH` only when no attempt was sent | Require fresh agreement/new linked work; if dispatch occurred or is uncertain, continue reconciliation instead |
-| Credential revoked/expired | Disable affected tenant capability and refuse stale worker actions | Rotate through approved secrets workflow, verify authorization, re-enable narrowly |
-| Worker lease expires | Permit a new worker only with correct fencing; retain durable result ledger | Ensure stale worker cannot commit a conflicting result or duplicate an unsafe write |
-| Inbox request becomes stale | Flag for restaurant staff; use only agreed escalation process | Record staff acknowledgment/follow-up, adjust staffing or expectations |
-| Security/tenant-isolation incident | Disable affected access/actions, protect evidence, involve responsible owner | Scope impact, rotate affected credentials if needed, assess notification obligations, verify fix |
-| Unexpected cost/toll abuse | Apply tenant/global budgets and configured fallback | Stop leaked sessions, inspect redacted events, verify provider billing evidence |
+| Trigger                                      | Immediate behavior                                                                                     | Recovery and verification                                                                                      |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| Voice/model outage                           | Use tested carrier/provider fallback or transfer/message route; do not fabricate answers               | Disable affected capability, verify test call, restore gradually                                               |
+| Gateway/API outage                           | Carrier/provider-level fallback should work without the application if the chosen provider supports it | Route to configured staff/voicemail, repair service, verify no forwarding loop                                 |
+| Database unavailable                         | Stop new writes; never claim a request/message was saved                                               | Restore connectivity, reconcile completed actions, check jobs after recovery                                   |
+| Reservation vendor unavailable before write  | Explain limitation and offer a request with caller agreement                                           | Circuit-break adapter; retry read probes within budgets                                                        |
+| Vendor write result unknown                  | Keep action unresolved; do not issue a second booking or fallback that may duplicate it                | Reconcile by supported vendor evidence or assign staff resolution; record evidence                             |
+| Future booking waits beyond `execute_before` | Prevent first dispatch and record `EXPIRED_BEFORE_DISPATCH` only when no attempt was sent              | Require fresh agreement/new linked work; if dispatch occurred or is uncertain, continue reconciliation instead |
+| Credential revoked/expired                   | Disable affected tenant capability and refuse stale worker actions                                     | Rotate through approved secrets workflow, verify authorization, re-enable narrowly                             |
+| Worker lease expires                         | Permit a new worker only with correct fencing; retain durable result ledger                            | Ensure stale worker cannot commit a conflicting result or duplicate an unsafe write                            |
+| Inbox request becomes stale                  | Flag for restaurant staff; use only agreed escalation process                                          | Record staff acknowledgment/follow-up, adjust staffing or expectations                                         |
+| Security/tenant-isolation incident           | Disable affected access/actions, protect evidence, involve responsible owner                           | Scope impact, rotate affected credentials if needed, assess notification obligations, verify fix               |
+| Unexpected cost/toll abuse                   | Apply tenant/global budgets and configured fallback                                                    | Stop leaked sessions, inspect redacted events, verify provider billing evidence                                |
 
 Call termination cancels obsolete speech/reads but does not erase a committed request or an attempted vendor write. A committed future booking still waiting for dispatch remains subject to its immutable approved `execute_before`, including after queue, journal, or rate-limit delays. Reconciliation is durable and continues after a caller disconnects or that deadline passes. Do not promise that an already attempted write was canceled merely because its network request was aborted or its start deadline expired.
 

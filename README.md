@@ -1,45 +1,66 @@
-# Restaurant AI receptionist
+# Hostline — restaurant AI receptionist
 
-A phone receptionist that answers restaurant questions through natural conversation, collects reservation requests, takes messages, and connects callers to staff. Restaurants keep their existing number by forwarding calls to a platform number.
+Hostline is a runnable local prototype for a restaurant phone receptionist. Its dashboard lets staff edit restaurant information, simulate conversations, collect unconfirmed reservation requests and messages, and track staff follow-up. Two synthetic restaurants demonstrate tenant isolation.
 
-**Status: planning and documentation only.** There is no application, runnable development environment, deployed infrastructure, or live reservation integration yet. The documentation describes the intended implementation and its release gates; it does not claim that controls or repository settings are already enforced.
+The separate Twilio/OpenAI Realtime gateway implements an optional **FAQ-only phone sandbox**. It is disabled by default and has not yet been verified through a real provider call. Phone request submission, live staff transfers, and production operation remain release gates. [Implementation status](docs/IMPLEMENTATION_STATUS.md) separates working code, test evidence, and remaining work.
 
-## Agreed first release
+## Run the local demo
 
-- One restaurant location per pilot, one language, and restaurant-approved hours, menu facts, and FAQs.
-- Reservation **requests** in a staff dashboard. Staff check the restaurant's authoritative reservation system and record the outcome. A saved or delivered request is not a confirmed table.
-- Messages and configured transfers to staff, including unanswered-transfer and after-hours behavior.
-- A shared, tenant-isolated platform with reusable connector contracts. OpenTable and Resy adapters remain disabled until authorized access and supported operations are verified for each restaurant.
+Use Node.js **24.19.0** and pnpm **11.19.0**. The versions are recorded in `.node-version` and `package.json`.
 
-Direct booking, reservation lookup or changes, ordering, payments, voiceprints, and synthetic-voice detection are later phases. Voice recognition and synthetic-voice detection must never establish identity on their own.
+```sh
+pnpm install --frozen-lockfile
+cp .env.example .env
+pnpm dev
+```
+
+Open **http://127.0.0.1:5173** and enter Harbor Table or Juniper Kitchen. Keep this exact origin: cookie-authenticated mutations verify the configured dashboard origin. The API listens on `127.0.0.1:3001`; Vite proxies `/api` to it. `pnpm dev` starts both processes and stops them together.
+
+The demo needs no provider credentials or database server. PGlite runs PostgreSQL compiled to WebAssembly and persists synthetic data in `.data/hostline`. Restarting preserves edits and submitted requests; demo seeds do not reset existing records. Session cookies expire after eight hours or an API restart. Only one API process may open this embedded data directory; its internal job loop handles demo jobs.
+
+Try a conversation in **Call simulator**, review the exact request details, and use the explicit confirmation button to save it. In **Requests**, claim an item, record staff handling or booking evidence, and record guest communication separately. A saved request does not reserve a table. The simulator is deterministic and does not call an AI model or telephone provider. Enter synthetic details only.
+
+## Stack and verification
+
+- TypeScript/pnpm workspaces; React, Vite, and Zod runtime contracts.
+- Fastify API with signed opaque sessions, Origin/CSRF checks, role checks, and tenant-scoped persistence.
+- PostgreSQL schema with forced row-level security, tenant composite keys, transactional receipts/outbox, and fenced internal jobs. PGlite supplies the default local engine; a separate `pg` adapter supports configured native PostgreSQL development.
+- Optional OIDC authorization-code login with PKCE/state/nonce and explicit subject memberships. It needs an identity provider and provisioned native database tenants; it is not a one-command production setup.
+- Separate persistent Node.js voice gateway using Twilio bidirectional Media Streams and OpenAI Realtime. OpenTable and Resy remain disabled capability adapters pending official access.
+
+```sh
+pnpm check
+pnpm exec playwright install chromium
+pnpm test:e2e
+pnpm build
+```
+
+`pnpm check` runs formatting, lint, strict typechecking, a credential-pattern baseline, credential-free tests, and builds. Browser tests are separate. `pnpm start` starts the built API; it does not serve or deploy the dashboard. The [contributor guide](CONTRIBUTING.md) describes individual commands and database prerequisites. CI is checked in; repository-required checks and security scanning settings require separate verification.
+
+## Phone setup and release boundary
+
+Read [Voice setup](docs/VOICE_SETUP.md) before starting `pnpm dev:voice`. Configure Twilio and OpenAI secrets in the environment or ignored `.env`, together with the test number, HTTPS gateway URL, and internal service token. Never paste credentials into chat or commit them. The gateway stays disabled until explicitly configured.
+
+The intended pilot routes the restaurant's existing number through provider forwarding to a dedicated platform number, then through the voice gateway to OpenAI Realtime. First prove the sandbox on a dedicated test number. Restaurant-number forwarding, human transfer/fallback, live request confirmation, provider privacy settings, and operational readiness need verification before public calls. Setting `NODE_ENV=production` currently fails startup deliberately.
+
+Direct booking, reservation changes/lookups, ordering, payments, voiceprints, and synthetic-voice detection are later phases. Resy and OpenTable require approved vendor access and independently verified capabilities; no live connector is available today.
 
 ## Documentation
 
-| Document | Purpose |
-| --- | --- |
-| [Build brief](BUILD_BRIEF.md) | Product scope and example customer experience |
-| [Implementation plan](docs/IMPLEMENTATION_PLAN.md) | Milestones, dependencies, deliverables, and acceptance gates |
-| [Architecture](docs/ARCHITECTURE.md) | Components, call lifecycle, APIs, and trust boundaries |
-| [Data model](docs/DATA_MODEL.md) | Tenant ownership, relationships, state, and transaction invariants |
-| [Integrations](docs/INTEGRATIONS.md) | Request fulfillment and optional OpenTable/Resy adapter foundations |
-| [Security design](docs/SECURITY.md) | Threat model, privacy rules, and implementation controls |
-| [Engineering standards](docs/ENGINEERING.md) | Code structure, coding practices, and future checks |
-| [Testing strategy](docs/TESTING.md) | Functional, security, connector, and voice evaluation scenarios |
-| [Operations](docs/OPERATIONS.md) | Deployment, reliability, monitoring, recovery, and rollout |
-| [Decisions](docs/DECISIONS.md) | Initial architecture decisions and reconsideration criteria |
-| [Architecture review](docs/ARCHITECTURE_REVIEW.md) | Review findings, resolutions, and open release dependencies |
-| [Contributing](CONTRIBUTING.md) | Human contribution and review workflow |
-| [Agent instructions](AGENTS.md) | Workflow and constraints for coding agents |
-| [Security reporting](SECURITY.md) | Private vulnerability-reporting guidance |
-
-Start with the implementation plan, then read the architecture and the documents relevant to the change. Contributors and agents must also read their root instructions.
-
-## Proposed implementation baseline
-
-A TypeScript/pnpm monorepo with a React/Vite staff dashboard, Fastify API, a separately deployable voice gateway for persistent audio WebSockets, and a Node.js background worker. PostgreSQL holds tenant-scoped records and a transactional outbox with leased jobs. An external OIDC provider handles staff sign-in. Phone and realtime voice providers sit behind adapters; Twilio and OpenAI Realtime are candidates whose current capabilities and account access need verification.
-
-The existing managed workspace is a development environment. Production hosting, regions, identity provider, vendors, and accounts are still to be selected. No commercial provider access or security certification is implied by these documents.
-
-## Next implementation milestone
-
-Complete vendor and pilot discovery, then scaffold the repository and build a deterministic conversation simulator with a mock restaurant, a request inbox, and tenant isolation. Real calls follow after the simulator's acceptance and security checks pass. Future command names in these docs are a scaffold contract, not commands that work today.
+| Document                                                                      | Purpose                                                |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------ |
+| [Implementation status](docs/IMPLEMENTATION_STATUS.md)                        | Delivered behavior, evidence, and launch gates         |
+| [Build brief](BUILD_BRIEF.md)                                                 | Target pilot scope and example customer experience     |
+| [Implementation plan](docs/IMPLEMENTATION_PLAN.md)                            | Milestones, dependencies, and acceptance gates         |
+| [Architecture](docs/ARCHITECTURE.md)                                          | Components, call lifecycle, APIs, and trust boundaries |
+| [Data model](docs/DATA_MODEL.md)                                              | Tenant ownership and transaction invariants            |
+| [Integrations](docs/INTEGRATIONS.md)                                          | Request fulfillment and optional provider foundations  |
+| [Voice setup](docs/VOICE_SETUP.md)                                            | Disabled-by-default phone sandbox configuration        |
+| [Security design](docs/SECURITY.md)                                           | Threat model, privacy rules, and required controls     |
+| [Engineering standards](docs/ENGINEERING.md)                                  | Coding and review standards                            |
+| [Testing strategy](docs/TESTING.md)                                           | Functional, security, connector, and voice scenarios   |
+| [Operations](docs/OPERATIONS.md)                                              | Reliability, recovery, and rollout requirements        |
+| [Decisions](docs/DECISIONS.md) and [ADR-009](docs/adr/009-local-prototype.md) | Architecture decisions and prototype boundary          |
+| [Architecture review](docs/ARCHITECTURE_REVIEW.md)                            | Review findings and open dependencies                  |
+| [Contributing](CONTRIBUTING.md) / [Agent instructions](AGENTS.md)             | Human and agent contribution workflows                 |
+| [Security reporting](SECURITY.md)                                             | Private vulnerability-reporting guidance               |

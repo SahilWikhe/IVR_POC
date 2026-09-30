@@ -1,5 +1,7 @@
 # Implementation plan
 
+Implementation evidence: see [current prototype status](IMPLEMENTATION_STATUS.md) and [ADR-009](adr/009-local-prototype.md). The requirements below include later pilot and production work; they are not all implemented.
+
 Status: proposed implementation plan, with documentation completed first. The accepted pilot uses staff-confirmed reservation requests. No application milestones below are complete merely because they are documented.
 
 ## Scope and success
@@ -123,13 +125,13 @@ Each issue should state trigger/result, scope, dependencies, data involved, acce
 
 ## Open decisions and dependencies
 
-| Dependency | Owner role | Resolution milestone |
-| --- | --- | --- |
-| Pilot restaurant, jurisdiction, timezone, staff response process | Product owner and restaurant manager | 0 |
-| Phone/voice capabilities, accounts, costs and limits | Technical lead and product owner | 0–3 |
-| OIDC, production host/region, database and secrets service | Technical lead | 0–1 |
-| Recording/disclosure, retention and vendor data terms | Product owner with appropriate privacy/legal advice | 0, before real caller data |
-| Authorized OpenTable/Resy API access and permitted operations | Product owner, restaurant and vendor | 0/6 |
-| Production branch protections and private security reporting | Repository owner | 1 |
-| Staff notification channel beyond dashboard | Restaurant manager and technical lead | Later optional slice |
-| Voiceprint or synthetic-voice processing | Separate future product/security review | Outside first release |
+| Dependency                                                       | Owner role                                          | Resolution milestone       |
+| ---------------------------------------------------------------- | --------------------------------------------------- | -------------------------- |
+| Pilot restaurant, jurisdiction, timezone, staff response process | Product owner and restaurant manager                | 0                          |
+| Phone/voice capabilities, accounts, costs and limits             | Technical lead and product owner                    | 0–3                        |
+| OIDC, production host/region, database and secrets service       | Technical lead                                      | 0–1                        |
+| Recording/disclosure, retention and vendor data terms            | Product owner with appropriate privacy/legal advice | 0, before real caller data |
+| Authorized OpenTable/Resy API access and permitted operations    | Product owner, restaurant and vendor                | 0/6                        |
+| Production branch protections and private security reporting     | Repository owner                                    | 1                          |
+| Staff notification channel beyond dashboard                      | Restaurant manager and technical lead               | Later optional slice       |
+| Voiceprint or synthetic-voice processing                         | Separate future product/security review             | Outside first release      |

@@ -1,0 +1,12 @@
+{
+  "name": "@hostline/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hostline/contracts": "workspace:*",
+    "@hostline/config": "workspace:*",
+    "@hostline/observability": "workspace:*",
+    "@hostline/database": "workspace:*"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "@hostline/voice-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hostline/contracts": "workspace:*",
+    "@hostline/config": "workspace:*",
+    "@hostline/observability": "workspace:*",
+    "fastify": "5.12.5",
+    "@fastify/formbody": "^8.0.0",
+    "@fastify/websocket": "^11.0.0",
+    "twilio": "^5.12.0",
+    "ws": "^8.19.0",
+    "zod": "^4.3.0",
+    "openai": "^6.27.0"
+  }
+}

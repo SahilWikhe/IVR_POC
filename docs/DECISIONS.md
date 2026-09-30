@@ -1,5 +1,7 @@
 # Initial architecture decisions
 
+Implementation evidence: see [current prototype status](IMPLEMENTATION_STATUS.md) and [ADR-009](adr/009-local-prototype.md). The requirements below include later pilot and production work; they are not all implemented.
+
 Status: accepted planning baseline for the requested documentation. These records are design choices for future implementation, not evidence of running services. Revisit a choice with observed requirements and a recorded replacement decision rather than silently changing the architecture. See [the implementation plan](IMPLEMENTATION_PLAN.md) for unresolved providers and access gates.
 
 ## ADR-001: Restaurant requests before automatic booking

@@ -1,0 +1,20 @@
+{
+  "name": "@hostline/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hostline/contracts": "workspace:*",
+    "@hostline/config": "workspace:*",
+    "@hostline/observability": "workspace:*",
+    "@hostline/domain": "workspace:*",
+    "@hostline/database": "workspace:*",
+    "@hostline/connectors": "workspace:*",
+    "fastify": "5.12.5",
+    "@fastify/cookie": "^11.0.0",
+    "@fastify/helmet": "^13.0.0",
+    "@fastify/rate-limit": "^10.0.0",
+    "openid-client": "^6.8.0",
+    "zod": "^4.3.0"
+  }
+}

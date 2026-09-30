@@ -1,6 +1,8 @@
 # Engineering standards
 
-These are implementation requirements for the planned restaurant receptionist. No source scaffold, automated enforcement, or production service exists yet. Follow [architecture](ARCHITECTURE.md), [security guidance](SECURITY.md), and [the implementation plan](IMPLEMENTATION_PLAN.md) alongside this document. A documented requirement is not proof that a control is implemented.
+Implementation evidence: see [current prototype status](IMPLEMENTATION_STATUS.md) and [ADR-009](adr/009-local-prototype.md). The requirements below include later pilot and production work; they are not all implemented.
+
+These are implementation requirements for the planned restaurant receptionist. A runnable local scaffold and automated checks now exist; production service and launch controls remain gated. Follow [architecture](ARCHITECTURE.md), [security guidance](SECURITY.md), and [the implementation plan](IMPLEMENTATION_PLAN.md) alongside this document. A documented requirement is not proof that a control is implemented.
 
 ## Boundaries and ownership
 
