@@ -39,6 +39,8 @@ Before concluding, review the diff for scope, accidental data exposure, missing 
 
 ## Git and handoff
 
+For the current prototype phase, the owner requests direct commits and pushes to `main`. Do not create pull requests unless the owner requests a change to this workflow. Keep the same validation, review, explicit staging, and safe history requirements before pushing.
+
 Commit or push when requested or already authorized by the session; these instructions do not add an approval requirement. Inspect the target remote and branch first. Stage explicit task-owned paths and inspect the staged diff. Do not use broad staging in a shared workspace. Do not amend unrelated commits, force-push, delete branches, or rewrite shared history without specific authorization.
 
 For a reviewable handoff, explain what changed and why, list validation actually performed, and identify material unresolved risks. Include the commit and remote branch when created. Keep PR descriptions accurate to the final implementation, and use the repository PR template. Do not claim that a documented security control is enforced until its implementation and checks exist.

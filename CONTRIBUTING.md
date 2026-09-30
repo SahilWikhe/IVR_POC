@@ -6,7 +6,7 @@ Hostline has a runnable local synthetic prototype. Start with [implementation st
 
 Choose an independently reviewable task from [the implementation plan](docs/IMPLEMENTATION_PLAN.md). State its observable behavior and acceptance criteria. The first pilot uses reservation requests for staff review; a saved request is never a confirmed table. Connector interfaces do not authorize live reservations or establish Resy/OpenTable access.
 
-Inspect `git status`, the current branch, remotes, and relevant scripts first. Use a task branch when appropriate. Preserve user changes and other agents' edits; do not reset, discard, stash, or reformat unrelated work. Stage explicit task paths and inspect the staged diff. Commit and push when requested or already authorized. Do not force-push or rewrite shared history without specific authorization.
+Inspect `git status`, the current branch, remotes, and relevant scripts first. During the current prototype phase, the owner requests direct commits and pushes to `main`, without creating pull requests. Temporary task branches may support local work, but validate and integrate their changes onto `main` before pushing. Preserve user changes and other agents' edits; do not reset, discard, stash, or reformat unrelated work. Stage explicit task paths and inspect the staged diff. Commit and push when requested or already authorized. Do not force-push or rewrite shared history without specific authorization.
 
 In a shared workspace, assign distinct file ownership before parallel edits. One contributor owns common manifests, lockfiles, migrations, integration, and final Git operations. Resolve ownership conflicts directly rather than overwriting another contributor's changes.
 
@@ -89,7 +89,7 @@ Update affected docs with the change, especially [implementation status](docs/IM
 
 ADR-001 through ADR-008 are in [initial decisions](docs/DECISIONS.md). New records live under `docs/adr/`, beginning with [ADR-009](docs/adr/009-local-prototype.md). Record consequential decisions with context, alternatives, consequences, evidence, and reconsideration criteria. Mark superseded records explicitly.
 
-Use [the PR template](.github/pull_request_template.md). Lead with the concrete change and resulting behavior, then verification and limitations. Review tenant/role access, runtime validation, confirmed-field binding, retry uncertainty, privacy, migration impact, and failure recovery. Authentication, tenant isolation, provider-write, and phone-routing changes need independent review; agent review does not replace accountable launch approval.
+For the current direct-to-main workflow, keep a reviewable diff and record the concrete change, resulting behavior, verification, and limitations in the handoff. If the owner later requests pull requests, use [the PR template](.github/pull_request_template.md). Review tenant/role access, runtime validation, confirmed-field binding, retry uncertainty, privacy, migration impact, and failure recovery. Authentication, tenant isolation, provider-write, and phone-routing changes need independent review; agent review does not replace accountable launch approval.
 
 GitHub Actions is configured to install dependencies, run checks, and run browser tests. Report its result only after observing the run. Branch protection, required checks, secret scanning, dependency-review enforcement, and protected deployment environments need separate verification. A workflow file alone does not prove enforcement. Default CI must not receive production secrets or make provider writes.
 

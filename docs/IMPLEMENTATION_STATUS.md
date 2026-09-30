@@ -42,7 +42,7 @@ Local verification on 2026-09-30:
 - The independent code review raised six actionable findings. All were fixed and rechecked: loopback dashboard exposure, inaccessible inbox pages, configuration/confirmation serialization, an invalid fulfillment action, concurrent socket admission, and failed model-response cleanup. Fresh-directory startup was additionally fixed during browser verification.
 - `git diff --check` and local Markdown target checks passed. The credential-pattern check covers selected patterns only; it is not comprehensive secret detection. Host secret-scanning configuration and branch protection remain unverified.
 
-These are local results, not evidence that GitHub CI has run successfully. Native PostgreSQL pooling/multi-connection locking, real OIDC interoperability, Twilio/OpenAI test calls, production deployment, and Resy/OpenTable remain outside current evidence.
+The implementation also passed its [GitHub Actions push run](https://github.com/SahilWikhe/IVR_POC/actions/runs/36761172681). This verifies the configured checks on that commit; branch protection and repository security settings remain unverified. Native PostgreSQL pooling/multi-connection locking, real OIDC interoperability, Twilio/OpenAI test calls, production deployment, and Resy/OpenTable remain outside current evidence.
 
 ## Configure the optional phone sandbox
 
