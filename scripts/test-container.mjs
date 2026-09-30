@@ -140,8 +140,8 @@ try {
     '-e',
     `
     if (process.getuid() === 0) throw new Error('Runtime must be non-root.');
-    const response = await fetch('http://127.0.0.1:3002/twilio/voice', { method: 'POST' });
-    if (response.status !== 503) throw new Error('Disabled voice route must reject incoming calls.');
+    const response = await fetch('http://127.0.0.1:3002/twilio/incoming', { method: 'POST' });
+    if (response.status !== 503) throw new Error('Disabled incoming voice route returned status ' + response.status + '; expected 503.');
   `,
   ]);
   console.log(
