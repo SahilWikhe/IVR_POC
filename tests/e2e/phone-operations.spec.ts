@@ -94,7 +94,7 @@ test('phone policy persists without activating an unconfigured phone line', asyn
     const session = sessionSchema.parse(await sessionResponse.json());
     expect(session.csrfToken).toBeTruthy();
     const restored = await page.request.put('/api/phone/policy', {
-      headers: { Origin: 'http://127.0.0.1:5173', 'X-CSRF-Token': session.csrfToken ?? '' },
+      headers: { Origin: new URL(page.url()).origin, 'X-CSRF-Token': session.csrfToken ?? '' },
       data: {
         expectedVersion: current.policy.version,
         policy: {

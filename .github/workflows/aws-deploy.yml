@@ -1,0 +1,135 @@
+name: AWS deploy
+on:
+  workflow_run:
+    workflows: [Checks]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target protected environment; production remains code-gated
+        type: choice
+        options: [staging, production]
+        default: staging
+      image_sha:
+        description: Current main workflow commit only; historical artifacts use AWS operations
+        type: string
+        default: ''
+      image_digest:
+        description: Required exact promoted sha256 digest for production
+        type: string
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: aws-${{ inputs.environment || 'staging' }}
+  cancel-in-progress: false
+jobs:
+  validate-infrastructure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r infra/aws/requirements-validation.txt
+      - run: python infra/aws/scripts/validate.py
+      - run: python -m unittest discover -s infra/aws/tests -v
+      - run: cfn-lint --format json --regions us-east-1 --template infra/aws/templates/*.json
+  deploy:
+    needs: validate-infrastructure
+    if: >-
+      github.repository == 'SahilWikhe/IVR_POC' &&
+      ((github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        vars.AWS_STAGING_READY == 'true') ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+        ((inputs.environment == 'staging' && vars.AWS_STAGING_READY == 'true') ||
+         (inputs.environment == 'production' && vars.AWS_PRODUCTION_READY == 'true'))))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: ${{ inputs.environment || 'staging' }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      AWS_ENVIRONMENT: ${{ inputs.environment || 'staging' }}
+      AWS_DEPLOYMENT_READY: 'true'
+      AWS_EXPECTED_IMAGE_DIGEST: ${{ inputs.image_digest || '' }}
+      TARGET_SHA: ${{ inputs.image_sha || github.event.workflow_run.head_sha || github.sha }}
+      DEPLOY_EVENT: ${{ github.event_name }}
+      WORKFLOW_SHA: ${{ github.sha }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_NAMESPACE: ${{ vars.AWS_NAMESPACE }}
+      AWS_CLOUDFORMATION_ROLE_ARN: ${{ vars.AWS_CLOUDFORMATION_ROLE_ARN }}
+      AWS_RUNTIME_BOUNDARY_ARN: ${{ vars.AWS_RUNTIME_BOUNDARY_ARN }}
+      AWS_APP_DOMAIN: ${{ vars.AWS_APP_DOMAIN }}
+      AWS_VOICE_DOMAIN: ${{ vars.AWS_VOICE_DOMAIN }}
+      AWS_PUBLIC_HOSTED_ZONE_ID: ${{ vars.AWS_PUBLIC_HOSTED_ZONE_ID }}
+      AWS_CERTIFICATE_ARN: ${{ vars.AWS_CERTIFICATE_ARN }}
+      AWS_OIDC_ISSUER: ${{ vars.AWS_OIDC_ISSUER }}
+      AWS_OIDC_CLIENT_ID: ${{ vars.AWS_OIDC_CLIENT_ID }}
+      AWS_API_SECRET_ARN: ${{ vars.AWS_API_SECRET_ARN }}
+      AWS_VOICE_SECRET_ARN: ${{ vars.AWS_VOICE_SECRET_ARN }}
+      AWS_WORKER_SECRET_ARN: ${{ vars.AWS_WORKER_SECRET_ARN }}
+      AWS_MIGRATION_SECRET_ARN: ${{ vars.AWS_MIGRATION_SECRET_ARN }}
+      AWS_VOICE_TENANT_ID: ${{ vars.AWS_VOICE_TENANT_ID }}
+      AWS_TWILIO_ACCOUNT_SID: ${{ vars.AWS_TWILIO_ACCOUNT_SID }}
+      AWS_TWILIO_PHONE_NUMBER: ${{ vars.AWS_TWILIO_PHONE_NUMBER }}
+      AWS_LIVE_VOICE_ENABLED: ${{ vars.AWS_LIVE_VOICE_ENABLED }}
+      AWS_VOICE_ACTIONS_ENABLED: ${{ vars.AWS_VOICE_ACTIONS_ENABLED }}
+      AWS_VOICE_TRANSFERS_ENABLED: ${{ vars.AWS_VOICE_TRANSFERS_ENABLED }}
+      AWS_STATUS_READER_ENABLED: ${{ vars.AWS_STATUS_READER_ENABLED }}
+      AWS_RECOVERY_INSTALLATION_ID: ${{ vars.AWS_RECOVERY_INSTALLATION_ID }}
+      AWS_RECOVERY_EPOCH: ${{ vars.AWS_RECOVERY_EPOCH }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Confirm main source and exact artifact commit
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python infra/aws/scripts/source.py
+      - name: Preserve current production launch gate
+        if: steps.source.outputs.eligible == 'true'
+        run: |
+          if [ "$AWS_ENVIRONMENT" = production ]; then
+            echo 'Production deployment remains blocked by the application readiness gate.'
+            exit 1
+          fi
+      - name: Assume environment-bound deployment role
+        if: steps.source.outputs.eligible == 'true'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYMENT_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+          role-duration-seconds: 3600
+          role-session-name: hostline-${{ github.run_id }}
+          unset-current-credentials: true
+          mask-aws-account-id: true
+      - name: Authenticate immutable staging registry
+        if: steps.source.outputs.eligible == 'true' && env.AWS_ENVIRONMENT == 'staging'
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd
+        with:
+          mask-password: 'true'
+      - name: Publish full-commit image
+        if: steps.source.outputs.eligible == 'true' && env.AWS_ENVIRONMENT == 'staging'
+        run: python infra/aws/scripts/build-image.py --sha "$TARGET_SHA"
+      - name: Migrate, deploy, verify readiness, and retain rollback evidence
+        if: steps.source.outputs.eligible == 'true'
+        run: python infra/aws/scripts/deploy.py --sha "$TARGET_SHA"

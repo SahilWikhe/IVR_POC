@@ -99,7 +99,7 @@ export function buildReadbackTwiml(input: {
   // separately configured provider-hosted failure URL.
   response.say(
     { language: 'en-US' },
-    'I could not confirm that your request was saved. Please contact the restaurant directly.',
+    'I could not confirm that your request was saved. Please try again later.',
   );
   response.hangup();
   return serialize(response);
@@ -143,7 +143,7 @@ export function buildTransferTwiml(input: {
     );
   response.say(
     { language: 'en-US' },
-    'The transfer has ended. Please contact the restaurant directly if you still need help.',
+    'The transfer has ended. If you still need help, please try again later.',
   );
   response.hangup();
   return serialize(response);

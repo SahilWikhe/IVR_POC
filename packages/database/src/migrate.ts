@@ -9,7 +9,9 @@ if (!url) {
   process.exitCode = 1;
 } else {
   try {
-    await migrate(url);
+    await migrate(url, {
+      ...(process.env['DATABASE_CA_FILE'] ? { caFile: process.env['DATABASE_CA_FILE'] } : {}),
+    });
     console.log('Database migrations completed.');
   } catch {
     console.error('Database migration failed. Verify migration permissions and connectivity.');

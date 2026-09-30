@@ -319,7 +319,11 @@ it('upgrades existing v2 policy once and preserves restrictions and handoff cont
     const migrationDates = (
       await sql.query('SELECT version,applied_at FROM schema_migrations ORDER BY version')
     ).rows;
-    expect(migrationDates).toHaveLength(3);
+    expect(migrationDates.slice(0, 3)).toEqual([
+      expect.objectContaining({ version: 1 }),
+      expect.objectContaining({ version: 2 }),
+      expect.objectContaining({ version: 3 }),
+    ]);
     expect(migrationDates.slice(0, 2)).toEqual(priorMigrations);
     await sql.close();
     sql = undefined;

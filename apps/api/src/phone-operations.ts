@@ -19,6 +19,7 @@ import {
 import type { AppConfig } from '@hostline/config';
 import type { Database, TenantTransaction } from '@hostline/database';
 import type { AuthService } from './auth.js';
+import { withStaffTenant } from './auth-transaction.js';
 
 class PhoneOperationsError extends Error {
   constructor(
@@ -92,7 +93,7 @@ export async function registerPhoneOperations(
   app.get('/api/phone/operations', async (request) => {
     const user = auth.actor(request);
     const query = pagination.parse(request.query);
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       await tx.lockVoiceAdmission();
       const policy = await tx.getPhonePolicy();
       const records = await tx.listVoiceCalls({ offset: query.offset, limit: query.limit + 1 });
@@ -115,7 +116,7 @@ export async function registerPhoneOperations(
   app.get('/api/phone/calls/:id', async (request) => {
     const user = auth.requireRole(request, ['owner', 'staff']);
     const { id } = callParams.parse(request.params);
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       await tx.lockVoiceAdmission();
       const record = await requiredVoiceCall(tx, id);
       const call = await tx.getCall(id);
@@ -144,7 +145,7 @@ export async function registerPhoneOperations(
   app.put('/api/phone/policy', async (request) => {
     const user = auth.requireRole(request, ['owner']);
     const input = updatePhonePolicyInputSchema.parse(request.body);
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       await tx.lockVoiceAdmission();
       const previous = await tx.getPhonePolicy();
       if (previous.version !== input.expectedVersion)
@@ -168,29 +169,36 @@ export async function registerPhoneOperations(
     const user = auth.requireRole(request, ['owner']);
     const { id } = callParams.parse(request.params);
     const input = versionInput.parse(request.body);
-    const admitted = await db.withTenant(user.tenantId, async (tx) => {
-      await tx.lockVoiceAdmission();
-      const record = await requiredVoiceCall(tx, id);
-      if (record.state === 'ENDED') return record;
-      if (record.version !== input.expectedVersion)
-        throw new PhoneOperationsError(
-          'VERSION_CONFLICT',
-          409,
-          'This call changed. Refresh before checking again.',
-        );
-      if (
-        !configured.reconciliationAvailable ||
-        user.tenantId !== config.voiceTenantId ||
-        record.accountSid !== config.voice.accountSid
-      )
-        throw new PhoneOperationsError(
-          'RECONCILIATION_UNAVAILABLE',
-          409,
-          'Provider status checking is unavailable for this restaurant.',
-        );
-      await tx.audit(user.userId, 'phone.reconciliation_requested', id);
-      return record;
-    });
+    const admitted = await withStaffTenant(
+      auth,
+      db,
+      config.auth.mode,
+      request,
+      user,
+      async (tx) => {
+        await tx.lockVoiceAdmission();
+        const record = await requiredVoiceCall(tx, id);
+        if (record.state === 'ENDED') return record;
+        if (record.version !== input.expectedVersion)
+          throw new PhoneOperationsError(
+            'VERSION_CONFLICT',
+            409,
+            'This call changed. Refresh before checking again.',
+          );
+        if (
+          !configured.reconciliationAvailable ||
+          user.tenantId !== config.voiceTenantId ||
+          record.accountSid !== config.voice.accountSid
+        )
+          throw new PhoneOperationsError(
+            'RECONCILIATION_UNAVAILABLE',
+            409,
+            'Provider status checking is unavailable for this restaurant.',
+          );
+        await tx.audit(user.userId, 'phone.reconciliation_requested', id);
+        return record;
+      },
+    );
     if (admitted.state === 'ENDED')
       return phoneReconcileResultSchema.parse({
         call: summary(admitted),
@@ -219,7 +227,7 @@ export async function registerPhoneOperations(
       new Set(evidence.children.map((child) => child.callSid)).size === evidence.children.length &&
       evidence.children.every((child) => child.callSid !== evidence.callSid);
 
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       await tx.lockVoiceAdmission();
       const record = await requiredVoiceCall(tx, id);
       if (record.state === 'ENDED')

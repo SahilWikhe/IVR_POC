@@ -9,3 +9,7 @@ playwright-report/
 test-results/
 artifacts/
 *.log
+
+# Local infrastructure validation bytecode
+__pycache__/
+*.pyc

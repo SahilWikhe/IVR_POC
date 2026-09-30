@@ -1,0 +1,2519 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Replaceable Hostline Fargate application. Retained PostgreSQL/network/images live in a separate data stack. Staging remains disabled until operator readiness is verified.",
+  "Parameters": {
+    "Namespace": {
+      "Type": "String",
+      "AllowedPattern": "[a-z][a-z0-9-]{2,12}",
+      "Default": "hostline"
+    },
+    "Environment": {
+      "Type": "String",
+      "AllowedValues": ["staging", "production"],
+      "Default": "staging"
+    },
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id"
+    },
+    "PublicSubnetIds": {
+      "Type": "List<AWS::EC2::Subnet::Id>"
+    },
+    "PrivateSubnetIds": {
+      "Type": "List<AWS::EC2::Subnet::Id>"
+    },
+    "ApiSecurityGroupId": {
+      "Type": "AWS::EC2::SecurityGroup::Id"
+    },
+    "VoiceSecurityGroupId": {
+      "Type": "AWS::EC2::SecurityGroup::Id"
+    },
+    "WorkerSecurityGroupId": {
+      "Type": "AWS::EC2::SecurityGroup::Id"
+    },
+    "ImageUri": {
+      "Type": "String",
+      "AllowedPattern": "[0-9]{12}\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com/[a-z0-9/-]+@sha256:[a-f0-9]{64}"
+    },
+    "ImageCommit": {
+      "Type": "String",
+      "AllowedPattern": "[a-f0-9]{40}"
+    },
+    "RepositoryArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "DataKeyArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "RuntimeBoundaryArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "CertificateArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "AppDomain": {
+      "Type": "String",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]+\\.[a-z]{2,}"
+    },
+    "VoiceDomain": {
+      "Type": "String",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]+\\.[a-z]{2,}"
+    },
+    "PublicHostedZoneId": {
+      "Type": "String",
+      "AllowedPattern": "(^$)|(^Z[A-Z0-9]+$)",
+      "Default": ""
+    },
+    "OidcIssuer": {
+      "Type": "String",
+      "AllowedPattern": "https://[a-zA-Z0-9.-]+/?"
+    },
+    "OidcClientId": {
+      "Type": "String",
+      "AllowedPattern": "[A-Za-z0-9._-]{8,200}"
+    },
+    "ApiSecretArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "VoiceSecretArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "WorkerSecretArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "MigrationSecretArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "VoiceTenantId": {
+      "Type": "String",
+      "AllowedPattern": "[a-f0-9-]{36}"
+    },
+    "TwilioAccountSid": {
+      "Type": "String",
+      "AllowedPattern": "(^$)|(^AC[a-fA-F0-9]{32}$)",
+      "Default": ""
+    },
+    "TwilioPhoneNumber": {
+      "Type": "String",
+      "AllowedPattern": "(^$)|(^\\+[1-9][0-9]{7,14}$)",
+      "Default": ""
+    },
+    "LiveVoiceEnabled": {
+      "Type": "String",
+      "AllowedValues": ["false", "true"],
+      "Default": "false"
+    },
+    "VoiceActionsEnabled": {
+      "Type": "String",
+      "AllowedValues": ["false", "true"],
+      "Default": "false"
+    },
+    "VoiceTransfersEnabled": {
+      "Type": "String",
+      "AllowedValues": ["false", "true"],
+      "Default": "false"
+    },
+    "StatusReaderEnabled": {
+      "Type": "String",
+      "AllowedValues": ["false", "true"],
+      "Default": "false"
+    },
+    "DesiredCount": {
+      "Type": "Number",
+      "Default": 0,
+      "AllowedValues": [0, 1]
+    },
+    "EnableWaf": {
+      "Type": "String",
+      "AllowedValues": ["false", "true"],
+      "Default": "true"
+    },
+    "PublicAlbSecurityGroupId": {
+      "Type": "AWS::EC2::SecurityGroup::Id"
+    },
+    "InternalAlbSecurityGroupId": {
+      "Type": "AWS::EC2::SecurityGroup::Id"
+    },
+    "PrivateAppZoneId": {
+      "Type": "String",
+      "AllowedPattern": "Z[A-Z0-9]+"
+    },
+    "RecoveryTableArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "RecoveryInstallationId": {
+      "Type": "String",
+      "AllowedPattern": "[a-fA-F0-9-]{36}"
+    },
+    "RecoveryTableName": {
+      "Type": "String",
+      "AllowedPattern": "[A-Za-z0-9_.-]{3,255}"
+    },
+    "RecoveryEpoch": {
+      "Type": "String",
+      "AllowedPattern": "[a-fA-F0-9-]{36}"
+    },
+    "RecoveryDatabaseResourceId": {
+      "Type": "String",
+      "AllowedPattern": "db-[A-Za-z0-9]+"
+    },
+    "DatabaseArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "RecoveryDatabaseInstanceId": {
+      "Type": "String",
+      "AllowedPattern": "[A-Za-z][A-Za-z0-9-]{0,62}"
+    },
+    "TrustedProxyCidrs": {
+      "Type": "String",
+      "AllowedPattern": "[0-9./,]+"
+    }
+  },
+  "Conditions": {
+    "Production": {
+      "Fn::Equals": [
+        {
+          "Ref": "Environment"
+        },
+        "production"
+      ]
+    },
+    "PublicDns": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "PublicHostedZoneId"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "LiveVoice": {
+      "Fn::Equals": [
+        {
+          "Ref": "LiveVoiceEnabled"
+        },
+        "true"
+      ]
+    },
+    "StatusReader": {
+      "Fn::Equals": [
+        {
+          "Ref": "StatusReaderEnabled"
+        },
+        "true"
+      ]
+    },
+    "Waf": {
+      "Fn::Equals": [
+        {
+          "Ref": "EnableWaf"
+        },
+        "true"
+      ]
+    },
+    "TwilioAccountConfigured": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "TwilioAccountSid"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "TwilioNumberConfigured": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "TwilioPhoneNumber"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Rules": {
+    "VoiceActionsRequireVoice": {
+      "Assertions": [
+        {
+          "Assert": {
+            "Fn::Or": [
+              {
+                "Fn::Equals": [
+                  {
+                    "Ref": "LiveVoiceEnabled"
+                  },
+                  "true"
+                ]
+              },
+              {
+                "Fn::And": [
+                  {
+                    "Fn::Equals": [
+                      {
+                        "Ref": "VoiceActionsEnabled"
+                      },
+                      "false"
+                    ]
+                  },
+                  {
+                    "Fn::Equals": [
+                      {
+                        "Ref": "VoiceTransfersEnabled"
+                      },
+                      "false"
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "AssertDescription": "Action/transfer flags cannot enable an otherwise disabled voice service."
+        }
+      ]
+    },
+    "DistinctDomains": {
+      "Assertions": [
+        {
+          "Assert": {
+            "Fn::Not": [
+              {
+                "Fn::Equals": [
+                  {
+                    "Ref": "AppDomain"
+                  },
+                  {
+                    "Ref": "VoiceDomain"
+                  }
+                ]
+              }
+            ]
+          },
+          "AssertDescription": "App and voice hosts must be distinct."
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "Cluster": {
+      "Type": "AWS::ECS::Cluster",
+      "Properties": {
+        "ClusterName": {
+          "Fn::Sub": "${Namespace}-${Environment}"
+        },
+        "ClusterSettings": [
+          {
+            "Name": "containerInsights",
+            "Value": "enabled"
+          }
+        ]
+      }
+    },
+    "PublicAlb": {
+      "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Namespace}-${Environment}-pub"
+        },
+        "Scheme": "internet-facing",
+        "Type": "application",
+        "Subnets": {
+          "Ref": "PublicSubnetIds"
+        },
+        "SecurityGroups": [
+          {
+            "Ref": "PublicAlbSecurityGroupId"
+          }
+        ],
+        "LoadBalancerAttributes": [
+          {
+            "Key": "idle_timeout.timeout_seconds",
+            "Value": "120"
+          },
+          {
+            "Key": "routing.http.drop_invalid_header_fields.enabled",
+            "Value": "true"
+          },
+          {
+            "Key": "routing.http.desync_mitigation_mode",
+            "Value": "strictest"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "HostlineNamespace",
+            "Value": {
+              "Ref": "Namespace"
+            }
+          },
+          {
+            "Key": "HostlineEnvironment",
+            "Value": {
+              "Ref": "Environment"
+            }
+          }
+        ]
+      }
+    },
+    "InternalAlb": {
+      "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Namespace}-${Environment}-int"
+        },
+        "Scheme": "internal",
+        "Type": "application",
+        "Subnets": {
+          "Ref": "PrivateSubnetIds"
+        },
+        "SecurityGroups": [
+          {
+            "Ref": "InternalAlbSecurityGroupId"
+          }
+        ],
+        "LoadBalancerAttributes": [
+          {
+            "Key": "idle_timeout.timeout_seconds",
+            "Value": "120"
+          },
+          {
+            "Key": "routing.http.drop_invalid_header_fields.enabled",
+            "Value": "true"
+          },
+          {
+            "Key": "routing.http.desync_mitigation_mode",
+            "Value": "strictest"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "HostlineNamespace",
+            "Value": {
+              "Ref": "Namespace"
+            }
+          },
+          {
+            "Key": "HostlineEnvironment",
+            "Value": {
+              "Ref": "Environment"
+            }
+          }
+        ]
+      }
+    },
+    "ApiPublicTargets": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Namespace}-${Environment}-api"
+        },
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "TargetType": "ip",
+        "Protocol": "HTTP",
+        "Port": 3001,
+        "HealthCheckPath": "/api/ready",
+        "HealthCheckIntervalSeconds": 15,
+        "HealthCheckTimeoutSeconds": 5,
+        "HealthyThresholdCount": 2,
+        "UnhealthyThresholdCount": 3,
+        "Matcher": {
+          "HttpCode": "200"
+        },
+        "TargetGroupAttributes": [
+          {
+            "Key": "deregistration_delay.timeout_seconds",
+            "Value": "30"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "HostlineNamespace",
+            "Value": {
+              "Ref": "Namespace"
+            }
+          },
+          {
+            "Key": "HostlineEnvironment",
+            "Value": {
+              "Ref": "Environment"
+            }
+          }
+        ]
+      }
+    },
+    "ApiInternalTargets": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Namespace}-${Environment}-api-int"
+        },
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "TargetType": "ip",
+        "Protocol": "HTTP",
+        "Port": 3001,
+        "HealthCheckPath": "/api/ready",
+        "HealthCheckIntervalSeconds": 15,
+        "HealthCheckTimeoutSeconds": 5,
+        "HealthyThresholdCount": 2,
+        "UnhealthyThresholdCount": 3,
+        "Matcher": {
+          "HttpCode": "200"
+        },
+        "TargetGroupAttributes": [
+          {
+            "Key": "deregistration_delay.timeout_seconds",
+            "Value": "30"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "HostlineNamespace",
+            "Value": {
+              "Ref": "Namespace"
+            }
+          },
+          {
+            "Key": "HostlineEnvironment",
+            "Value": {
+              "Ref": "Environment"
+            }
+          }
+        ]
+      }
+    },
+    "VoicePublicTargets": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Namespace}-${Environment}-voice"
+        },
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "TargetType": "ip",
+        "Protocol": "HTTP",
+        "Port": 3002,
+        "HealthCheckPath": "/health",
+        "HealthCheckIntervalSeconds": 15,
+        "HealthCheckTimeoutSeconds": 5,
+        "HealthyThresholdCount": 2,
+        "UnhealthyThresholdCount": 3,
+        "Matcher": {
+          "HttpCode": "200"
+        },
+        "TargetGroupAttributes": [
+          {
+            "Key": "deregistration_delay.timeout_seconds",
+            "Value": "120"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "HostlineNamespace",
+            "Value": {
+              "Ref": "Namespace"
+            }
+          },
+          {
+            "Key": "HostlineEnvironment",
+            "Value": {
+              "Ref": "Environment"
+            }
+          }
+        ]
+      }
+    },
+    "PublicListener": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "PublicAlb"
+        },
+        "Port": 443,
+        "Protocol": "HTTPS",
+        "SslPolicy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+        "Certificates": [
+          {
+            "CertificateArn": {
+              "Ref": "CertificateArn"
+            }
+          }
+        ],
+        "DefaultActions": [
+          {
+            "Type": "fixed-response",
+            "FixedResponseConfig": {
+              "StatusCode": "404",
+              "ContentType": "text/plain",
+              "MessageBody": "Not found"
+            }
+          }
+        ]
+      }
+    },
+    "InternalListener": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "InternalAlb"
+        },
+        "Port": 443,
+        "Protocol": "HTTPS",
+        "SslPolicy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+        "Certificates": [
+          {
+            "CertificateArn": {
+              "Ref": "CertificateArn"
+            }
+          }
+        ],
+        "DefaultActions": [
+          {
+            "Type": "fixed-response",
+            "FixedResponseConfig": {
+              "StatusCode": "404",
+              "ContentType": "text/plain",
+              "MessageBody": "Not found"
+            }
+          }
+        ]
+      }
+    },
+    "DenyPublicInternalRoutes": {
+      "Type": "AWS::ElasticLoadBalancingV2::ListenerRule",
+      "Properties": {
+        "ListenerArn": {
+          "Ref": "PublicListener"
+        },
+        "Priority": 1,
+        "Conditions": [
+          {
+            "Field": "path-pattern",
+            "Values": ["/internal", "/internal/*"]
+          }
+        ],
+        "Actions": [
+          {
+            "Type": "fixed-response",
+            "FixedResponseConfig": {
+              "StatusCode": "403",
+              "ContentType": "text/plain",
+              "MessageBody": "Private endpoint"
+            }
+          }
+        ]
+      }
+    },
+    "PublicAppRule": {
+      "Type": "AWS::ElasticLoadBalancingV2::ListenerRule",
+      "Properties": {
+        "ListenerArn": {
+          "Ref": "PublicListener"
+        },
+        "Priority": 10,
+        "Conditions": [
+          {
+            "Field": "host-header",
+            "Values": [
+              {
+                "Ref": "AppDomain"
+              }
+            ]
+          }
+        ],
+        "Actions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": {
+              "Ref": "ApiPublicTargets"
+            }
+          }
+        ]
+      }
+    },
+    "PublicVoiceRule": {
+      "Type": "AWS::ElasticLoadBalancingV2::ListenerRule",
+      "Properties": {
+        "ListenerArn": {
+          "Ref": "PublicListener"
+        },
+        "Priority": 20,
+        "Conditions": [
+          {
+            "Field": "host-header",
+            "Values": [
+              {
+                "Ref": "VoiceDomain"
+              }
+            ]
+          }
+        ],
+        "Actions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": {
+              "Ref": "VoicePublicTargets"
+            }
+          }
+        ]
+      }
+    },
+    "PrivateAppRule": {
+      "Type": "AWS::ElasticLoadBalancingV2::ListenerRule",
+      "Properties": {
+        "ListenerArn": {
+          "Ref": "InternalListener"
+        },
+        "Priority": 10,
+        "Conditions": [
+          {
+            "Field": "host-header",
+            "Values": [
+              {
+                "Ref": "AppDomain"
+              }
+            ]
+          }
+        ],
+        "Actions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": {
+              "Ref": "ApiInternalTargets"
+            }
+          }
+        ]
+      }
+    },
+    "PrivateAppRecord": {
+      "Type": "AWS::Route53::RecordSet",
+      "Properties": {
+        "HostedZoneId": {
+          "Ref": "PrivateAppZoneId"
+        },
+        "Name": {
+          "Ref": "AppDomain"
+        },
+        "Type": "A",
+        "AliasTarget": {
+          "DNSName": {
+            "Fn::GetAtt": ["InternalAlb", "DNSName"]
+          },
+          "HostedZoneId": {
+            "Fn::GetAtt": ["InternalAlb", "CanonicalHostedZoneID"]
+          },
+          "EvaluateTargetHealth": true
+        }
+      }
+    },
+    "PublicAppRecord": {
+      "Type": "AWS::Route53::RecordSet",
+      "Properties": {
+        "HostedZoneId": {
+          "Ref": "PublicHostedZoneId"
+        },
+        "Name": {
+          "Ref": "AppDomain"
+        },
+        "Type": "A",
+        "AliasTarget": {
+          "DNSName": {
+            "Fn::GetAtt": ["PublicAlb", "DNSName"]
+          },
+          "HostedZoneId": {
+            "Fn::GetAtt": ["PublicAlb", "CanonicalHostedZoneID"]
+          },
+          "EvaluateTargetHealth": true
+        }
+      },
+      "Condition": "PublicDns"
+    },
+    "PublicVoiceRecord": {
+      "Type": "AWS::Route53::RecordSet",
+      "Properties": {
+        "HostedZoneId": {
+          "Ref": "PublicHostedZoneId"
+        },
+        "Name": {
+          "Ref": "VoiceDomain"
+        },
+        "Type": "A",
+        "AliasTarget": {
+          "DNSName": {
+            "Fn::GetAtt": ["PublicAlb", "DNSName"]
+          },
+          "HostedZoneId": {
+            "Fn::GetAtt": ["PublicAlb", "CanonicalHostedZoneID"]
+          },
+          "EvaluateTargetHealth": true
+        }
+      },
+      "Condition": "PublicDns"
+    },
+    "ApiLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/hostline/${Namespace}/${Environment}/api"
+        },
+        "RetentionInDays": 30,
+        "KmsKeyId": {
+          "Ref": "DataKeyArn"
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "ApiExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${Namespace}-${Environment}-task-api-execution"
+        },
+        "PermissionsBoundary": {
+          "Ref": "RuntimeBoundaryArn"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "LaunchOnly",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "ecr:GetAuthorizationToken",
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage"
+                  ],
+                  "Resource": {
+                    "Ref": "RepositoryArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                  "Resource": {
+                    "Fn::GetAtt": ["ApiLogs", "Arn"]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Resource": {
+                    "Ref": "ApiSecretArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "kms:Decrypt",
+                  "Resource": {
+                    "Ref": "DataKeyArn"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "kms:ViaService": {
+                        "Fn::Sub": "secretsmanager.${AWS::Region}.amazonaws.com"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ApiRuntimeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${Namespace}-${Environment}-task-api-runtime"
+        },
+        "PermissionsBoundary": {
+          "Ref": "RuntimeBoundaryArn"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "BoundRecoveryManifestRead",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "dynamodb:GetItem",
+                  "Resource": {
+                    "Ref": "RecoveryTableArn"
+                  },
+                  "Condition": {
+                    "ForAllValues:StringEquals": {
+                      "dynamodb:LeadingKeys": [
+                        {
+                          "Fn::Sub": "INSTALLATION#${RecoveryInstallationId}"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "rds:DescribeDBInstances",
+                  "Resource": {
+                    "Ref": "DatabaseArn"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ApiTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Family": {
+          "Fn::Sub": "${Namespace}-${Environment}-api"
+        },
+        "Cpu": "512",
+        "Memory": "1024",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": ["FARGATE"],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": ["ApiExecutionRole", "Arn"]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": ["ApiRuntimeRole", "Arn"]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "api",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": ["node", "apps/api/dist/index.js"],
+            "User": "10001",
+            "ReadonlyRootFilesystem": true,
+            "StopTimeout": 120,
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "Environment": [
+              {
+                "Name": "NODE_ENV",
+                "Value": {
+                  "Fn::If": ["Production", "production", "development"]
+                }
+              },
+              {
+                "Name": "HOSTLINE_ENVIRONMENT",
+                "Value": {
+                  "Ref": "Environment"
+                }
+              },
+              {
+                "Name": "DATABASE_CA_FILE",
+                "Value": "/opt/hostline/certs/rds-global-bundle.pem"
+              },
+              {
+                "Name": "AUTH_MODE",
+                "Value": "oidc"
+              },
+              {
+                "Name": "API_HOST",
+                "Value": "0.0.0.0"
+              },
+              {
+                "Name": "API_PORT",
+                "Value": "3001"
+              },
+              {
+                "Name": "DASHBOARD_ORIGIN",
+                "Value": {
+                  "Fn::Sub": "https://${AppDomain}"
+                }
+              },
+              {
+                "Name": "OIDC_ISSUER",
+                "Value": {
+                  "Ref": "OidcIssuer"
+                }
+              },
+              {
+                "Name": "OIDC_CLIENT_ID",
+                "Value": {
+                  "Ref": "OidcClientId"
+                }
+              },
+              {
+                "Name": "OIDC_REDIRECT_URI",
+                "Value": {
+                  "Fn::Sub": "https://${AppDomain}/api/auth/callback"
+                }
+              },
+              {
+                "Name": "RUN_INTERNAL_JOBS",
+                "Value": "false"
+              },
+              {
+                "Name": "LIVE_VOICE_ENABLED",
+                "Value": {
+                  "Ref": "LiveVoiceEnabled"
+                }
+              },
+              {
+                "Name": "VOICE_MODE",
+                "Value": "sandbox"
+              },
+              {
+                "Name": "VOICE_ACTIONS_ENABLED",
+                "Value": {
+                  "Ref": "VoiceActionsEnabled"
+                }
+              },
+              {
+                "Name": "VOICE_TRANSFERS_ENABLED",
+                "Value": {
+                  "Ref": "VoiceTransfersEnabled"
+                }
+              },
+              {
+                "Name": "VOICE_TENANT_ID",
+                "Value": {
+                  "Ref": "VoiceTenantId"
+                }
+              },
+              {
+                "Fn::If": [
+                  "TwilioAccountConfigured",
+                  {
+                    "Name": "TWILIO_ACCOUNT_SID",
+                    "Value": {
+                      "Ref": "TwilioAccountSid"
+                    }
+                  },
+                  {
+                    "Ref": "AWS::NoValue"
+                  }
+                ]
+              },
+              {
+                "Fn::If": [
+                  "TwilioNumberConfigured",
+                  {
+                    "Name": "TWILIO_PHONE_NUMBER",
+                    "Value": {
+                      "Ref": "TwilioPhoneNumber"
+                    }
+                  },
+                  {
+                    "Ref": "AWS::NoValue"
+                  }
+                ]
+              },
+              {
+                "Name": "VOICE_PUBLIC_URL",
+                "Value": {
+                  "Fn::Sub": "https://${VoiceDomain}"
+                }
+              },
+              {
+                "Name": "RECOVERY_INSTALLATION_ID",
+                "Value": {
+                  "Ref": "RecoveryInstallationId"
+                }
+              },
+              {
+                "Name": "RECOVERY_EPOCH",
+                "Value": {
+                  "Ref": "RecoveryEpoch"
+                }
+              },
+              {
+                "Name": "RECOVERY_DATABASE_RESOURCE_ID",
+                "Value": {
+                  "Ref": "RecoveryDatabaseResourceId"
+                }
+              },
+              {
+                "Name": "RECOVERY_TABLE_NAME",
+                "Value": {
+                  "Ref": "RecoveryTableName"
+                }
+              },
+              {
+                "Name": "AWS_REGION",
+                "Value": {
+                  "Ref": "AWS::Region"
+                }
+              },
+              {
+                "Name": "RECOVERY_DATABASE_INSTANCE_ID",
+                "Value": {
+                  "Ref": "RecoveryDatabaseInstanceId"
+                }
+              },
+              {
+                "Name": "API_TRUSTED_PROXY_CIDRS",
+                "Value": {
+                  "Ref": "TrustedProxyCidrs"
+                }
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "DATABASE_URL",
+                "ValueFrom": {
+                  "Fn::Sub": "${ApiSecretArn}:DATABASE_URL::"
+                }
+              },
+              {
+                "Name": "SESSION_SECRET",
+                "ValueFrom": {
+                  "Fn::Sub": "${ApiSecretArn}:SESSION_SECRET::"
+                }
+              },
+              {
+                "Name": "SESSION_ENCRYPTION_SECRET",
+                "ValueFrom": {
+                  "Fn::Sub": "${ApiSecretArn}:SESSION_ENCRYPTION_SECRET::"
+                }
+              },
+              {
+                "Name": "OIDC_CLIENT_SECRET",
+                "ValueFrom": {
+                  "Fn::Sub": "${ApiSecretArn}:OIDC_CLIENT_SECRET::"
+                }
+              },
+              {
+                "Name": "VOICE_SERVICE_TOKEN",
+                "ValueFrom": {
+                  "Fn::Sub": "${ApiSecretArn}:VOICE_SERVICE_TOKEN::"
+                }
+              },
+              {
+                "Fn::If": [
+                  "StatusReader",
+                  {
+                    "Name": "TWILIO_AUTH_TOKEN",
+                    "ValueFrom": {
+                      "Fn::Sub": "${ApiSecretArn}:TWILIO_AUTH_TOKEN::"
+                    }
+                  },
+                  {
+                    "Ref": "AWS::NoValue"
+                  }
+                ]
+              }
+            ],
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "ApiLogs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "api",
+                "mode": "non-blocking",
+                "max-buffer-size": "4m"
+              }
+            },
+            "PortMappings": [
+              {
+                "ContainerPort": 3001,
+                "Protocol": "tcp"
+              }
+            ],
+            "HealthCheck": {
+              "Command": [
+                "CMD",
+                "node",
+                "-e",
+                "fetch('http://127.0.0.1:3001/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+              ],
+              "Interval": 30,
+              "Timeout": 5,
+              "Retries": 3,
+              "StartPeriod": 60
+            }
+          }
+        ]
+      }
+    },
+    "ApiService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "ServiceName": "api",
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "TaskDefinition": {
+          "Ref": "ApiTask"
+        },
+        "DesiredCount": {
+          "Ref": "DesiredCount"
+        },
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "EnableExecuteCommand": false,
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "ApiSecurityGroupId"
+              }
+            ]
+          }
+        },
+        "DeploymentConfiguration": {
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200,
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          }
+        },
+        "LoadBalancers": [
+          {
+            "TargetGroupArn": {
+              "Ref": "ApiPublicTargets"
+            },
+            "ContainerName": "api",
+            "ContainerPort": 3001
+          },
+          {
+            "TargetGroupArn": {
+              "Ref": "ApiInternalTargets"
+            },
+            "ContainerName": "api",
+            "ContainerPort": 3001
+          }
+        ],
+        "HealthCheckGracePeriodSeconds": 90
+      },
+      "DependsOn": ["PublicAppRule", "PrivateAppRule"]
+    },
+    "VoiceLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/hostline/${Namespace}/${Environment}/voice"
+        },
+        "RetentionInDays": 30,
+        "KmsKeyId": {
+          "Ref": "DataKeyArn"
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "VoiceExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${Namespace}-${Environment}-task-voice-execution"
+        },
+        "PermissionsBoundary": {
+          "Ref": "RuntimeBoundaryArn"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "LaunchOnly",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "ecr:GetAuthorizationToken",
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage"
+                  ],
+                  "Resource": {
+                    "Ref": "RepositoryArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                  "Resource": {
+                    "Fn::GetAtt": ["VoiceLogs", "Arn"]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Resource": {
+                    "Ref": "VoiceSecretArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "kms:Decrypt",
+                  "Resource": {
+                    "Ref": "DataKeyArn"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "kms:ViaService": {
+                        "Fn::Sub": "secretsmanager.${AWS::Region}.amazonaws.com"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "VoiceRuntimeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${Namespace}-${Environment}-task-voice-runtime"
+        },
+        "PermissionsBoundary": {
+          "Ref": "RuntimeBoundaryArn"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "VoiceTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Family": {
+          "Fn::Sub": "${Namespace}-${Environment}-voice"
+        },
+        "Cpu": "512",
+        "Memory": "1024",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": ["FARGATE"],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": ["VoiceExecutionRole", "Arn"]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": ["VoiceRuntimeRole", "Arn"]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "voice",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": ["node", "apps/voice-gateway/dist/index.js"],
+            "User": "10001",
+            "ReadonlyRootFilesystem": true,
+            "StopTimeout": 120,
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "Environment": [
+              {
+                "Name": "NODE_ENV",
+                "Value": {
+                  "Fn::If": ["Production", "production", "development"]
+                }
+              },
+              {
+                "Name": "HOSTLINE_ENVIRONMENT",
+                "Value": {
+                  "Ref": "Environment"
+                }
+              },
+              {
+                "Name": "DATABASE_CA_FILE",
+                "Value": "/opt/hostline/certs/rds-global-bundle.pem"
+              },
+              {
+                "Name": "VOICE_HOST",
+                "Value": "0.0.0.0"
+              },
+              {
+                "Name": "VOICE_PORT",
+                "Value": "3002"
+              },
+              {
+                "Name": "LIVE_VOICE_ENABLED",
+                "Value": {
+                  "Ref": "LiveVoiceEnabled"
+                }
+              },
+              {
+                "Name": "VOICE_MODE",
+                "Value": "sandbox"
+              },
+              {
+                "Name": "VOICE_ACTIONS_ENABLED",
+                "Value": {
+                  "Ref": "VoiceActionsEnabled"
+                }
+              },
+              {
+                "Name": "VOICE_TRANSFERS_ENABLED",
+                "Value": {
+                  "Ref": "VoiceTransfersEnabled"
+                }
+              },
+              {
+                "Name": "VOICE_TENANT_ID",
+                "Value": {
+                  "Ref": "VoiceTenantId"
+                }
+              },
+              {
+                "Name": "TWILIO_ACCOUNT_SID",
+                "Value": {
+                  "Ref": "TwilioAccountSid"
+                }
+              },
+              {
+                "Name": "TWILIO_PHONE_NUMBER",
+                "Value": {
+                  "Ref": "TwilioPhoneNumber"
+                }
+              },
+              {
+                "Name": "VOICE_PUBLIC_URL",
+                "Value": {
+                  "Fn::Sub": "https://${VoiceDomain}"
+                }
+              },
+              {
+                "Name": "API_INTERNAL_URL",
+                "Value": {
+                  "Fn::Sub": "https://${AppDomain}"
+                }
+              },
+              {
+                "Name": "OPENAI_REALTIME_MODEL",
+                "Value": "gpt-realtime"
+              }
+            ],
+            "Secrets": {
+              "Fn::If": [
+                "LiveVoice",
+                [
+                  {
+                    "Name": "TWILIO_AUTH_TOKEN",
+                    "ValueFrom": {
+                      "Fn::Sub": "${VoiceSecretArn}:TWILIO_AUTH_TOKEN::"
+                    }
+                  },
+                  {
+                    "Name": "OPENAI_API_KEY",
+                    "ValueFrom": {
+                      "Fn::Sub": "${VoiceSecretArn}:OPENAI_API_KEY::"
+                    }
+                  },
+                  {
+                    "Name": "VOICE_SERVICE_TOKEN",
+                    "ValueFrom": {
+                      "Fn::Sub": "${VoiceSecretArn}:VOICE_SERVICE_TOKEN::"
+                    }
+                  }
+                ],
+                {
+                  "Ref": "AWS::NoValue"
+                }
+              ]
+            },
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "VoiceLogs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "voice",
+                "mode": "non-blocking",
+                "max-buffer-size": "4m"
+              }
+            },
+            "PortMappings": [
+              {
+                "ContainerPort": 3002,
+                "Protocol": "tcp"
+              }
+            ],
+            "HealthCheck": {
+              "Command": [
+                "CMD",
+                "node",
+                "-e",
+                "fetch('http://127.0.0.1:3002/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+              ],
+              "Interval": 30,
+              "Timeout": 5,
+              "Retries": 3,
+              "StartPeriod": 60
+            }
+          }
+        ]
+      }
+    },
+    "VoiceService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "ServiceName": "voice",
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "TaskDefinition": {
+          "Ref": "VoiceTask"
+        },
+        "DesiredCount": {
+          "Ref": "DesiredCount"
+        },
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "EnableExecuteCommand": false,
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "VoiceSecurityGroupId"
+              }
+            ]
+          }
+        },
+        "DeploymentConfiguration": {
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200,
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          }
+        },
+        "LoadBalancers": [
+          {
+            "TargetGroupArn": {
+              "Ref": "VoicePublicTargets"
+            },
+            "ContainerName": "voice",
+            "ContainerPort": 3002
+          }
+        ],
+        "HealthCheckGracePeriodSeconds": 90
+      },
+      "DependsOn": ["PublicVoiceRule", "PrivateAppRecord"]
+    },
+    "WorkerLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/hostline/${Namespace}/${Environment}/worker"
+        },
+        "RetentionInDays": 30,
+        "KmsKeyId": {
+          "Ref": "DataKeyArn"
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "WorkerExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${Namespace}-${Environment}-task-worker-execution"
+        },
+        "PermissionsBoundary": {
+          "Ref": "RuntimeBoundaryArn"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "LaunchOnly",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "ecr:GetAuthorizationToken",
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage"
+                  ],
+                  "Resource": {
+                    "Ref": "RepositoryArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                  "Resource": {
+                    "Fn::GetAtt": ["WorkerLogs", "Arn"]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Resource": {
+                    "Ref": "WorkerSecretArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "kms:Decrypt",
+                  "Resource": {
+                    "Ref": "DataKeyArn"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "kms:ViaService": {
+                        "Fn::Sub": "secretsmanager.${AWS::Region}.amazonaws.com"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "WorkerRuntimeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${Namespace}-${Environment}-task-worker-runtime"
+        },
+        "PermissionsBoundary": {
+          "Ref": "RuntimeBoundaryArn"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "BoundRecoveryManifestRead",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "dynamodb:GetItem",
+                  "Resource": {
+                    "Ref": "RecoveryTableArn"
+                  },
+                  "Condition": {
+                    "ForAllValues:StringEquals": {
+                      "dynamodb:LeadingKeys": [
+                        {
+                          "Fn::Sub": "INSTALLATION#${RecoveryInstallationId}"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "rds:DescribeDBInstances",
+                  "Resource": {
+                    "Ref": "DatabaseArn"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "WorkerTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Family": {
+          "Fn::Sub": "${Namespace}-${Environment}-worker"
+        },
+        "Cpu": "512",
+        "Memory": "1024",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": ["FARGATE"],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": ["WorkerExecutionRole", "Arn"]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": ["WorkerRuntimeRole", "Arn"]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "worker",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": ["node", "apps/worker/dist/index.js"],
+            "User": "10001",
+            "ReadonlyRootFilesystem": true,
+            "StopTimeout": 120,
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "Environment": [
+              {
+                "Name": "NODE_ENV",
+                "Value": {
+                  "Fn::If": ["Production", "production", "development"]
+                }
+              },
+              {
+                "Name": "HOSTLINE_ENVIRONMENT",
+                "Value": {
+                  "Ref": "Environment"
+                }
+              },
+              {
+                "Name": "DATABASE_CA_FILE",
+                "Value": "/opt/hostline/certs/rds-global-bundle.pem"
+              },
+              {
+                "Name": "RECOVERY_INSTALLATION_ID",
+                "Value": {
+                  "Ref": "RecoveryInstallationId"
+                }
+              },
+              {
+                "Name": "RECOVERY_EPOCH",
+                "Value": {
+                  "Ref": "RecoveryEpoch"
+                }
+              },
+              {
+                "Name": "RECOVERY_DATABASE_RESOURCE_ID",
+                "Value": {
+                  "Ref": "RecoveryDatabaseResourceId"
+                }
+              },
+              {
+                "Name": "RECOVERY_TABLE_NAME",
+                "Value": {
+                  "Ref": "RecoveryTableName"
+                }
+              },
+              {
+                "Name": "AWS_REGION",
+                "Value": {
+                  "Ref": "AWS::Region"
+                }
+              },
+              {
+                "Name": "RECOVERY_DATABASE_INSTANCE_ID",
+                "Value": {
+                  "Ref": "RecoveryDatabaseInstanceId"
+                }
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "DATABASE_URL",
+                "ValueFrom": {
+                  "Fn::Sub": "${WorkerSecretArn}:DATABASE_URL::"
+                }
+              }
+            ],
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "WorkerLogs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "worker",
+                "mode": "non-blocking",
+                "max-buffer-size": "4m"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "WorkerService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "ServiceName": "worker",
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "TaskDefinition": {
+          "Ref": "WorkerTask"
+        },
+        "DesiredCount": {
+          "Ref": "DesiredCount"
+        },
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "EnableExecuteCommand": false,
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "WorkerSecurityGroupId"
+              }
+            ]
+          }
+        },
+        "DeploymentConfiguration": {
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200,
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          }
+        }
+      }
+    },
+    "MigrationLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/hostline/${Namespace}/${Environment}/migration"
+        },
+        "RetentionInDays": 30,
+        "KmsKeyId": {
+          "Ref": "DataKeyArn"
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "MigrationExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${Namespace}-${Environment}-task-migration-execution"
+        },
+        "PermissionsBoundary": {
+          "Ref": "RuntimeBoundaryArn"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "LaunchOnly",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "ecr:GetAuthorizationToken",
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage"
+                  ],
+                  "Resource": {
+                    "Ref": "RepositoryArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                  "Resource": {
+                    "Fn::GetAtt": ["MigrationLogs", "Arn"]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Resource": {
+                    "Ref": "MigrationSecretArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "kms:Decrypt",
+                  "Resource": {
+                    "Ref": "DataKeyArn"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "kms:ViaService": {
+                        "Fn::Sub": "secretsmanager.${AWS::Region}.amazonaws.com"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "MigrationRuntimeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${Namespace}-${Environment}-task-migration-runtime"
+        },
+        "PermissionsBoundary": {
+          "Ref": "RuntimeBoundaryArn"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "MigrationTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Family": {
+          "Fn::Sub": "${Namespace}-${Environment}-migration"
+        },
+        "Cpu": "512",
+        "Memory": "1024",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": ["FARGATE"],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": ["MigrationExecutionRole", "Arn"]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": ["MigrationRuntimeRole", "Arn"]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "migration",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": ["node", "apps/migrate/dist/index.js"],
+            "User": "10001",
+            "ReadonlyRootFilesystem": true,
+            "StopTimeout": 120,
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "Environment": [
+              {
+                "Name": "NODE_ENV",
+                "Value": {
+                  "Fn::If": ["Production", "production", "development"]
+                }
+              },
+              {
+                "Name": "HOSTLINE_ENVIRONMENT",
+                "Value": {
+                  "Ref": "Environment"
+                }
+              },
+              {
+                "Name": "DATABASE_CA_FILE",
+                "Value": "/opt/hostline/certs/rds-global-bundle.pem"
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "DATABASE_MIGRATION_URL",
+                "ValueFrom": {
+                  "Fn::Sub": "${MigrationSecretArn}:DATABASE_MIGRATION_URL::"
+                }
+              }
+            ],
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "MigrationLogs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "migration",
+                "mode": "non-blocking",
+                "max-buffer-size": "4m"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "WafAcl": {
+      "Type": "AWS::WAFv2::WebACL",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Namespace}-${Environment}-public"
+        },
+        "Scope": "REGIONAL",
+        "DefaultAction": {
+          "Allow": {}
+        },
+        "VisibilityConfig": {
+          "CloudWatchMetricsEnabled": true,
+          "MetricName": {
+            "Fn::Sub": "${Namespace}-${Environment}-waf"
+          },
+          "SampledRequestsEnabled": false
+        },
+        "Rules": [
+          {
+            "Name": "BlockDecodedPrivatePaths",
+            "Priority": 0,
+            "Statement": {
+              "ByteMatchStatement": {
+                "FieldToMatch": {
+                  "UriPath": {}
+                },
+                "PositionalConstraint": "STARTS_WITH",
+                "SearchString": "/internal",
+                "TextTransformations": [
+                  {
+                    "Priority": 0,
+                    "Type": "URL_DECODE"
+                  },
+                  {
+                    "Priority": 1,
+                    "Type": "NORMALIZE_PATH"
+                  },
+                  {
+                    "Priority": 2,
+                    "Type": "LOWERCASE"
+                  }
+                ]
+              }
+            },
+            "Action": {
+              "Block": {}
+            },
+            "VisibilityConfig": {
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": {
+                "Fn::Sub": "${Namespace}-${Environment}-private-block"
+              },
+              "SampledRequestsEnabled": false
+            }
+          },
+          {
+            "Name": "ManagedCommonRules",
+            "Priority": 10,
+            "Statement": {
+              "ManagedRuleGroupStatement": {
+                "VendorName": "AWS",
+                "Name": "AWSManagedRulesCommonRuleSet"
+              }
+            },
+            "OverrideAction": {
+              "None": {}
+            },
+            "VisibilityConfig": {
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": {
+                "Fn::Sub": "${Namespace}-${Environment}-common"
+              },
+              "SampledRequestsEnabled": false
+            }
+          },
+          {
+            "Name": "RateLimit",
+            "Priority": 20,
+            "Statement": {
+              "RateBasedStatement": {
+                "Limit": 2000,
+                "AggregateKeyType": "IP"
+              }
+            },
+            "Action": {
+              "Block": {}
+            },
+            "VisibilityConfig": {
+              "CloudWatchMetricsEnabled": true,
+              "MetricName": {
+                "Fn::Sub": "${Namespace}-${Environment}-rate"
+              },
+              "SampledRequestsEnabled": false
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "HostlineNamespace",
+            "Value": {
+              "Ref": "Namespace"
+            }
+          },
+          {
+            "Key": "HostlineEnvironment",
+            "Value": {
+              "Ref": "Environment"
+            }
+          }
+        ]
+      },
+      "Condition": "Waf"
+    },
+    "WafAssociation": {
+      "Type": "AWS::WAFv2::WebACLAssociation",
+      "Properties": {
+        "ResourceArn": {
+          "Ref": "PublicAlb"
+        },
+        "WebACLArn": {
+          "Fn::GetAtt": ["WafAcl", "Arn"]
+        }
+      },
+      "Condition": "Waf"
+    },
+    "ApiUnhealthyAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${Namespace}-${Environment}-api-unhealthy"
+        },
+        "AlarmDescription": "Unhealthy target count; no notification recipient is provisioned. Configure alarm actions through operator review.",
+        "Namespace": "AWS/ApplicationELB",
+        "MetricName": "UnHealthyHostCount",
+        "Dimensions": [
+          {
+            "Name": "LoadBalancer",
+            "Value": {
+              "Fn::GetAtt": ["PublicAlb", "LoadBalancerFullName"]
+            }
+          },
+          {
+            "Name": "TargetGroup",
+            "Value": {
+              "Fn::GetAtt": ["ApiPublicTargets", "TargetGroupFullName"]
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 60,
+        "EvaluationPeriods": 3,
+        "DatapointsToAlarm": 2,
+        "Threshold": 0,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    },
+    "VoiceUnhealthyAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${Namespace}-${Environment}-voice-unhealthy"
+        },
+        "AlarmDescription": "Unhealthy target count; no notification recipient is provisioned. Configure alarm actions through operator review.",
+        "Namespace": "AWS/ApplicationELB",
+        "MetricName": "UnHealthyHostCount",
+        "Dimensions": [
+          {
+            "Name": "LoadBalancer",
+            "Value": {
+              "Fn::GetAtt": ["PublicAlb", "LoadBalancerFullName"]
+            }
+          },
+          {
+            "Name": "TargetGroup",
+            "Value": {
+              "Fn::GetAtt": ["VoicePublicTargets", "TargetGroupFullName"]
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 60,
+        "EvaluationPeriods": 3,
+        "DatapointsToAlarm": 2,
+        "Threshold": 0,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    },
+    "LatencyAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": {
+          "Fn::Sub": "${Namespace}-${Environment}-api-p99-latency"
+        },
+        "AlarmDescription": "Initial p99 latency threshold; tune with measured staging traffic.",
+        "Namespace": "AWS/ApplicationELB",
+        "MetricName": "TargetResponseTime",
+        "Dimensions": [
+          {
+            "Name": "LoadBalancer",
+            "Value": {
+              "Fn::GetAtt": ["PublicAlb", "LoadBalancerFullName"]
+            }
+          },
+          {
+            "Name": "TargetGroup",
+            "Value": {
+              "Fn::GetAtt": ["ApiPublicTargets", "TargetGroupFullName"]
+            }
+          }
+        ],
+        "ExtendedStatistic": "p99",
+        "Period": 60,
+        "EvaluationPeriods": 3,
+        "DatapointsToAlarm": 2,
+        "Threshold": 2,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    }
+  },
+  "Outputs": {
+    "ApiTaskDefinition": {
+      "Value": {
+        "Ref": "ApiTask"
+      },
+      "Description": "Immutable image api task revision; migration uses a dedicated one-off task."
+    },
+    "ApiLogGroup": {
+      "Value": {
+        "Ref": "ApiLogs"
+      },
+      "Description": "Retained encrypted redacted application logs; no caller bodies requested."
+    },
+    "ApiService": {
+      "Value": {
+        "Fn::GetAtt": ["ApiService", "Name"]
+      },
+      "Description": "api ECS service name."
+    },
+    "VoiceTaskDefinition": {
+      "Value": {
+        "Ref": "VoiceTask"
+      },
+      "Description": "Immutable image voice task revision; migration uses a dedicated one-off task."
+    },
+    "VoiceLogGroup": {
+      "Value": {
+        "Ref": "VoiceLogs"
+      },
+      "Description": "Retained encrypted redacted application logs; no caller bodies requested."
+    },
+    "VoiceService": {
+      "Value": {
+        "Fn::GetAtt": ["VoiceService", "Name"]
+      },
+      "Description": "voice ECS service name."
+    },
+    "WorkerTaskDefinition": {
+      "Value": {
+        "Ref": "WorkerTask"
+      },
+      "Description": "Immutable image worker task revision; migration uses a dedicated one-off task."
+    },
+    "WorkerLogGroup": {
+      "Value": {
+        "Ref": "WorkerLogs"
+      },
+      "Description": "Retained encrypted redacted application logs; no caller bodies requested."
+    },
+    "WorkerService": {
+      "Value": {
+        "Fn::GetAtt": ["WorkerService", "Name"]
+      },
+      "Description": "worker ECS service name."
+    },
+    "MigrationTaskDefinition": {
+      "Value": {
+        "Ref": "MigrationTask"
+      },
+      "Description": "Immutable image migration task revision; migration uses a dedicated one-off task."
+    },
+    "MigrationLogGroup": {
+      "Value": {
+        "Ref": "MigrationLogs"
+      },
+      "Description": "Retained encrypted redacted application logs; no caller bodies requested."
+    },
+    "ClusterName": {
+      "Value": {
+        "Ref": "Cluster"
+      },
+      "Description": "Scoped ECS cluster for deployment and read-only service status."
+    },
+    "PublicAlbDns": {
+      "Value": {
+        "Fn::GetAtt": ["PublicAlb", "DNSName"]
+      },
+      "Description": "Public DNS alias target if records are managed outside Route 53."
+    },
+    "PublicAlbZoneId": {
+      "Value": {
+        "Fn::GetAtt": ["PublicAlb", "CanonicalHostedZoneID"]
+      },
+      "Description": "Alias hosted zone for DNS."
+    },
+    "AppUrl": {
+      "Value": {
+        "Fn::Sub": "https://${AppDomain}"
+      },
+      "Description": "Public staff HTTPS origin; public /internal paths return 403."
+    },
+    "VoiceUrl": {
+      "Value": {
+        "Fn::Sub": "https://${VoiceDomain}"
+      },
+      "Description": "Public signed webhook/voice HTTPS origin."
+    },
+    "ImageCommit": {
+      "Value": {
+        "Ref": "ImageCommit"
+      },
+      "Description": "Full Git commit SHA corresponding to the immutable deployed image."
+    },
+    "ImageUri": {
+      "Value": {
+        "Ref": "ImageUri"
+      },
+      "Description": "Exact image digest; never a mutable latest tag."
+    }
+  }
+}

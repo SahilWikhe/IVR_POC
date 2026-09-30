@@ -352,7 +352,7 @@ describe('bounded scoped internal voice client', () => {
     expect(() => loadVoiceConfig({ VOICE_TRANSFERS_ENABLED: '1' })).toThrow(
       'Invalid voice activation',
     );
-    expect(loadVoiceConfig({})).toEqual({ enabled: false, port: 3002 });
+    expect(loadVoiceConfig({})).toEqual({ enabled: false, port: 3002, host: '127.0.0.1' });
   });
 
   it('validates current-policy responses and carries call cancellation through the client', async () => {

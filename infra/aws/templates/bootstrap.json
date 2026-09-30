@@ -1,0 +1,788 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Manual Hostline GitHub OIDC bootstrap. Environment branch restrictions and reviews must be verified before readiness flags are enabled. No long-lived AWS credential is created.",
+  "Parameters": {
+    "Namespace": {
+      "Type": "String",
+      "AllowedPattern": "[a-z][a-z0-9-]{2,12}",
+      "Default": "hostline"
+    },
+    "Environment": {
+      "Type": "String",
+      "AllowedValues": ["staging", "production"],
+      "Default": "staging"
+    },
+    "GitHubRepository": {
+      "Type": "String",
+      "AllowedPattern": "[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
+      "Default": "SahilWikhe/IVR_POC"
+    },
+    "GitHubOidcProviderArn": {
+      "Type": "String",
+      "Description": "Existing GitHub token.actions.githubusercontent.com provider; operator manages the account-wide provider.",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "AppStackName": {
+      "Type": "String",
+      "AllowedPattern": "[A-Za-z][A-Za-z0-9-]{2,80}"
+    },
+    "RepositoryArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "DataKeyArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "ApiSecretArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "VoiceSecretArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "WorkerSecretArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "MigrationSecretArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "RecoveryTableArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    },
+    "RecoveryInstallationId": {
+      "Type": "String",
+      "AllowedPattern": "[a-fA-F0-9-]{36}"
+    },
+    "PrivateAppZoneId": {
+      "Type": "String",
+      "AllowedPattern": "Z[A-Z0-9]+"
+    },
+    "PublicHostedZoneId": {
+      "Type": "String",
+      "AllowedPattern": "(^$)|(^Z[A-Z0-9]+$)",
+      "Default": ""
+    },
+    "AppDomain": {
+      "Type": "String",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]+\\.[a-z]{2,}"
+    },
+    "VoiceDomain": {
+      "Type": "String",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]+\\.[a-z]{2,}"
+    },
+    "DatabaseArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+"
+    }
+  },
+  "Resources": {
+    "RuntimeBoundary": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "Description": "Maximum permissions for ECS launch/application roles; no IAM, provisioning, or account administration.",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["ecr:GetAuthorizationToken"],
+              "Resource": "*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage"
+              ],
+              "Resource": {
+                "Ref": "RepositoryArn"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/hostline/${Namespace}/${Environment}/*"
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["secretsmanager:GetSecretValue"],
+              "Resource": [
+                {
+                  "Ref": "ApiSecretArn"
+                },
+                {
+                  "Ref": "VoiceSecretArn"
+                },
+                {
+                  "Ref": "WorkerSecretArn"
+                },
+                {
+                  "Ref": "MigrationSecretArn"
+                }
+              ]
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["kms:Decrypt", "kms:DescribeKey"],
+              "Resource": {
+                "Ref": "DataKeyArn"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "kms:ViaService": {
+                    "Fn::Sub": "secretsmanager.${AWS::Region}.amazonaws.com"
+                  }
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": "dynamodb:GetItem",
+              "Resource": {
+                "Ref": "RecoveryTableArn"
+              },
+              "Condition": {
+                "ForAllValues:StringEquals": {
+                  "dynamodb:LeadingKeys": [
+                    {
+                      "Fn::Sub": "INSTALLATION#${RecoveryInstallationId}"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": "rds:DescribeDBInstances",
+              "Resource": {
+                "Ref": "DatabaseArn"
+              }
+            }
+          ]
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "CloudFormationExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${Namespace}-${Environment}-deployment-execution"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "cloudformation.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "HostlineApplicationResources",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "TaskRoleCreationWithBoundary",
+                  "Effect": "Allow",
+                  "Action": ["iam:CreateRole", "iam:PutRolePermissionsBoundary"],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Namespace}-${Environment}-task-*"
+                  },
+                  "Condition": {
+                    "ArnEquals": {
+                      "iam:PermissionsBoundary": {
+                        "Ref": "RuntimeBoundary"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Sid": "TaskRoleManagement",
+                  "Effect": "Allow",
+                  "Action": [
+                    "iam:DeleteRole",
+                    "iam:GetRole",
+                    "iam:UpdateAssumeRolePolicy",
+                    "iam:PutRolePolicy",
+                    "iam:DeleteRolePolicy",
+                    "iam:GetRolePolicy",
+                    "iam:ListRolePolicies",
+                    "iam:ListAttachedRolePolicies",
+                    "iam:TagRole",
+                    "iam:UntagRole"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Namespace}-${Environment}-task-*"
+                  }
+                },
+                {
+                  "Sid": "PassOnlyEcsRoles",
+                  "Effect": "Allow",
+                  "Action": "iam:PassRole",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Namespace}-${Environment}-task-*"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "iam:PassedToService": "ecs-tasks.amazonaws.com"
+                    }
+                  }
+                },
+                {
+                  "Sid": "AppCluster",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecs:CreateCluster",
+                    "ecs:DescribeClusters",
+                    "ecs:DeleteCluster",
+                    "ecs:UpdateClusterSettings",
+                    "ecs:TagResource",
+                    "ecs:UntagResource"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${Namespace}-${Environment}"
+                  }
+                },
+                {
+                  "Sid": "AppServices",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecs:CreateService",
+                    "ecs:UpdateService",
+                    "ecs:DeleteService",
+                    "ecs:DescribeServices",
+                    "ecs:TagResource",
+                    "ecs:UntagResource"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${Namespace}-${Environment}/*"
+                  }
+                },
+                {
+                  "Sid": "ReadNetwork",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:DescribeSecurityGroups",
+                    "ec2:DescribeVpcs",
+                    "ec2:DescribeSubnets",
+                    "ec2:DescribeNetworkInterfaces"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "AppLogs",
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:DeleteLogGroup",
+                    "logs:PutRetentionPolicy",
+                    "logs:DeleteRetentionPolicy",
+                    "logs:AssociateKmsKey",
+                    "logs:DisassociateKmsKey",
+                    "logs:TagResource",
+                    "logs:UntagResource",
+                    "logs:ListTagsForResource",
+                    "logs:PutMetricFilter",
+                    "logs:DeleteMetricFilter",
+                    "logs:DescribeMetricFilters"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/hostline/${Namespace}/${Environment}/*"
+                  }
+                },
+                {
+                  "Sid": "AppAlarms",
+                  "Effect": "Allow",
+                  "Action": [
+                    "cloudwatch:PutMetricAlarm",
+                    "cloudwatch:DeleteAlarms",
+                    "cloudwatch:DescribeAlarms",
+                    "cloudwatch:TagResource",
+                    "cloudwatch:UntagResource",
+                    "cloudwatch:ListTagsForResource"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${Namespace}-${Environment}-*"
+                  }
+                },
+                {
+                  "Sid": "CertificateAndKeyMetadata",
+                  "Effect": "Allow",
+                  "Action": ["acm:DescribeCertificate", "kms:DescribeKey"],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "AllocateAppLoadBalancers",
+                  "Effect": "Allow",
+                  "Action": [
+                    "elasticloadbalancing:CreateLoadBalancer",
+                    "elasticloadbalancing:CreateTargetGroup"
+                  ],
+                  "Resource": "*",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/HostlineNamespace": {
+                        "Ref": "Namespace"
+                      },
+                      "aws:RequestTag/HostlineEnvironment": {
+                        "Ref": "Environment"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Sid": "ReadLoadBalancerMetadata",
+                  "Effect": "Allow",
+                  "Action": [
+                    "elasticloadbalancing:DescribeLoadBalancers",
+                    "elasticloadbalancing:DescribeTargetGroups",
+                    "elasticloadbalancing:DescribeTargetGroupAttributes",
+                    "elasticloadbalancing:DescribeListeners",
+                    "elasticloadbalancing:DescribeRules",
+                    "elasticloadbalancing:DescribeLoadBalancerAttributes",
+                    "elasticloadbalancing:DescribeTags",
+                    "elasticloadbalancing:DescribeTargetHealth"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "ManageOnlyNamespacedLoadBalancers",
+                  "Effect": "Allow",
+                  "Action": [
+                    "elasticloadbalancing:DeleteLoadBalancer",
+                    "elasticloadbalancing:DeleteTargetGroup",
+                    "elasticloadbalancing:ModifyTargetGroup",
+                    "elasticloadbalancing:ModifyTargetGroupAttributes",
+                    "elasticloadbalancing:CreateListener",
+                    "elasticloadbalancing:DeleteListener",
+                    "elasticloadbalancing:ModifyListener",
+                    "elasticloadbalancing:CreateRule",
+                    "elasticloadbalancing:DeleteRule",
+                    "elasticloadbalancing:ModifyRule",
+                    "elasticloadbalancing:ModifyLoadBalancerAttributes",
+                    "elasticloadbalancing:AddTags",
+                    "elasticloadbalancing:RemoveTags",
+                    "elasticloadbalancing:SetSecurityGroups",
+                    "elasticloadbalancing:SetSubnets",
+                    "elasticloadbalancing:RegisterTargets",
+                    "elasticloadbalancing:DeregisterTargets"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/${Namespace}-${Environment}-*/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/${Namespace}-${Environment}-*/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener/app/${Namespace}-${Environment}-*/*/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener-rule/app/${Namespace}-${Environment}-*/*/*/*"
+                    }
+                  ]
+                },
+                {
+                  "Sid": "ReadScopedHostedZones",
+                  "Effect": "Allow",
+                  "Action": ["route53:GetHostedZone", "route53:ListResourceRecordSets"],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:route53:::hostedzone/${PrivateAppZoneId}"
+                    },
+                    {
+                      "Fn::If": [
+                        "PublicDns",
+                        {
+                          "Fn::Sub": "arn:${AWS::Partition}:route53:::hostedzone/${PublicHostedZoneId}"
+                        },
+                        {
+                          "Ref": "AWS::NoValue"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "Sid": "OnlyApplicationDnsNames",
+                  "Effect": "Allow",
+                  "Action": "route53:ChangeResourceRecordSets",
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:route53:::hostedzone/${PrivateAppZoneId}"
+                    },
+                    {
+                      "Fn::If": [
+                        "PublicDns",
+                        {
+                          "Fn::Sub": "arn:${AWS::Partition}:route53:::hostedzone/${PublicHostedZoneId}"
+                        },
+                        {
+                          "Ref": "AWS::NoValue"
+                        }
+                      ]
+                    }
+                  ],
+                  "Condition": {
+                    "ForAllValues:StringEquals": {
+                      "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+                        {
+                          "Ref": "AppDomain"
+                        },
+                        {
+                          "Ref": "VoiceDomain"
+                        }
+                      ],
+                      "route53:ChangeResourceRecordSetsRecordTypes": ["A"]
+                    }
+                  }
+                },
+                {
+                  "Sid": "ReadDnsChangeCompletion",
+                  "Effect": "Allow",
+                  "Action": "route53:GetChange",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:route53:::change/*"
+                  }
+                },
+                {
+                  "Sid": "AllocateNamespacedWaf",
+                  "Effect": "Allow",
+                  "Action": "wafv2:CreateWebACL",
+                  "Resource": "*",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/HostlineNamespace": {
+                        "Ref": "Namespace"
+                      },
+                      "aws:RequestTag/HostlineEnvironment": {
+                        "Ref": "Environment"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Sid": "NamespacedWafManagement",
+                  "Effect": "Allow",
+                  "Action": [
+                    "wafv2:UpdateWebACL",
+                    "wafv2:DeleteWebACL",
+                    "wafv2:GetWebACL",
+                    "wafv2:TagResource",
+                    "wafv2:UntagResource",
+                    "wafv2:ListTagsForResource"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:wafv2:${AWS::Region}:${AWS::AccountId}:regional/webacl/${Namespace}-${Environment}-*/*"
+                  }
+                },
+                {
+                  "Sid": "OnlyApplicationWafAssociation",
+                  "Effect": "Allow",
+                  "Action": [
+                    "wafv2:AssociateWebACL",
+                    "wafv2:DisassociateWebACL",
+                    "wafv2:GetWebACLForResource"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/${Namespace}-${Environment}-*/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/${Namespace}-${Environment}-*/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener/app/${Namespace}-${Environment}-*/*/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener-rule/app/${Namespace}-${Environment}-*/*/*/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:wafv2:${AWS::Region}:${AWS::AccountId}:regional/webacl/${Namespace}-${Environment}-*/*"
+                    }
+                  ]
+                },
+                {
+                  "Sid": "RegisterTaskDefinitionOnly",
+                  "Effect": "Allow",
+                  "Action": "ecs:RegisterTaskDefinition",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "OwnTaskDefinitionMetadataAndCleanup",
+                  "Effect": "Allow",
+                  "Action": ["ecs:DescribeTaskDefinition", "ecs:DeregisterTaskDefinition"],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${Namespace}-${Environment}-*:*"
+                  }
+                },
+                {
+                  "Sid": "ReadLogGroupMetadata",
+                  "Effect": "Allow",
+                  "Action": "logs:DescribeLogGroups",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "AssociateWafOnlyWithApplicationAlb",
+                  "Effect": "Allow",
+                  "Action": "elasticloadbalancing:SetWebAcl",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/${Namespace}-${Environment}-*/*"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "GitHubDeploymentRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${Namespace}-${Environment}-github-deployment"
+        },
+        "MaxSessionDuration": 3600,
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": {
+                  "Ref": "GitHubOidcProviderArn"
+                }
+              },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                  "token.actions.githubusercontent.com:sub": {
+                    "Fn::Sub": "repo:${GitHubRepository}:environment:${Environment}"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "ApplicationDeploymentAndReadOnlyOperations",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "ImagePublishing",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage",
+                    "ecr:InitiateLayerUpload",
+                    "ecr:UploadLayerPart",
+                    "ecr:CompleteLayerUpload",
+                    "ecr:PutImage",
+                    "ecr:DescribeImages"
+                  ],
+                  "Resource": {
+                    "Ref": "RepositoryArn"
+                  }
+                },
+                {
+                  "Sid": "RegistryAuthentication",
+                  "Effect": "Allow",
+                  "Action": "ecr:GetAuthorizationToken",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "AppStackOnly",
+                  "Effect": "Allow",
+                  "Action": [
+                    "cloudformation:CreateChangeSet",
+                    "cloudformation:DescribeStacks",
+                    "cloudformation:GetTemplate",
+                    "cloudformation:DeleteStack",
+                    "cloudformation:DescribeEvents"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*"
+                  }
+                },
+                {
+                  "Sid": "NamedAppChangeSets",
+                  "Effect": "Allow",
+                  "Action": [
+                    "cloudformation:DescribeChangeSet",
+                    "cloudformation:ExecuteChangeSet",
+                    "cloudformation:DeleteChangeSet",
+                    "cloudformation:DescribeEvents"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/${AppStackName}-*/*"
+                  }
+                },
+                {
+                  "Sid": "PassCloudFormationRole",
+                  "Effect": "Allow",
+                  "Action": "iam:PassRole",
+                  "Resource": {
+                    "Fn::GetAtt": ["CloudFormationExecutionRole", "Arn"]
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "iam:PassedToService": "cloudformation.amazonaws.com"
+                    }
+                  }
+                },
+                {
+                  "Sid": "ReadOwnDataOutputs",
+                  "Effect": "Allow",
+                  "Action": "cloudformation:DescribeStacks",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Namespace}-${Environment}-data/*"
+                  }
+                },
+                {
+                  "Sid": "PassOnlyMigrationRoles",
+                  "Effect": "Allow",
+                  "Action": "iam:PassRole",
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Namespace}-${Environment}-task-migration-execution"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Namespace}-${Environment}-task-migration-runtime"
+                    }
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "iam:PassedToService": "ecs-tasks.amazonaws.com"
+                    }
+                  }
+                },
+                {
+                  "Sid": "LogQuery",
+                  "Effect": "Allow",
+                  "Action": "logs:StartQuery",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/hostline/${Namespace}/${Environment}/*"
+                  }
+                },
+                {
+                  "Sid": "ReadLogQueryResults",
+                  "Effect": "Allow",
+                  "Action": ["logs:GetQueryResults", "logs:StopQuery"],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "HealthMetadata",
+                  "Effect": "Allow",
+                  "Action": "elasticloadbalancing:DescribeTargetHealth",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "RegisterMigrationRevision",
+                  "Effect": "Allow",
+                  "Action": "ecs:RegisterTaskDefinition",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "ReadTaskDefinitions",
+                  "Effect": "Allow",
+                  "Action": ["ecs:DescribeTaskDefinition", "ecs:DeregisterTaskDefinition"],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${Namespace}-${Environment}-*:*"
+                  }
+                },
+                {
+                  "Sid": "OnlyOneOffMigration",
+                  "Effect": "Allow",
+                  "Action": "ecs:RunTask",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${Namespace}-${Environment}-deploy-migration:*"
+                  },
+                  "Condition": {
+                    "ArnEquals": {
+                      "ecs:cluster": {
+                        "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${Namespace}-${Environment}"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Sid": "ReadOwnTasks",
+                  "Effect": "Allow",
+                  "Action": "ecs:DescribeTasks",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${Namespace}-${Environment}/*"
+                  }
+                },
+                {
+                  "Sid": "OwnServiceRedeployAndStatus",
+                  "Effect": "Allow",
+                  "Action": ["ecs:UpdateService", "ecs:DescribeServices"],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${Namespace}-${Environment}/*"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    }
+  },
+  "Outputs": {
+    "DeploymentRoleArn": {
+      "Value": {
+        "Fn::GetAtt": ["GitHubDeploymentRole", "Arn"]
+      },
+      "Description": "Configure the matching protected GitHub environment repository variable."
+    },
+    "CloudFormationRoleArn": {
+      "Value": {
+        "Fn::GetAtt": ["CloudFormationExecutionRole", "Arn"]
+      },
+      "Description": "Configure the matching protected GitHub environment repository variable."
+    },
+    "RuntimeBoundaryArn": {
+      "Value": {
+        "Ref": "RuntimeBoundary"
+      },
+      "Description": "Pass to the application stack; all launch/task roles retain this boundary."
+    }
+  },
+  "Conditions": {
+    "PublicDns": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "PublicHostedZoneId"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  }
+}

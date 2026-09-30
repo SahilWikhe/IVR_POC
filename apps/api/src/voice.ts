@@ -52,9 +52,7 @@ const equal = (a: string, b: string) => {
   return left.length === right.length && timingSafeEqual(left, right);
 };
 
-function hangup(
-  message = 'This call has ended. Please contact the restaurant directly if you still need help.',
-) {
+function hangup(message = 'This call has ended. If you still need help, please try again later.') {
   const response = new twilio.twiml.VoiceResponse();
   response.say({ language: 'en-US' }, message);
   response.hangup();
@@ -67,10 +65,7 @@ function streamTwiml(publicUrl: string, grant: string, message?: string) {
     .connect()
     .stream({ url: `${publicUrl.replace(/^https:/, 'wss:')}/twilio/media` })
     .parameter({ name: 'grant', value: grant });
-  response.say(
-    { language: 'en-US' },
-    'The assistant is unavailable. Please contact the restaurant directly.',
-  );
+  response.say({ language: 'en-US' }, 'The assistant is unavailable. Please try again later.');
   response.hangup();
   return response.toString();
 }
@@ -181,7 +176,11 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
     record?: VoiceCallRecord,
   ): Promise<PhonePolicy> => {
     const policy = await tx.getPhonePolicy();
-    if (!policy.voiceEnabled || (record && (record.policyVersion ?? 1) !== policy.version))
+    if (
+      !(await tx.getTenantAccess()).enabled ||
+      !policy.voiceEnabled ||
+      (record && (record.policyVersion ?? 1) !== policy.version)
+    )
       throw new VoiceError(
         'PHONE_POLICY_REVOKED',
         403,
@@ -254,6 +253,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
     const policy = await tx.getPhonePolicy();
     if (
       remaining(record, now) < 15 ||
+      !(await tx.getTenantAccess()).enabled ||
       !policy.voiceEnabled ||
       (record.policyVersion ?? 1) !== policy.version
     ) {
@@ -377,6 +377,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         const restaurant = await tx.getRestaurant();
         const call = await callFor(tx, record);
         const allowed =
+          (await tx.getTenantAccess()).enabled &&
           policy.voiceEnabled &&
           (record.policyVersion ?? 1) === policy.version &&
           record.generation === input.generation &&
@@ -553,7 +554,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         now,
       );
       const result = { controlId, twiml };
-      await tx.putReceipt(key, fingerprint(input), result);
+      await tx.putReceipt(key, fingerprint(input), result, record.id);
       return result;
     }),
   );
@@ -619,10 +620,12 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         },
         now,
       );
-      await tx.putReceipt(`voice:transfer-grant:${hash(grant)}`, hash(grant), {
-        providerCallSid: record.providerCallSid,
-        controlId,
-      });
+      await tx.putReceipt(
+        `voice:transfer-grant:${hash(grant)}`,
+        hash(grant),
+        { providerCallSid: record.providerCallSid, controlId },
+        record.id,
+      );
       await tx.saveHandoff({
         callId: record.id,
         controlId,
@@ -631,7 +634,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         createdAt: now.toISOString(),
       });
       const result = { controlId, twiml };
-      await tx.putReceipt(key, fingerprint(input), result);
+      await tx.putReceipt(key, fingerprint(input), result, record.id);
       return result;
     }),
   );
@@ -676,7 +679,12 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         return { dispatch: false, twiml: null, unavailable: true };
       };
       const policy = await tx.getPhonePolicy();
-      if (!policy.voiceEnabled || (record.policyVersion ?? 1) !== policy.version) return abandon();
+      if (
+        !(await tx.getTenantAccess()).enabled ||
+        !policy.voiceEnabled ||
+        (record.policyVersion ?? 1) !== policy.version
+      )
+        return abandon();
       let twiml = record.controlTwiml;
       if (record.controlKind === 'readback') {
         if (
@@ -827,6 +835,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
       if (
         affirmed &&
         config.voice.actionsEnabled &&
+        (await tx.getTenantAccess()).enabled &&
         policy.voiceEnabled &&
         policy.requestsEnabled &&
         (record.policyVersion ?? 1) === policy.version &&
@@ -854,7 +863,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         }
       } else await clearProposal(tx, call, now, outcome);
       const result = await resume(tx, record, now, outcome);
-      await tx.putReceipt(key, fingerprint(input), result);
+      await tx.putReceipt(key, fingerprint(input), result, record.id);
       return result;
     }),
   );
@@ -978,11 +987,11 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         result = callbackResult(next, hangup('The transfer has ended. Thank you for calling.'));
       } else {
         const outcome =
-          'I could not connect you to the staff line. You can leave a message or contact the restaurant directly.';
+          'I could not connect you to the staff line. You can leave a message or try again later.';
         await clearProposal(tx, call, now, outcome);
         result = await resume(tx, record, now, outcome);
       }
-      await tx.putReceipt(key, fingerprint(input), result);
+      await tx.putReceipt(key, fingerprint(input), result, record.id);
       return result;
     }),
   );

@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { createDatabase } from '@hostline/database';
+import { createDatabase, createRuntimeRecoveryGuard } from '@hostline/database';
 
 if (existsSync('.env')) process.loadEnvFile('.env');
 
@@ -10,8 +10,13 @@ if (!databaseUrl) {
   );
   process.exitCode = 1;
 } else {
-  const db = await createDatabase({ url: databaseUrl });
+  const db = await createDatabase({
+    url: databaseUrl,
+    ...(process.env['DATABASE_CA_FILE'] ? { caFile: process.env['DATABASE_CA_FILE'] } : {}),
+  });
   const controller = new AbortController();
+  const recoveryGuard = createRuntimeRecoveryGuard(db);
+  let quarantined = false;
   const stop = () => {
     controller.abort();
   };
@@ -20,7 +25,13 @@ if (!databaseUrl) {
   try {
     while (!controller.signal.aborted) {
       try {
-        const completed = await db.processJobs(25);
+        const ready = await recoveryGuard();
+        if (!ready && !quarantined)
+          console.error(JSON.stringify({ component: 'worker', event: 'recovery_quarantine' }));
+        if (ready && quarantined)
+          console.log(JSON.stringify({ component: 'worker', event: 'recovery_ready' }));
+        quarantined = !ready;
+        const completed = ready ? await db.processJobs(25) : 0;
         if (completed > 0)
           console.log(
             JSON.stringify({

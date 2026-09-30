@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 const portSchema = z.coerce.number().int().min(1).max(65535);
 const enabledSchema = z.enum(['true', 'false']);
+const hostSchema = z.enum(['127.0.0.1', 'localhost', '::1', '0.0.0.0', '::']);
 const httpsOrigin = z
   .string()
   .url()
@@ -49,8 +50,12 @@ const activeSchema = z.object({
   maxCallSeconds: z.coerce.number().int().min(15).max(600),
 });
 
-export type EnabledVoiceConfig = z.infer<typeof activeSchema> & { enabled: true; port: number };
-export type VoiceConfig = EnabledVoiceConfig | { enabled: false; port: number };
+export type EnabledVoiceConfig = z.infer<typeof activeSchema> & {
+  enabled: true;
+  port: number;
+  host?: string;
+};
+export type VoiceConfig = EnabledVoiceConfig | { enabled: false; port: number; host?: string };
 
 /** No network calls happen during configuration. Invalid values are never included in errors. */
 export function loadVoiceConfig(env: NodeJS.ProcessEnv = process.env): VoiceConfig {
@@ -58,9 +63,10 @@ export function loadVoiceConfig(env: NodeJS.ProcessEnv = process.env): VoiceConf
   const actions = enabledSchema.safeParse(env.VOICE_ACTIONS_ENABLED ?? 'false');
   const transfers = enabledSchema.safeParse(env.VOICE_TRANSFERS_ENABLED ?? 'false');
   const port = portSchema.safeParse(env.VOICE_PORT ?? env.PORT ?? '3002');
-  if (!enabled.success || !port.success || !actions.success || !transfers.success)
-    throw new Error('Invalid voice activation flags or VOICE_PORT');
-  if (enabled.data === 'false') return { enabled: false, port: port.data };
+  const host = hostSchema.safeParse(env.VOICE_HOST ?? '127.0.0.1');
+  if (!enabled.success || !port.success || !host.success || !actions.success || !transfers.success)
+    throw new Error('Invalid voice activation flags, VOICE_HOST, or VOICE_PORT');
+  if (enabled.data === 'false') return { enabled: false, port: port.data, host: host.data };
   if (env.NODE_ENV === 'production')
     throw new Error('Production voice activation is unavailable: sandbox verification is required');
   const parsed = activeSchema.safeParse({
@@ -90,5 +96,6 @@ export function loadVoiceConfig(env: NodeJS.ProcessEnv = process.env): VoiceConf
     apiUrl: new URL(parsed.data.apiUrl).origin,
     enabled: true,
     port: port.data,
+    host: host.data,
   };
 }

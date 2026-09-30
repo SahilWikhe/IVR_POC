@@ -13,6 +13,7 @@ import {
   phonePolicySchema,
   restaurantSchema,
   voiceCallRecordSchema,
+  tenantAccessSchema,
   type CallSession,
   type CallSummary,
   type InboxItem,
@@ -20,9 +21,27 @@ import {
   type PhonePolicy,
   type Restaurant,
   type VoiceCallRecord,
+  type TenantAccess,
 } from '@hostline/contracts';
 import { expireFulfillment } from '@hostline/domain';
 import { demoData } from './seed.js';
+import { postgresConnectionConfig } from './postgres.js';
+import {
+  createAuthPersistence,
+  readAuthSession,
+  type AuthPersistence,
+  type AuthSessionBinding,
+  type AuthSession,
+} from './identity.js';
+import { readRecoveryCheckpoint, type RecoveryCheckpoint } from './privacy.js';
+export * from './identity.js';
+export * from './identity-operator.js';
+export * from './privacy.js';
+export * from './privacy-persistence.js';
+export * from './aws-recovery.js';
+export * from './recovery-runtime.js';
+export * from './recovery-operator.js';
+export * from './postgres.js';
 
 type Row = Record<string, unknown>;
 interface QueryResult {
@@ -46,6 +65,7 @@ export class PersistenceError extends Error {
 
 export interface TenantTransaction {
   getRestaurant(): Promise<Restaurant>;
+  getTenantAccess(): Promise<TenantAccess>;
   saveRestaurant(value: Restaurant, expectedVersion: number): Promise<void>;
   getPhonePolicy(): Promise<PhonePolicy>;
   savePhonePolicy(value: PhonePolicy, expectedVersion: number): Promise<void>;
@@ -67,12 +87,24 @@ export interface TenantTransaction {
   getHandoff(callId: string): Promise<Handoff | null>;
   saveHandoff(value: Handoff): Promise<void>;
   getReceipt(key: string): Promise<{ fingerprint: string; result: unknown } | null>;
-  putReceipt(key: string, fingerprint: string, result: unknown): Promise<void>;
+  putReceipt(
+    key: string,
+    fingerprint: string,
+    result: unknown,
+    resourceCallId?: string,
+  ): Promise<void>;
   audit(actorId: string, action: string, resourceId: string): Promise<void>;
   enqueue(kind: string, resourceId: string): Promise<void>;
 }
 export interface Database {
+  readonly auth: AuthPersistence;
+  withAuthenticatedTenant<T>(
+    binding: AuthSessionBinding,
+    work: (tx: TenantTransaction, session: AuthSession) => Promise<T>,
+  ): Promise<T>;
   close(): Promise<void>;
+  readiness(component?: 'api' | 'worker'): Promise<{ ready: true; migrationVersion: number }>;
+  readRecoveryCheckpoint(installationId: string): Promise<RecoveryCheckpoint | null>;
   withTenant<T>(tenantId: string, work: (tx: TenantTransaction) => Promise<T>): Promise<T>;
   seedDemo(): Promise<void>;
   processJobs(limit?: number): Promise<number>;
@@ -149,6 +181,20 @@ class Transaction implements TenantTransaction {
     } catch (error) {
       safeDatabaseError(error);
     }
+  }
+  async getTenantAccess(): Promise<TenantAccess> {
+    const row = (
+      await this.query('SELECT public.auth_read_tenant_access($1::uuid) AS document', [
+        this.tenantId,
+      ])
+    ).rows[0];
+    if (!row)
+      throw new PersistenceError(
+        'TENANT_UNAVAILABLE',
+        503,
+        'The restaurant access policy is not available.',
+      );
+    return tenantAccessSchema.parse(documentSchema.parse(row).document);
   }
   async getRestaurant(): Promise<Restaurant> {
     // Hold the approved config version stable through a confirmation transaction.
@@ -443,14 +489,20 @@ class Transaction implements TenantTransaction {
     ).rows[0];
     return row ? receiptSchema.parse(row) : null;
   }
-  async putReceipt(key: string, fingerprint: string, result: unknown): Promise<void> {
+  async putReceipt(
+    key: string,
+    fingerprint: string,
+    result: unknown,
+    resourceCallId?: string,
+  ): Promise<void> {
     await this.query(
-      'INSERT INTO receipts (tenant_id,idempotency_key,fingerprint,result) VALUES ($1,$2,$3,$4::jsonb)',
+      'INSERT INTO receipts (tenant_id,idempotency_key,fingerprint,result,resource_call_id) VALUES ($1,$2,$3,$4::jsonb,$5)',
       [
         this.tenantId,
         keySchema.parse(key),
         keySchema.parse(fingerprint),
         JSON.stringify(jsonValueSchema.parse(result)),
+        resourceCallId === undefined ? null : idSchema.parse(resourceCallId),
       ],
     );
   }
@@ -518,6 +570,8 @@ const migrations = [
   { version: 1, file: '001_initial.sql' },
   { version: 2, file: '002_voice_calls.sql' },
   { version: 3, file: '003_phone_operations.sql' },
+  { version: 4, file: '004_identity.sql' },
+  { version: 5, file: '005_privacy.sql' },
 ] as const;
 
 async function readMigration(file: string): Promise<string> {
@@ -557,8 +611,12 @@ async function applyMigration(
   }
 }
 
-export async function migrate(url: string): Promise<void> {
-  const pool = new pg.Pool({ connectionString: url, max: 1, connectionTimeoutMillis: 5000 });
+export async function migrate(url: string, options: { caFile?: string } = {}): Promise<void> {
+  const pool = new pg.Pool({
+    ...(await postgresConnectionConfig({ url, ...options })),
+    max: 1,
+    connectionTimeoutMillis: 5000,
+  });
   const client = await pool.connect();
   try {
     await applyMigration(pgClient(client), async (sql) => {
@@ -570,13 +628,42 @@ export async function migrate(url: string): Promise<void> {
   }
 }
 
+async function requireSafeRuntimeRoles(client: SqlClient): Promise<void> {
+  const safety = await client.query(
+    "SELECT rolname,rolsuper,rolbypassrls,rolcanlogin,rolcreaterole,rolcreatedb,rolreplication, EXISTS (SELECT FROM pg_class c WHERE c.relname IN ('restaurants','calls','inbox','voice_calls','phone_policies','phone_handoffs','receipts','audit_events','outbox','jobs') AND pg_has_role('hostline_auth_broker',c.relowner,'MEMBER')) OR pg_has_role('hostline_auth_broker','hostline_app','MEMBER') OR pg_has_role('hostline_auth_broker','hostline_worker','MEMBER') OR pg_has_role('hostline_auth_broker','hostline_privacy','MEMBER') OR EXISTS(SELECT FROM pg_class c WHERE c.relname IN ('restaurants','calls','inbox','voice_calls','phone_policies','phone_handoffs','receipts','audit_events','outbox','jobs') AND has_table_privilege('hostline_auth_broker',c.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')) AS unsafe_broker, EXISTS (SELECT FROM pg_class WHERE relname IN ('restaurants','calls','inbox','voice_calls','phone_policies','phone_handoffs','receipts','audit_events','outbox','jobs','auth_identities','auth_membership_routes','auth_sessions','auth_login_attempts','auth_tenant_access','auth_memberships','auth_operator_events','privacy_policies','privacy_holds','privacy_decisions','recovery_checkpoints') AND relowner = pg_roles.oid) AS owns_tables FROM pg_roles WHERE rolname IN (current_user,'hostline_auth_broker')",
+  );
+  if (
+    safety.rows.length !== 2 ||
+    safety.rows.some(
+      (row) =>
+        row['rolsuper'] !== false ||
+        row['rolbypassrls'] !== false ||
+        row['owns_tables'] !== false ||
+        row['rolcanlogin'] !== false ||
+        row['rolcreaterole'] !== false ||
+        row['rolcreatedb'] !== false ||
+        row['rolreplication'] !== false ||
+        row['unsafe_broker'] !== false,
+    )
+  ) {
+    throw new PersistenceError(
+      'UNSAFE_DATABASE_ROLE',
+      503,
+      'The database runtime role must enforce tenant isolation.',
+    );
+  }
+}
+
 export async function createDatabase(
-  options: { url?: string; dataDir?: string } = {},
+  options: { url?: string; dataDir?: string; caFile?: string } = {},
 ): Promise<Database> {
   let backend: Backend;
   if (options.url) {
     const pool = new pg.Pool({
-      connectionString: options.url,
+      ...(await postgresConnectionConfig({
+        url: options.url,
+        ...(options.caFile ? { caFile: options.caFile } : {}),
+      })),
       max: 10,
       connectionTimeoutMillis: 5000,
     });
@@ -617,12 +704,77 @@ export async function createDatabase(
     };
   }
 
+  async function requireSafeLogin(client: SqlClient): Promise<void> {
+    if (backend.embedded) return;
+    const result = await client.query(
+      "SELECT rolsuper,rolbypassrls,rolcreaterole,rolcreatedb,rolreplication,pg_has_role(session_user,'hostline_auth_broker','MEMBER') AS broker_member, pg_has_role(session_user,'hostline_privacy','MEMBER') AS privacy_member, EXISTS (SELECT FROM pg_class c WHERE c.relname IN ('restaurants','calls','inbox','voice_calls','phone_policies','phone_handoffs','receipts','audit_events','outbox','jobs','auth_identities','auth_membership_routes','auth_sessions','auth_login_attempts','auth_tenant_access','auth_memberships','auth_operator_events','privacy_policies','privacy_holds','privacy_decisions','recovery_checkpoints') AND pg_has_role(session_user,c.relowner,'MEMBER')) AS owns_tables FROM pg_roles WHERE rolname=session_user",
+    );
+    const row = result.rows[0];
+    if (
+      !row ||
+      row['rolsuper'] !== false ||
+      row['rolbypassrls'] !== false ||
+      row['rolcreaterole'] !== false ||
+      row['rolcreatedb'] !== false ||
+      row['rolreplication'] !== false ||
+      row['broker_member'] !== false ||
+      row['privacy_member'] !== false ||
+      row['owns_tables'] !== false
+    )
+      throw new PersistenceError(
+        'UNSAFE_DATABASE_ROLE',
+        503,
+        'The database login must have only restricted runtime privileges.',
+      );
+  }
+
+  async function readiness(
+    component: 'api' | 'worker' = 'api',
+  ): Promise<{ ready: true; migrationVersion: number }> {
+    return backend.run(async (client) => {
+      await requireSafeLogin(client);
+      await client.query('BEGIN');
+      try {
+        await client.query(
+          component === 'worker'
+            ? 'SET LOCAL ROLE hostline_worker'
+            : 'SET LOCAL ROLE hostline_auth',
+        );
+        const result = await client.query('SELECT max(version) AS version FROM schema_migrations');
+        if (result.rows[0]?.['version'] !== 5)
+          throw new PersistenceError(
+            'SCHEMA_UNAVAILABLE',
+            503,
+            'The database schema is not ready.',
+          );
+        for (const role of component === 'worker'
+          ? (['hostline_app', 'hostline_worker'] as const)
+          : (['hostline_app', 'hostline_auth'] as const)) {
+          await client.query(
+            role === 'hostline_app'
+              ? 'SET LOCAL ROLE hostline_app'
+              : role === 'hostline_worker'
+                ? 'SET LOCAL ROLE hostline_worker'
+                : 'SET LOCAL ROLE hostline_auth',
+          );
+          await requireSafeRuntimeRoles(client);
+        }
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        safeDatabaseError(error);
+      }
+      return { ready: true, migrationVersion: 5 };
+    });
+  }
+
   async function transact<T>(
-    role: 'hostline_app' | 'hostline_worker',
+    role: 'hostline_app' | 'hostline_worker' | 'hostline_auth',
     tenantId: string | null,
     work: (client: SqlClient) => Promise<T>,
   ): Promise<T> {
     return backend.run(async (client) => {
+      await requireSafeLogin(client);
       await client.query('BEGIN');
       let inApplicationWork = false;
       try {
@@ -630,24 +782,14 @@ export async function createDatabase(
         await client.query(
           role === 'hostline_app'
             ? 'SET LOCAL ROLE hostline_app'
-            : 'SET LOCAL ROLE hostline_worker',
+            : role === 'hostline_worker'
+              ? 'SET LOCAL ROLE hostline_worker'
+              : 'SET LOCAL ROLE hostline_auth',
         );
         await client.query("SET LOCAL statement_timeout = '5000ms'");
         await client.query("SET LOCAL lock_timeout = '2000ms'");
         await client.query("SELECT set_config('hostline.tenant_id', $1, true)", [tenantId ?? '']);
-        const safety = await client.query(
-          "SELECT rolsuper, rolbypassrls, EXISTS (SELECT FROM pg_class WHERE relname IN ('restaurants','calls','inbox','voice_calls','phone_policies','phone_handoffs','receipts','audit_events','outbox','jobs') AND relowner = pg_roles.oid) AS owns_tables FROM pg_roles WHERE rolname = current_user",
-        );
-        if (
-          safety.rows[0]?.rolsuper !== false ||
-          safety.rows[0]?.rolbypassrls !== false ||
-          safety.rows[0]?.owns_tables !== false
-        )
-          throw new PersistenceError(
-            'UNSAFE_DATABASE_ROLE',
-            503,
-            'The database runtime role must enforce tenant isolation.',
-          );
+        await requireSafeRuntimeRoles(client);
         inApplicationWork = true;
         const result = await work(client);
         inApplicationWork = false;
@@ -670,6 +812,46 @@ export async function createDatabase(
       const tx = new Transaction(client, validatedId);
       try {
         return await work(tx);
+      } finally {
+        tx.finish();
+      }
+    });
+  }
+
+  const auth = createAuthPersistence(
+    async (work) => {
+      try {
+        return await transact('hostline_auth', null, work);
+      } catch (error) {
+        safeDatabaseError(error);
+      }
+    },
+    () =>
+      new PersistenceError(
+        'AUTH_CAPACITY_UNAVAILABLE',
+        503,
+        'Sign-in is temporarily unavailable. Try again later.',
+      ),
+  );
+
+  async function withAuthenticatedTenant<T>(
+    binding: AuthSessionBinding,
+    work: (tx: TenantTransaction, session: AuthSession) => Promise<T>,
+  ): Promise<T> {
+    return transact('hostline_auth', null, async (client) => {
+      let session: AuthSession | null;
+      try {
+        session = await readAuthSession(client, binding);
+      } catch (error) {
+        safeDatabaseError(error);
+      }
+      if (!session) throw new PersistenceError('UNAUTHENTICATED', 401, 'Sign in to continue.');
+      await client.query('SET LOCAL ROLE hostline_app');
+      await requireSafeRuntimeRoles(client);
+      await client.query("SELECT set_config('hostline.tenant_id',$1,true)", [session.tenantId]);
+      const tx = new Transaction(client, session.tenantId);
+      try {
+        return await work(tx, session);
       } finally {
         tx.finish();
       }
@@ -699,6 +881,25 @@ export async function createDatabase(
         for (const call of seed.calls) if (!(await tx.getCall(call.id))) await tx.insertCall(call);
         for (const item of seed.inbox)
           if (!(await tx.getInbox(item.id))) await tx.insertInbox(item);
+      });
+      // Only the offline synthetic seed identity may initialize tenant state;
+      // runtime app/auth roles cannot insert access rows or memberships.
+      await backend.run(async (client) => {
+        await client.query('BEGIN');
+        try {
+          await client.query('SET LOCAL ROLE hostline_auth_broker');
+          await client.query("SELECT set_config('hostline.tenant_id',$1,true)", [
+            seed.restaurant.id,
+          ]);
+          await client.query(
+            'INSERT INTO auth_tenant_access(tenant_id,version,enabled,workspace_name) VALUES($1,1,true,$2) ON CONFLICT DO NOTHING',
+            [seed.restaurant.id, seed.restaurant.name],
+          );
+          await client.query('COMMIT');
+        } catch (error) {
+          await client.query('ROLLBACK');
+          safeDatabaseError(error);
+        }
       });
     }
   }
@@ -730,7 +931,17 @@ export async function createDatabase(
     return completed;
   }
 
-  return { withTenant, seedDemo, processJobs, close: () => backend.close() };
+  return {
+    auth,
+    withAuthenticatedTenant,
+    withTenant,
+    seedDemo,
+    processJobs,
+    close: () => backend.close(),
+    readiness,
+    readRecoveryCheckpoint: (installationId) =>
+      transact('hostline_app', null, (client) => readRecoveryCheckpoint(client, installationId)),
+  };
 }
 
 // Internal helpers deliberately stay outside the public transaction interface.

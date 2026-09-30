@@ -1,6 +1,6 @@
 import { build } from 'esbuild';
 import { cp, mkdir } from 'node:fs/promises';
-for (const name of ['api', 'voice-gateway', 'worker']) {
+for (const name of ['api', 'voice-gateway', 'worker', 'migrate']) {
   await build({
     entryPoints: [`apps/${name}/src/index.ts`],
     outfile: `apps/${name}/dist/index.js`,
@@ -23,7 +23,7 @@ for (const name of ['api', 'voice-gateway', 'worker']) {
     ],
   });
 }
-for (const name of ['api', 'worker']) {
+for (const name of ['api', 'worker', 'migrate']) {
   await mkdir(`apps/${name}/dist/migrations`, { recursive: true });
   await cp('packages/database/migrations', `apps/${name}/dist/migrations`, { recursive: true });
 }

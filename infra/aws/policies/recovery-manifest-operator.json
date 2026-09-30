@@ -1,0 +1,16 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReviewedInstallationManifestOperator",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem"],
+      "Resource": "${RECOVERY_TABLE_ARN}",
+      "Condition": {
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": ["INSTALLATION#${RECOVERY_INSTALLATION_ID}"]
+        }
+      }
+    }
+  ]
+}

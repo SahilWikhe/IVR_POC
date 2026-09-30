@@ -358,6 +358,7 @@ describe('authenticated phone operations and conservative provider reconciliatio
         user: null,
         workspace: null,
       }),
+      databaseBinding: () => null,
       close() {},
     };
     const roleApp = Fastify();

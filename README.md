@@ -27,7 +27,8 @@ Try a conversation in **Call simulator**, review the exact request details, and 
 - TypeScript/pnpm workspaces; React, Vite, and Zod runtime contracts.
 - Fastify API with signed opaque sessions, Origin/CSRF checks, role checks, and tenant-scoped persistence.
 - PostgreSQL schema with forced row-level security, tenant composite keys, transactional receipts/outbox, and fenced internal jobs. PGlite supplies the default local engine; a separate `pg` adapter supports configured native PostgreSQL development.
-- Optional OIDC authorization-code login with PKCE/state/nonce and explicit subject memberships. It needs an identity provider and provisioned native database tenants; it is not a one-command production setup.
+- Auth0 server-side login with PKCE/state/nonce, verified MFA, durable revocable sessions and versioned restaurant memberships. See [Auth0 setup](docs/AUTH0_SETUP.md) and [identity operations](docs/IDENTITY_OPERATIONS.md). Native operation requires provisioned tenants and independent recovery authorization.
+- Prepared [AWS CloudFormation deployment](docs/AWS_DEPLOYMENT.md), container packaging, main-triggered staging/redeployment/logs/cleanup, and [privacy/recovery operators](docs/PRIVACY_OPERATIONS.md). Retention defaults off; account configuration and live acceptance remain required.
 - Separate persistent Node.js voice gateway using Twilio bidirectional Media Streams and OpenAI Realtime. OpenTable and Resy remain disabled capability adapters pending official access.
 - Tenant-scoped durable phone state and callback receipts. The model prepares a proposal; Twilio reads the canonical fields before a separate speech-confirmation step can save it. The model has no confirmation tool.
 

@@ -1,0 +1,1099 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Hostline retained network, encrypted PostgreSQL, immutable image repository, and audit data. Provision separately; application workflows never delete this stack.",
+  "Parameters": {
+    "Namespace": {
+      "Type": "String",
+      "AllowedPattern": "[a-z][a-z0-9-]{2,12}",
+      "Default": "hostline"
+    },
+    "Environment": {
+      "Type": "String",
+      "AllowedValues": ["staging", "production"],
+      "Default": "staging"
+    },
+    "PostgresEngineVersion": {
+      "Type": "String",
+      "Description": "Choose a currently supported PostgreSQL 17 minor in this region; verify before provisioning.",
+      "AllowedPattern": "17\\.[0-9]+"
+    },
+    "DatabaseClass": {
+      "Type": "String",
+      "AllowedValues": ["db.t4g.micro", "db.t4g.small", "db.t4g.medium"],
+      "Default": "db.t4g.micro"
+    },
+    "HighAvailability": {
+      "Type": "String",
+      "AllowedValues": ["true", "false"],
+      "Default": "false"
+    },
+    "AppDomain": {
+      "Type": "String",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]+\\.[a-z]{2,}"
+    }
+  },
+  "Rules": {
+    "ProductionHA": {
+      "RuleCondition": {
+        "Fn::Equals": [
+          {
+            "Ref": "Environment"
+          },
+          "production"
+        ]
+      },
+      "Assertions": [
+        {
+          "Assert": {
+            "Fn::Equals": [
+              {
+                "Ref": "HighAvailability"
+              },
+              "true"
+            ]
+          },
+          "AssertDescription": "Production needs multi-AZ database and one NAT gateway per AZ."
+        }
+      ]
+    }
+  },
+  "Conditions": {
+    "HA": {
+      "Fn::Equals": [
+        {
+          "Ref": "HighAvailability"
+        },
+        "true"
+      ]
+    }
+  },
+  "Resources": {
+    "Vpc": {
+      "Type": "AWS::EC2::VPC",
+      "Properties": {
+        "CidrBlock": "10.42.0.0/16",
+        "EnableDnsSupport": true,
+        "EnableDnsHostnames": true,
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Fn::Sub": "${Namespace}-${Environment}"
+            }
+          }
+        ]
+      }
+    },
+    "InternetGateway": {
+      "Type": "AWS::EC2::InternetGateway",
+      "Properties": {}
+    },
+    "InternetAttachment": {
+      "Type": "AWS::EC2::VPCGatewayAttachment",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "InternetGatewayId": {
+          "Ref": "InternetGateway"
+        }
+      }
+    },
+    "PublicRoutes": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        }
+      }
+    },
+    "InternetRoute": {
+      "Type": "AWS::EC2::Route",
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "PublicRoutes"
+        },
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": {
+          "Ref": "InternetGateway"
+        }
+      },
+      "DependsOn": "InternetAttachment"
+    },
+    "PublicSubnet1": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "AvailabilityZone": {
+          "Fn::Select": [
+            0,
+            {
+              "Fn::GetAZs": ""
+            }
+          ]
+        },
+        "CidrBlock": "10.42.1.0/24",
+        "MapPublicIpOnLaunch": false
+      }
+    },
+    "PrivateSubnet1": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "AvailabilityZone": {
+          "Fn::Select": [
+            0,
+            {
+              "Fn::GetAZs": ""
+            }
+          ]
+        },
+        "CidrBlock": "10.42.11.0/24",
+        "MapPublicIpOnLaunch": false
+      }
+    },
+    "PublicAssociation1": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PublicSubnet1"
+        },
+        "RouteTableId": {
+          "Ref": "PublicRoutes"
+        }
+      }
+    },
+    "PrivateRoutes1": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        }
+      }
+    },
+    "PrivateAssociation1": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PrivateSubnet1"
+        },
+        "RouteTableId": {
+          "Ref": "PrivateRoutes1"
+        }
+      }
+    },
+    "NatAddress1": {
+      "Type": "AWS::EC2::EIP",
+      "Properties": {
+        "Domain": "vpc"
+      },
+      "DependsOn": "InternetAttachment"
+    },
+    "Nat1": {
+      "Type": "AWS::EC2::NatGateway",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PublicSubnet1"
+        },
+        "AllocationId": {
+          "Fn::GetAtt": ["NatAddress1", "AllocationId"]
+        }
+      },
+      "DependsOn": "InternetAttachment"
+    },
+    "NatRoute1": {
+      "Type": "AWS::EC2::Route",
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "PrivateRoutes1"
+        },
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "NatGatewayId": {
+          "Ref": "Nat1"
+        }
+      }
+    },
+    "PublicSubnet2": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "AvailabilityZone": {
+          "Fn::Select": [
+            1,
+            {
+              "Fn::GetAZs": ""
+            }
+          ]
+        },
+        "CidrBlock": "10.42.2.0/24",
+        "MapPublicIpOnLaunch": false
+      }
+    },
+    "PrivateSubnet2": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "AvailabilityZone": {
+          "Fn::Select": [
+            1,
+            {
+              "Fn::GetAZs": ""
+            }
+          ]
+        },
+        "CidrBlock": "10.42.12.0/24",
+        "MapPublicIpOnLaunch": false
+      }
+    },
+    "PublicAssociation2": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PublicSubnet2"
+        },
+        "RouteTableId": {
+          "Ref": "PublicRoutes"
+        }
+      }
+    },
+    "PrivateRoutes2": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        }
+      }
+    },
+    "PrivateAssociation2": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PrivateSubnet2"
+        },
+        "RouteTableId": {
+          "Ref": "PrivateRoutes2"
+        }
+      }
+    },
+    "NatAddress2": {
+      "Type": "AWS::EC2::EIP",
+      "Properties": {
+        "Domain": "vpc"
+      },
+      "Condition": "HA",
+      "DependsOn": "InternetAttachment"
+    },
+    "Nat2": {
+      "Type": "AWS::EC2::NatGateway",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PublicSubnet2"
+        },
+        "AllocationId": {
+          "Fn::GetAtt": ["NatAddress2", "AllocationId"]
+        }
+      },
+      "DependsOn": "InternetAttachment",
+      "Condition": "HA"
+    },
+    "NatRoute2": {
+      "Type": "AWS::EC2::Route",
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "PrivateRoutes2"
+        },
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "NatGatewayId": {
+          "Fn::If": [
+            "HA",
+            {
+              "Ref": "Nat2"
+            },
+            {
+              "Ref": "Nat1"
+            }
+          ]
+        }
+      }
+    },
+    "ApiSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "GroupDescription": "Hostline api tasks: HTTPS egress and explicit private ingress only.",
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "TLS to AWS services and approved external providers through NAT."
+          }
+        ]
+      }
+    },
+    "VoiceSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "GroupDescription": "Hostline voice tasks: HTTPS egress and explicit private ingress only.",
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "TLS to AWS services and approved external providers through NAT."
+          }
+        ]
+      }
+    },
+    "WorkerSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "GroupDescription": "Hostline worker tasks: HTTPS egress and explicit private ingress only.",
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "TLS to AWS services and approved external providers through NAT."
+          }
+        ]
+      }
+    },
+    "MigrationSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "GroupDescription": "Hostline migration tasks: HTTPS egress and explicit private ingress only.",
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "TLS to AWS services and approved external providers through NAT."
+          }
+        ]
+      }
+    },
+    "DatabaseSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "GroupDescription": "PostgreSQL from scoped API, worker, and migration tasks only.",
+        "SecurityGroupEgress": []
+      }
+    },
+    "ApiDatabaseIngress": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "DatabaseSecurityGroup"
+        },
+        "IpProtocol": "tcp",
+        "FromPort": 5432,
+        "ToPort": 5432,
+        "SourceSecurityGroupId": {
+          "Ref": "ApiSecurityGroup"
+        }
+      }
+    },
+    "ApiDatabaseEgress": {
+      "Type": "AWS::EC2::SecurityGroupEgress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "ApiSecurityGroup"
+        },
+        "IpProtocol": "tcp",
+        "FromPort": 5432,
+        "ToPort": 5432,
+        "DestinationSecurityGroupId": {
+          "Ref": "DatabaseSecurityGroup"
+        }
+      }
+    },
+    "WorkerDatabaseIngress": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "DatabaseSecurityGroup"
+        },
+        "IpProtocol": "tcp",
+        "FromPort": 5432,
+        "ToPort": 5432,
+        "SourceSecurityGroupId": {
+          "Ref": "WorkerSecurityGroup"
+        }
+      }
+    },
+    "WorkerDatabaseEgress": {
+      "Type": "AWS::EC2::SecurityGroupEgress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "WorkerSecurityGroup"
+        },
+        "IpProtocol": "tcp",
+        "FromPort": 5432,
+        "ToPort": 5432,
+        "DestinationSecurityGroupId": {
+          "Ref": "DatabaseSecurityGroup"
+        }
+      }
+    },
+    "MigrationDatabaseIngress": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "DatabaseSecurityGroup"
+        },
+        "IpProtocol": "tcp",
+        "FromPort": 5432,
+        "ToPort": 5432,
+        "SourceSecurityGroupId": {
+          "Ref": "MigrationSecurityGroup"
+        }
+      }
+    },
+    "MigrationDatabaseEgress": {
+      "Type": "AWS::EC2::SecurityGroupEgress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "MigrationSecurityGroup"
+        },
+        "IpProtocol": "tcp",
+        "FromPort": 5432,
+        "ToPort": 5432,
+        "DestinationSecurityGroupId": {
+          "Ref": "DatabaseSecurityGroup"
+        }
+      }
+    },
+    "DataKey": {
+      "Type": "AWS::KMS::Key",
+      "Properties": {
+        "Description": "Hostline retained database, Secrets Manager, and redacted CloudWatch log encryption key.",
+        "EnableKeyRotation": true,
+        "PendingWindowInDays": 30,
+        "KeyPolicy": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AccountAdministration",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+                }
+              },
+              "Action": "kms:*",
+              "Resource": "*"
+            },
+            {
+              "Sid": "BoundCloudWatchLogs",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": {
+                  "Fn::Sub": "logs.${AWS::Region}.amazonaws.com"
+                }
+              },
+              "Action": [
+                "kms:Encrypt",
+                "kms:Decrypt",
+                "kms:ReEncrypt*",
+                "kms:GenerateDataKey*",
+                "kms:DescribeKey"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "ArnLike": {
+                  "kms:EncryptionContext:aws:logs:arn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/hostline/${Namespace}/${Environment}/*"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "DatabaseSubnets": {
+      "Type": "AWS::RDS::DBSubnetGroup",
+      "Properties": {
+        "DBSubnetGroupDescription": "Private PostgreSQL subnets in two availability zones.",
+        "SubnetIds": [
+          {
+            "Ref": "PrivateSubnet1"
+          },
+          {
+            "Ref": "PrivateSubnet2"
+          }
+        ]
+      }
+    },
+    "DatabaseParameters": {
+      "Type": "AWS::RDS::DBParameterGroup",
+      "Properties": {
+        "Description": "Force TLS and avoid statement/connection payload logging.",
+        "Family": "postgres17",
+        "Parameters": {
+          "rds.force_ssl": "1",
+          "log_statement": "none",
+          "log_min_duration_statement": "-1",
+          "log_connections": "0",
+          "log_disconnections": "0"
+        }
+      }
+    },
+    "Database": {
+      "Type": "AWS::RDS::DBInstance",
+      "Properties": {
+        "Engine": "postgres",
+        "EngineVersion": {
+          "Ref": "PostgresEngineVersion"
+        },
+        "DBInstanceClass": {
+          "Ref": "DatabaseClass"
+        },
+        "DBName": "hostline",
+        "MasterUsername": "hostline_migration_admin",
+        "ManageMasterUserPassword": true,
+        "MasterUserSecret": {
+          "KmsKeyId": {
+            "Fn::GetAtt": ["DataKey", "Arn"]
+          }
+        },
+        "AllocatedStorage": "20",
+        "MaxAllocatedStorage": 100,
+        "StorageType": "gp3",
+        "StorageEncrypted": true,
+        "KmsKeyId": {
+          "Fn::GetAtt": ["DataKey", "Arn"]
+        },
+        "PubliclyAccessible": false,
+        "MultiAZ": {
+          "Fn::If": ["HA", true, false]
+        },
+        "DeletionProtection": true,
+        "BackupRetentionPeriod": 14,
+        "CopyTagsToSnapshot": true,
+        "AutoMinorVersionUpgrade": true,
+        "DBSubnetGroupName": {
+          "Ref": "DatabaseSubnets"
+        },
+        "DBParameterGroupName": {
+          "Ref": "DatabaseParameters"
+        },
+        "VPCSecurityGroups": [
+          {
+            "Ref": "DatabaseSecurityGroup"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "HostlineData",
+            "Value": "retained"
+          }
+        ]
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "ImageRepository": {
+      "Type": "AWS::ECR::Repository",
+      "Properties": {
+        "RepositoryName": {
+          "Fn::Sub": "${Namespace}-${Environment}"
+        },
+        "ImageTagMutability": "IMMUTABLE",
+        "ImageScanningConfiguration": {
+          "ScanOnPush": true
+        },
+        "EncryptionConfiguration": {
+          "EncryptionType": "KMS",
+          "KmsKey": {
+            "Fn::GetAtt": ["DataKey", "Arn"]
+          }
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "AuditBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "OwnershipControls": {
+          "Rules": [
+            {
+              "ObjectOwnership": "BucketOwnerEnforced"
+            }
+          ]
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "AuditBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "AuditBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyPlaintext",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": ["AuditBucket", "Arn"]
+                },
+                {
+                  "Fn::Sub": "${AuditBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            },
+            {
+              "Sid": "AuditAcl",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "cloudtrail.amazonaws.com"
+              },
+              "Action": "s3:GetBucketAcl",
+              "Resource": {
+                "Fn::GetAtt": ["AuditBucket", "Arn"]
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${Namespace}-${Environment}-audit"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "AuditWrite",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "cloudtrail.amazonaws.com"
+              },
+              "Action": "s3:PutObject",
+              "Resource": {
+                "Fn::Sub": "${AuditBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "s3:x-amz-acl": "bucket-owner-full-control",
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${Namespace}-${Environment}-audit"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "AuditTrail": {
+      "Type": "AWS::CloudTrail::Trail",
+      "Properties": {
+        "TrailName": {
+          "Fn::Sub": "${Namespace}-${Environment}-audit"
+        },
+        "S3BucketName": {
+          "Ref": "AuditBucket"
+        },
+        "IsLogging": true,
+        "IsMultiRegionTrail": true,
+        "IncludeGlobalServiceEvents": true,
+        "EnableLogFileValidation": true,
+        "EventSelectors": [
+          {
+            "IncludeManagementEvents": true,
+            "ReadWriteType": "All"
+          }
+        ]
+      },
+      "DependsOn": "AuditBucketPolicy",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "PrivateAppZone": {
+      "Type": "AWS::Route53::HostedZone",
+      "Properties": {
+        "Name": {
+          "Ref": "AppDomain"
+        },
+        "VPCs": [
+          {
+            "VPCId": {
+              "Ref": "Vpc"
+            },
+            "VPCRegion": {
+              "Ref": "AWS::Region"
+            }
+          }
+        ],
+        "HostedZoneConfig": {
+          "Comment": "Retained private HTTPS API name; application stack manages only its exact A record."
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "PublicAlbSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Public HTTPS application load balancer.",
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 3001,
+            "ToPort": 3001,
+            "DestinationSecurityGroupId": {
+              "Ref": "ApiSecurityGroup"
+            }
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 3002,
+            "ToPort": 3002,
+            "DestinationSecurityGroupId": {
+              "Ref": "VoiceSecurityGroup"
+            }
+          }
+        ],
+        "VpcId": {
+          "Ref": "Vpc"
+        }
+      }
+    },
+    "InternalAlbSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Internal HTTPS application load balancer.",
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "SourceSecurityGroupId": {
+              "Ref": "VoiceSecurityGroup"
+            }
+          }
+        ],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 3001,
+            "ToPort": 3001,
+            "DestinationSecurityGroupId": {
+              "Ref": "ApiSecurityGroup"
+            }
+          }
+        ],
+        "VpcId": {
+          "Ref": "Vpc"
+        }
+      }
+    },
+    "ApiPublicIngress": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "ApiSecurityGroup"
+        },
+        "SourceSecurityGroupId": {
+          "Ref": "PublicAlbSecurityGroup"
+        },
+        "IpProtocol": "tcp",
+        "FromPort": 3001,
+        "ToPort": 3001
+      }
+    },
+    "ApiInternalIngress": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "ApiSecurityGroup"
+        },
+        "SourceSecurityGroupId": {
+          "Ref": "InternalAlbSecurityGroup"
+        },
+        "IpProtocol": "tcp",
+        "FromPort": 3001,
+        "ToPort": 3001
+      }
+    },
+    "VoicePublicIngress": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "VoiceSecurityGroup"
+        },
+        "SourceSecurityGroupId": {
+          "Ref": "PublicAlbSecurityGroup"
+        },
+        "IpProtocol": "tcp",
+        "FromPort": 3002,
+        "ToPort": 3002
+      }
+    },
+    "RecoveryTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "PK",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "SK",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "PK",
+            "KeyType": "HASH"
+          },
+          {
+            "AttributeName": "SK",
+            "KeyType": "RANGE"
+          }
+        ],
+        "SSESpecification": {
+          "SSEEnabled": true,
+          "SSEType": "KMS",
+          "KMSMasterKeyId": {
+            "Fn::GetAtt": ["DataKey", "Arn"]
+          }
+        },
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        },
+        "DeletionProtectionEnabled": true
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    }
+  },
+  "Outputs": {
+    "Vpc": {
+      "Value": {
+        "Ref": "Vpc"
+      },
+      "Description": "Reference for the replaceable application stack: Vpc."
+    },
+    "PublicSubnet1": {
+      "Value": {
+        "Ref": "PublicSubnet1"
+      },
+      "Description": "Reference for the replaceable application stack: PublicSubnet1."
+    },
+    "PublicSubnet2": {
+      "Value": {
+        "Ref": "PublicSubnet2"
+      },
+      "Description": "Reference for the replaceable application stack: PublicSubnet2."
+    },
+    "PrivateSubnet1": {
+      "Value": {
+        "Ref": "PrivateSubnet1"
+      },
+      "Description": "Reference for the replaceable application stack: PrivateSubnet1."
+    },
+    "PrivateSubnet2": {
+      "Value": {
+        "Ref": "PrivateSubnet2"
+      },
+      "Description": "Reference for the replaceable application stack: PrivateSubnet2."
+    },
+    "ApiSecurityGroup": {
+      "Value": {
+        "Ref": "ApiSecurityGroup"
+      },
+      "Description": "Reference for the replaceable application stack: ApiSecurityGroup."
+    },
+    "VoiceSecurityGroup": {
+      "Value": {
+        "Ref": "VoiceSecurityGroup"
+      },
+      "Description": "Reference for the replaceable application stack: VoiceSecurityGroup."
+    },
+    "WorkerSecurityGroup": {
+      "Value": {
+        "Ref": "WorkerSecurityGroup"
+      },
+      "Description": "Reference for the replaceable application stack: WorkerSecurityGroup."
+    },
+    "MigrationSecurityGroup": {
+      "Value": {
+        "Ref": "MigrationSecurityGroup"
+      },
+      "Description": "Reference for the replaceable application stack: MigrationSecurityGroup."
+    },
+    "DataKeyArn": {
+      "Value": {
+        "Fn::GetAtt": ["DataKey", "Arn"]
+      },
+      "Description": "Retained KMS key; create application secrets under this key."
+    },
+    "DatabaseEndpoint": {
+      "Value": {
+        "Fn::GetAtt": ["Database", "Endpoint.Address"]
+      },
+      "Description": "Private RDS endpoint; credentials are never output."
+    },
+    "DatabasePort": {
+      "Value": {
+        "Fn::GetAtt": ["Database", "Endpoint.Port"]
+      },
+      "Description": "Private PostgreSQL port."
+    },
+    "MasterSecretArn": {
+      "Value": {
+        "Fn::GetAtt": ["Database", "MasterUserSecret.SecretArn"]
+      },
+      "Description": "Operator bootstrap credential reference only; do not use for runtime tasks."
+    },
+    "RepositoryUri": {
+      "Value": {
+        "Fn::GetAtt": ["ImageRepository", "RepositoryUri"]
+      },
+      "Description": "Immutable full-commit-SHA image repository."
+    },
+    "RepositoryArn": {
+      "Value": {
+        "Fn::GetAtt": ["ImageRepository", "Arn"]
+      },
+      "Description": "Scope image publishing and pulling."
+    },
+    "AuditBucketName": {
+      "Value": {
+        "Ref": "AuditBucket"
+      },
+      "Description": "Retained CloudTrail audit storage."
+    },
+    "PublicAlbSecurityGroup": {
+      "Value": {
+        "Ref": "PublicAlbSecurityGroup"
+      },
+      "Description": "Fixed load-balancer security group; app CI cannot mutate it."
+    },
+    "InternalAlbSecurityGroup": {
+      "Value": {
+        "Ref": "InternalAlbSecurityGroup"
+      },
+      "Description": "Fixed load-balancer security group; app CI cannot mutate it."
+    },
+    "PrivateAppZoneId": {
+      "Value": {
+        "Ref": "PrivateAppZone"
+      },
+      "Description": "Retained private DNS zone; app may manage only the exact app A record."
+    },
+    "DatabaseResourceId": {
+      "Value": {
+        "Fn::GetAtt": ["Database", "DbiResourceId"]
+      },
+      "Description": "Restore-distinct RDS resource identity; bind recovery checkpoint to this value."
+    },
+    "RecoveryTableName": {
+      "Value": {
+        "Ref": "RecoveryTable"
+      },
+      "Description": "Retained independent recovery authority; initialization is an explicit operator action."
+    },
+    "RecoveryTableArn": {
+      "Value": {
+        "Fn::GetAtt": ["RecoveryTable", "Arn"]
+      },
+      "Description": "Scope runtime manifest reads and separately controlled operator access."
+    },
+    "AppDomain": {
+      "Value": {
+        "Ref": "AppDomain"
+      },
+      "Description": "Pinned private HTTPS API domain; application deployment must match this retained network setting."
+    },
+    "DatabaseInstanceId": {
+      "Value": {
+        "Ref": "Database"
+      },
+      "Description": "Actual RDS instance identifier; runtime checks provider-issued resource identity."
+    },
+    "DatabaseArn": {
+      "Value": {
+        "Fn::Sub": "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:${Database}"
+      },
+      "Description": "Exact database metadata-read IAM target."
+    },
+    "PublicAlbSubnetCidrs": {
+      "Value": "10.42.1.0/24,10.42.2.0/24",
+      "Description": "Narrow public ALB source CIDRs; application SG still requires ALB security group."
+    },
+    "InternalAlbSubnetCidrs": {
+      "Value": "10.42.11.0/24,10.42.12.0/24",
+      "Description": "Narrow internal ALB source CIDRs; never trust every proxy."
+    }
+  }
+}

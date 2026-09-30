@@ -7,9 +7,12 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "3.1142.0",
+    "@aws-sdk/client-rds": "3.1142.0",
+    "@aws-sdk/lib-dynamodb": "3.1142.0",
+    "@electric-sql/pglite": "0.5.8",
     "@hostline/contracts": "workspace:*",
     "@hostline/domain": "workspace:*",
-    "@electric-sql/pglite": "0.5.8",
     "pg": "^8.18.0",
     "zod": "^4.3.0"
   }

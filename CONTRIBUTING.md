@@ -22,7 +22,7 @@ pnpm dev
 
 The dashboard is at `http://127.0.0.1:5173` and proxies `/api` to `127.0.0.1:3001`. Use the exact configured origin. Default demo authentication is allowed only on loopback and uses synthetic Harbor Table and Juniper Kitchen workspaces. No Twilio, OpenAI, OIDC, or database-server credentials are needed.
 
-The API stores data in `.data/hostline` using PGlite, PostgreSQL compiled to WebAssembly. Seeds are idempotent: restart preserves edited settings, requests, and receipts. Its transaction mutex prevents overlapping tenant contexts on the embedded connection. Run one API process per embedded data directory; do not start a separate worker against it. Internal jobs run in the API process. Session state is in memory and is lost on restart.
+The API stores data in `.data/hostline` using PGlite, PostgreSQL compiled to WebAssembly. Seeds are idempotent: restart preserves edited settings, requests, and receipts. Its transaction mutex prevents overlapping tenant contexts on the embedded connection. Run one API process per embedded data directory; do not start a separate worker against it. Internal jobs run in the API process. Demo session state is in memory and is lost on restart; Auth0 sessions and authorization live in shared PostgreSQL.
 
 API, voice gateway, migration, and worker entrypoints load a root `.env` when present. Keep secrets in environment configuration or ignored `.env`; never put them in chat, committed files, fixtures, screenshots, or frontend variables. Copying `.env.example` leaves the phone gateway disabled.
 
@@ -31,6 +31,8 @@ apps/dashboard/         React/Vite staff dashboard
 apps/api/               Fastify auth, configuration, inbox, simulator APIs
 apps/voice-gateway/     Optional Twilio/OpenAI voice/action sandbox
 apps/worker/            Native PostgreSQL internal job worker
+apps/migrate/           Dedicated one-off migration entrypoint
+infra/aws/              CloudFormation and deployment/operations automation
 packages/contracts/    Shared Zod schemas and TypeScript contracts
 packages/domain/       Conversation, time, confirmation, fulfillment rules
 packages/database/     PGlite/pg adapters, migrations, synthetic seed
@@ -55,7 +57,7 @@ tests/                 Credential-free behavioral and browser tests
 | `pnpm test:e2e`                       | Run Playwright dashboard and simulated-workflow tests; requires Chromium.                     |
 | `pnpm build`                          | Bundle API, worker, and voice services; build the dashboard. No deployment occurs.            |
 | `pnpm check`                          | Run formatting, lint, typecheck, deterministic tests, and builds. Browser tests are separate. |
-| `pnpm start`                          | Start the built API. Does not serve or deploy the dashboard.                                  |
+| `pnpm start`                          | Start the built API; serve the built dashboard when `DASHBOARD_STATIC_DIR` is configured.     |
 | `pnpm db:migrate`                     | Apply checked-in migrations to `DATABASE_MIGRATION_URL` with a dedicated migration identity.  |
 | `pnpm worker`                         | Run internal jobs against provisioned native PostgreSQL using `DATABASE_URL`.                 |
 
@@ -63,15 +65,21 @@ Install the browser with `pnpm exec playwright install chromium` (CI also instal
 
 Default database tests use PGlite's actual PostgreSQL engine for SQL constraints, RLS, transactions, and persistence. They do not exercise a native server's network pooling, TLS, identity grants, or operations. There is no separate `test:integration` script: credential-free database/API integration tests are part of `pnpm test`.
 
+`pnpm test:native` requires `TEST_DATABASE_URL` pointing to a new empty loopback PostgreSQL database whose name starts with `hostline_native_test`. `pnpm identity:ops -- --help` and `pnpm privacy:ops -- --help` describe explicit offline operations; these commands can change authorization or minimize data and are not ordinary verification commands.
+
 Provider sandbox checks are separate. Do not initiate real calls, forward a restaurant number, submit real reservations, or contact customers as incidental verification. Follow [voice setup](docs/VOICE_SETUP.md) and record which real-provider scenarios were actually verified.
 
 ## Native PostgreSQL and development OIDC
 
-The `pg` adapter and OIDC flow are implemented; deployment/provisioning remains an operator task. Use a disposable development database, migrate through `DATABASE_MIGRATION_URL`, and configure a separate `DATABASE_URL` runtime identity. That identity must be able to assume `hostline_app` and `hostline_worker`, must not own protected tables, and must not be a superuser or have `BYPASSRLS`. Verify actual grants and forced RLS on the target server. PostgreSQL-backed API startup does not migrate or insert demo tenants.
+The API uses Auth0 Universal Login as a Regular Web Application through the existing server-side OIDC client. Read [Auth0 setup](docs/AUTH0_SETUP.md) and [identity operations](docs/IDENTITY_OPERATIONS.md). Configure HTTPS, exact callback/origin, separate signing/encryption secrets, and a native database. Create restaurant configuration and issuer/subject memberships through the explicit versioned operator CLI. `OIDC_MEMBERSHIPS` is rejected; provider claims and browser tenant fields cannot grant membership.
 
-Provision authorized tenant configuration through a controlled operator procedure; a subject mapping alone does not create a restaurant. Configure an HTTPS OIDC issuer/client, the dashboard's exact HTTPS origin, callback `/api/auth/callback`, a strong persistent session secret, and explicit `OIDC_MEMBERSHIPS`. Each verified subject maps to one tenant and one `owner`, `staff`, or `viewer` role. Provider claims and browser tenant fields do not grant membership. OIDC code/PKCE/state/nonce composition is covered with a mocked provider; verify a real identity provider separately.
+Durable hashed sessions expire after eight hours absolutely and thirty minutes idle. Each login requires a fresh verified MFA claim by default. Revocation, demotion, suspension, logout and callback cancellation are shared across API instances. Business transactions recheck current authority while holding the corresponding database locks. Hostline logout revokes its local application session; it does not log out all Auth0 SSO sessions. High-impact operator actions still need controlled access and independent review.
 
-Sessions live in one API process for at most eight hours. Shared session storage, durable membership administration/revocation, MFA verification, and production deployment controls remain launch gates. `NODE_ENV=production` is deliberately rejected; removing its guard does not complete those gates.
+Migrate using a dedicated `DATABASE_MIGRATION_URL`. API login may assume only `hostline_app` and `hostline_auth`; the standalone internal worker needs `hostline_app` and `hostline_worker`. Runtime logins must not own protected tables, inherit the auth broker/privacy operator, or have administrative/BYPASSRLS privileges. RDS connections use `DATABASE_CA_FILE` with full certificate and hostname validation; URL query parameters cannot override endpoint or credentials. Native startup does not migrate or seed tenants. The native suite uses an explicitly disposable empty loopback database, and required CI runs it separately.
+
+Native API and worker work stays quarantined until the independent AWS recovery authority, actual RDS instance resource/endpoint, and database replay checkpoint agree. Follow [privacy/recovery operations](docs/PRIVACY_OPERATIONS.md) for approved retention, separate operator identities, admission/journal ordering, historical replay and security reauthorization. The local synthetic demo does not need AWS.
+
+[AWS deployment](docs/AWS_DEPLOYMENT.md) describes CloudFormation, immutable container releases, main-triggered staging, redeployment, logs and application cleanup. A successful pipeline does not prove live Auth0, phone forwarding, TLS/WebSocket behavior or restore drills. `NODE_ENV=production` remains deliberately rejected until the documented launch gates pass.
 
 ## Implementation and meaningful tests
 
@@ -99,7 +107,7 @@ Provider status reads use fixed account/call targets and bounded complete child-
 
 Update affected docs with the change, especially [implementation status](docs/IMPLEMENTATION_STATUS.md). Explain implemented behavior, checks run, and operational dependencies. Preserve incomplete requirements in architecture/security docs and link the gap rather than silently weakening them.
 
-ADR-001 through ADR-008 are in [initial decisions](docs/DECISIONS.md). Later records include [ADR-009](docs/adr/009-local-prototype.md) and [ADR-010](docs/adr/010-phone-actions.md). Record consequential decisions with context, alternatives, consequences, evidence, and reconsideration criteria. Mark superseded records explicitly.
+ADR-001 through ADR-008 are in [initial decisions](docs/DECISIONS.md). Later records include [ADR-009](docs/adr/009-local-prototype.md), [ADR-010](docs/adr/010-phone-actions.md), and [ADR-011](docs/adr/011-identity-and-cloud-foundations.md). Record consequential decisions with context, alternatives, consequences, evidence, and reconsideration criteria. Mark superseded records explicitly.
 
 For the current direct-to-main workflow, keep a reviewable diff and record the concrete change, resulting behavior, verification, and limitations in the handoff. If the owner later requests pull requests, use [the PR template](.github/pull_request_template.md). Review tenant/role access, runtime validation, confirmed-field binding, retry uncertainty, privacy, migration impact, and failure recovery. Authentication, tenant isolation, provider-write, and phone-routing changes need independent review; agent review does not replace accountable launch approval.
 

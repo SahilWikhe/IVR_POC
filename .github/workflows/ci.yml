@@ -5,6 +5,46 @@ on:
 permissions:
   contents: read
 jobs:
+  container-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - run: docker build --tag hostline:ci .
+      - run: node scripts/test-container.mjs hostline:ci
+  native-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: hostline_native_test
+          POSTGRES_USER: hostline_test_admin
+          POSTGRES_PASSWORD: synthetic-local-fixture
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hostline_test_admin -d hostline_native_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:native
+        env:
+          TEST_DATABASE_URL: postgresql://hostline_test_admin:synthetic-local-fixture@127.0.0.1:5432/hostline_native_test
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15

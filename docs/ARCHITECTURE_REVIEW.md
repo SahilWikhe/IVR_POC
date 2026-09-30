@@ -4,6 +4,18 @@ Review date: September 30, 2026. Scope: the proposed restaurant receptionist, in
 
 The original review covered documentation, with an agent independent of the primary authors, followed by cross-checks and coordinated revisions. It examined trust boundaries, lifecycle consistency, concurrency, truthful caller status, failure/restore behavior, and delivery gates. A runnable local application and later implementation reviews now exist; their scope and test evidence are recorded in [implementation status](IMPLEMENTATION_STATUS.md). This is not a penetration test, provider verification, legal assessment, or certification. “Addressed” in the original findings below means the design was corrected, rather than establishing that every control exists in code.
 
+## Identity and cloud coding review — 2026-09-30
+
+The current implementation follows [ADR-011](adr/011-identity-and-cloud-foundations.md). Independent review identified and drove fixes for these concrete integration gaps:
+
+- Auth0 callback/logout races, shared revocation, original database-login privilege checks, and authorization changes between request authentication and business transactions.
+- Viewer caller-data access through alternate inbox/bootstrap routes, and encoded routes bypassing raw-path authentication or recovery hooks.
+- PostgreSQL URL options overriding certificate or endpoint verification; actual driver configuration now preserves the approved target and CA. Proxy trust is restricted to the immediate configured ALB hop.
+- Independent journal acknowledgment, sequence/source lineage, deletion admission versus later holds, legacy receipt coverage and privacy-role drift. Restored authority is fenced before separately reviewed security reauthorization.
+- CloudFormation permissions affecting retained network resources, liveness being mistaken for readiness, historical code replacing current deployment controls, and IAM partition keys disagreeing with the journal adapter.
+
+Tests exercise these boundaries using synthetic provider transports, PGlite and disposable native PostgreSQL. [Implementation status](IMPLEMENTATION_STATUS.md) records the final checks and hosted results. Live Auth0 policy, RDS TLS/backup recovery, AWS IAM enforcement, carrier behavior and approved provider retention still need account-dependent acceptance.
+
 ## Findings and resolutions
 
 | ID   | Priority               | Gap found                                                                                                                                                                         | Resolution in the reviewed design                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |

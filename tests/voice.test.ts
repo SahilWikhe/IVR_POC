@@ -559,7 +559,12 @@ describe('current phone policy and knowledge boundaries', () => {
 
 describe('voice admission and limits', () => {
   it('is disabled without secrets and refuses incomplete or production activation', async () => {
-    expect(loadVoiceConfig({})).toEqual({ enabled: false, port: 3002 });
+    expect(loadVoiceConfig({})).toEqual({ enabled: false, port: 3002, host: '127.0.0.1' });
+    expect(loadVoiceConfig({ VOICE_HOST: '0.0.0.0' })).toMatchObject({
+      enabled: false,
+      host: '0.0.0.0',
+    });
+    expect(() => loadVoiceConfig({ VOICE_HOST: 'untrusted.example' })).toThrow('VOICE_HOST');
     expect(() => loadVoiceConfig({ LIVE_VOICE_ENABLED: 'true' })).toThrow(
       'Invalid voice configuration',
     );

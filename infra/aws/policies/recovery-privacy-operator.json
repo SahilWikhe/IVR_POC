@@ -1,0 +1,36 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InstallationAuthorityRead",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:Query"],
+      "Resource": "${RECOVERY_TABLE_ARN}",
+      "Condition": {
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": ["INSTALLATION#${RECOVERY_INSTALLATION_ID}"]
+        }
+      }
+    },
+    {
+      "Sid": "VerifyBoundRdsInstance",
+      "Effect": "Allow",
+      "Action": "rds:DescribeDBInstances",
+      "Resource": "${DATABASE_ARN}"
+    },
+    {
+      "Sid": "JournalConditionalTransactionOnly",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+      "Resource": "${RECOVERY_TABLE_ARN}",
+      "Condition": {
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": ["INSTALLATION#${RECOVERY_INSTALLATION_ID}"]
+        },
+        "StringEquals": {
+          "dynamodb:EnclosingOperation": "TransactWriteItems"
+        }
+      }
+    }
+  ]
+}

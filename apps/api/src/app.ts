@@ -24,6 +24,9 @@ import { logEvent } from '@hostline/observability';
 import { registerAuth } from './auth.js';
 import { registerVoiceActions } from './voice.js';
 import { registerPhoneOperations } from './phone-operations.js';
+import { withStaffTenant } from './auth-transaction.js';
+import { registerDashboard } from './dashboard-static.js';
+import { trustedProxy } from './trusted-proxy.js';
 
 class ApiError extends Error {
   constructor(
@@ -64,25 +67,54 @@ async function requiredCall(tx: TenantTransaction, id: string) {
 export async function createApp(
   config: AppConfig,
   db: Database,
-  dependencies: { callStatusReader?: CallStatusReader } = {},
+  dependencies: {
+    callStatusReader?: CallStatusReader;
+    recoveryGuard?: () => Promise<boolean>;
+  } = {},
 ) {
   const app = Fastify({
     logger: false,
     bodyLimit: 64 * 1024,
     requestTimeout: 15000,
-    trustProxy: false,
+    trustProxy: config.trustedProxyCidrs.length ? trustedProxy(config.trustedProxyCidrs) : false,
   });
   await app.register(cookie, { secret: config.auth.sessionSecret });
   await app.register(helmet);
   await app.register(rateLimit, { max: 180, timeWindow: '1 minute' });
-  const auth = await registerAuth(app, config.auth);
+  async function recoveryReady(): Promise<boolean> {
+    if (config.auth.mode === 'demo') return true;
+    try {
+      return (await dependencies.recoveryGuard?.()) === true;
+    } catch {
+      return false;
+    }
+  }
+  app.addHook('onRequest', async (request) => {
+    const path = request.routeOptions.url;
+    if (
+      (!path?.startsWith('/api/') && !path?.startsWith('/internal/')) ||
+      ['/api/health', '/api/ready', '/api/auth/logout'].includes(path)
+    )
+      return;
+    if (!(await recoveryReady()))
+      throw new ApiError(
+        'RECOVERY_QUARANTINE',
+        503,
+        'This installation is awaiting recovery authorization.',
+      );
+  });
+  const auth = await registerAuth(app, config.auth, db.auth);
   app.addHook('onSend', async (_request, reply) => {
-    reply.header('Cache-Control', 'no-store');
+    if (!reply.hasHeader('Cache-Control')) reply.header('Cache-Control', 'no-store');
   });
   app.addHook('onClose', async () => {
     auth.close();
   });
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof ApiError)
+      return reply
+        .code(error.status)
+        .send({ error: { code: error.code, message: error.message, requestId: request.id } });
     if (error instanceof z.ZodError)
       return reply.code(400).send({
         error: {
@@ -124,24 +156,35 @@ export async function createApp(
     mode: config.auth.mode,
     liveReservations: false,
   }));
+  app.get('/api/ready', async (_request, reply) => {
+    try {
+      const result = await db.readiness();
+      if (!(await recoveryReady())) return reply.code(503).send({ status: 'unavailable' });
+      return { status: 'ready', migrationVersion: result.migrationVersion, mode: config.auth.mode };
+    } catch {
+      return reply.code(503).send({ status: 'unavailable' });
+    }
+  });
   app.get('/api/bootstrap', async (request) => {
     const user = actor(request);
-    return db.withTenant(user.tenantId, async (tx) => ({
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => ({
       restaurant: await tx.getRestaurant(),
-      inbox: await tx.listInbox(),
-      calls: await tx.listCalls(),
+      inbox: user.role === 'viewer' ? [] : await tx.listInbox(),
+      calls: (await tx.listCalls()).map((call) =>
+        user.role === 'viewer' ? { ...call, outcome: null } : call,
+      ),
       integrations: getIntegrationStatuses(),
     }));
   });
   app.get('/api/inbox', async (request) => {
-    const user = actor(request),
+    const user = auth.requireRole(request, ['owner', 'staff']),
       query = inboxQuery.parse(request.query);
-    return db.withTenant(user.tenantId, (tx) => tx.listInbox(query));
+    return withStaffTenant(auth, db, config.auth.mode, request, user, (tx) => tx.listInbox(query));
   });
   app.get('/api/inbox/:id', async (request) => {
-    const user = actor(request);
+    const user = auth.requireRole(request, ['owner', 'staff']);
     const { id } = routeParams.parse(request.params);
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       const item = await tx.getInbox(id);
       if (!item) throw new ApiError('NOT_FOUND', 404, 'Request not found.');
       return item;
@@ -162,7 +205,7 @@ export async function createApp(
         400,
         'Use a staff destination different from the restaurant and AI phone numbers.',
       );
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       const previous = await tx.getRestaurant();
       compareVersion(previous.version, input.expectedVersion);
       const next = {
@@ -180,7 +223,7 @@ export async function createApp(
     const user = actor(request, true),
       { id } = routeParams.parse(request.params),
       input = inboxActionSchema.parse(request.body);
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       const item = await tx.getInbox(id);
       if (!item) throw new ApiError('NOT_FOUND', 404, 'Request not found.');
       compareVersion(item.version, input.expectedVersion);
@@ -200,7 +243,7 @@ export async function createApp(
         403,
         'The simulator is restricted to synthetic demo workspaces.',
       );
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       const call = createSimulationSession(await tx.getRestaurant(), new Date());
       await tx.insertCall(call);
       await tx.audit(user.userId, 'simulation.started', call.id);
@@ -208,15 +251,15 @@ export async function createApp(
     });
   });
   app.get('/api/simulator/calls/:id', async (request) => {
-    const user = actor(request),
+    const user = auth.requireRole(request, ['owner', 'staff']),
       { id } = routeParams.parse(request.params);
-    return db.withTenant(user.tenantId, (tx) => requiredCall(tx, id));
+    return withStaffTenant(auth, db, config.auth.mode, request, user, (tx) => requiredCall(tx, id));
   });
   app.post('/api/simulator/calls/:id/turn', async (request) => {
     const user = actor(request, true),
       { id } = routeParams.parse(request.params),
       input = turnInputSchema.parse(request.body);
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       const call = await requiredCall(tx, id),
         key = `turn:${id}:${input.clientTurnId}`,
         hash = fingerprint(input),
@@ -229,7 +272,7 @@ export async function createApp(
       compareVersion(call.version, input.expectedVersion);
       const next = advanceConversation(call, input.text, await tx.getRestaurant(), new Date());
       await tx.saveCall(next, call.version);
-      await tx.putReceipt(key, hash, next);
+      await tx.putReceipt(key, hash, next, id);
       return next;
     });
   });
@@ -237,7 +280,7 @@ export async function createApp(
     const user = actor(request, true),
       { id } = routeParams.parse(request.params),
       input = confirmInputSchema.parse(request.body);
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       const call = await requiredCall(tx, id),
         key = `confirm:${id}:${input.idempotencyKey}`,
         hash = fingerprint(input),
@@ -258,7 +301,7 @@ export async function createApp(
       await tx.saveCall(result.call, call.version);
       await tx.enqueue('inbox.created', result.item.id);
       await tx.audit(user.userId, 'inbox.created', result.item.id);
-      await tx.putReceipt(key, hash, result.call);
+      await tx.putReceipt(key, hash, result.call, id);
       return result.call;
     });
   });
@@ -266,7 +309,7 @@ export async function createApp(
     const user = actor(request, true),
       { id } = routeParams.parse(request.params),
       input = versionBody.parse(request.body);
-    return db.withTenant(user.tenantId, async (tx) => {
+    return withStaffTenant(auth, db, config.auth.mode, request, user, async (tx) => {
       const call = await requiredCall(tx, id);
       compareVersion(call.version, input.expectedVersion);
       if (call.status !== 'active') return call;
@@ -294,12 +337,17 @@ export async function createApp(
       !timingSafeEqual(supplied, expected)
     )
       throw new ApiError('UNAUTHORIZED', 401, 'Unauthorized.');
-    return db.withTenant(config.voiceTenantId, async (tx) => ({
-      tenantId: config.voiceTenantId,
-      restaurant: await tx.getRestaurant(),
-    }));
+    return db.withTenant(config.voiceTenantId, async (tx) => {
+      if (!(await tx.getTenantAccess()).enabled)
+        throw new ApiError('TENANT_DISABLED', 403, 'Restaurant access is disabled.');
+      return { tenantId: config.voiceTenantId, restaurant: await tx.getRestaurant() };
+    });
   });
   await registerVoiceActions(app, config, db);
   await registerPhoneOperations(app, config, db, auth, dependencies);
+  await registerDashboard(
+    app,
+    config.dashboardStaticDir ? { directory: config.dashboardStaticDir } : {},
+  );
   return app;
 }
