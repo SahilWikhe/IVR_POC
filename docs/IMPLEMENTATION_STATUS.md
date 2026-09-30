@@ -70,7 +70,9 @@ Local verification on 2026-09-30:
 - Built API and disabled gateway smoke checks passed from a fresh nested data directory. The API applied both migrations, health endpoints responded, and disabled incoming voice returned 503 without opening a provider connection. All 188 local Markdown targets across 20 documents and `git diff --check` passed.
 - Independent review findings were fixed and rechecked: immutable initial grants on incoming replay, callback-before-acknowledgment races, monotonic transfer evidence, current-generation disconnect fencing, GA acknowledgment and cancellation handling, readback limits, conservative capacity, remaining transfer budgets, and explicit original-deadline checks immediately before dispatch. Additional API scenarios prove atomic rollback and one-slot concurrent admission.
 
-No real Twilio/OpenAI calls have been verified. Native PostgreSQL multi-connection behavior, provider enforcement, and the launch gates below remain outside this evidence. The earlier 81-test result and its hosted CI run are historical; a later push run must be observed separately.
+The implementation commit `bdc4b68` also passed its [GitHub Actions push run](https://github.com/SahilWikhe/IVR_POC/actions/runs/36769213564). This establishes the configured hosted checks on that code revision, not branch protection or live-provider acceptance.
+
+No real Twilio/OpenAI calls have been verified. Native PostgreSQL multi-connection behavior, provider enforcement, and the launch gates below remain outside this evidence. The earlier 81-test result and its hosted CI run remain historical.
 
 This foundation saves at most one reservation request or message per phone call. It can continue answering questions or attempt a staff transfer afterward; additional saved items in the same call need a separately reviewed workflow.
 
