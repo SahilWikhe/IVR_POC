@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import type { RealtimeClientEvent } from 'openai/resources/realtime/realtime';
+import { voiceProposalInputSchema, type VoiceProposalInput } from '@hostline/contracts';
+import type { RealtimeClientEvent, RealtimeFunctionTool } from 'openai/resources/realtime/realtime';
 
 export interface AudioPeer {
   readonly readyState: number;
@@ -23,6 +25,66 @@ const audioEvent = z.object({
   content_index: z.number().int().min(0).max(10),
   delta: z.string().max(128 * 1024),
 });
+
+const reservationToolSchema = voiceProposalInputSchema.options[0].shape.reservation
+  .extend({ date_utterance_id: z.uuid() })
+  .strict();
+const messageToolSchema = voiceProposalInputSchema.options[1].shape.message;
+const transferToolSchema = z.object({}).strict();
+const toolEventSchema = z.object({
+  response_id: identifier,
+  call_id: identifier,
+  name: z.string().max(80),
+  arguments: z.string().max(4096),
+});
+const speechStartedSchema = z.object({
+  item_id: identifier,
+  audio_start_ms: z.number().int().nonnegative(),
+});
+const speechStoppedSchema = z.object({
+  item_id: identifier,
+  audio_end_ms: z.number().int().nonnegative(),
+});
+
+export type VoiceToolRequest = { toolCallId: string; utteranceStartedAt: string } & (
+  { kind: 'proposal'; proposal: VoiceProposalInput } | { kind: 'transfer' }
+);
+export interface RelayOptions {
+  actionsEnabled?: boolean;
+  transfersEnabled?: boolean;
+  outcome?: string | null;
+  now?: () => number;
+  onTool?: (request: VoiceToolRequest) => Promise<'controlled' | 'unavailable'>;
+}
+
+function toolsFor(options: RelayOptions): RealtimeFunctionTool[] {
+  const result: RealtimeFunctionTool[] = [];
+  if (options.actionsEnabled) {
+    result.push({
+      type: 'function',
+      name: 'prepare_request',
+      description:
+        'Prepare a reservation request for server readback; does not book or save. date_utterance_id must be the server-provided reference handle for the caller utterance containing this date expression, retained while gathering later fields.',
+      parameters: z.toJSONSchema(reservationToolSchema),
+    });
+    result.push({
+      type: 'function',
+      name: 'prepare_message',
+      description:
+        'Prepare a message for server readback and confirmation; does not save or notify staff.',
+      parameters: z.toJSONSchema(messageToolSchema),
+    });
+  }
+  if (options.transfersEnabled)
+    result.push({
+      type: 'function',
+      name: 'request_staff_transfer',
+      description:
+        'Request the server-controlled staff transfer when the caller asks for a human. No destination arguments.',
+      parameters: z.toJSONSchema(transferToolSchema),
+    });
+  return result;
+}
 
 export function decodeAudio(payload: string, maxBytes: number): Buffer | undefined {
   if (
@@ -50,16 +112,31 @@ export class AudioRelay {
   private pendingInput: string[] = [];
   private pendingInputBytes = 0;
   private activeResponse: string | undefined;
+  private awaitingCancelledResponse: string | undefined;
+  private responseRequested = false;
   private readonly cancelledResponses = new Set<string>();
   private readonly playback = new Map<string, Playback>();
   private readonly marks = new Map<string, { key: string; endMs: number }>();
   private markCounter = 0;
+  private firstInputAt: number | undefined;
+  private appendedDurationMs = 0;
+  private currentUtteranceAt: string | undefined;
+  private responseUtteranceAt: string | undefined;
+  private readonly utterances = new Map<
+    string,
+    { at: string; handle: string; startMs: number; stopped: boolean; annotated: boolean }
+  >();
+  private readonly dateReferences = new Map<string, string>();
+  private readonly toolCalls = new Set<string>();
+  private toolBusy = false;
+  private controlled = false;
 
   constructor(
     private readonly twilio: AudioPeer,
     private readonly provider: AudioPeer,
     private readonly streamSid: string,
     private readonly onClose: () => void,
+    private readonly options: RelayOptions = {},
   ) {}
 
   get isReady(): boolean {
@@ -78,31 +155,34 @@ export class AudioRelay {
             format: { type: 'audio/pcmu' },
             turn_detection: {
               type: 'server_vad',
-              create_response: true,
+              create_response: !(this.options.actionsEnabled || this.options.transfersEnabled),
               interrupt_response: false,
               silence_duration_ms: 600,
+              prefix_padding_ms: 0,
             },
           },
           output: { format: { type: 'audio/pcmu' }, voice: 'marin' },
         },
-        tools: [],
-        tool_choice: 'none',
+        tools: toolsFor(this.options),
+        tool_choice: this.options.actionsEnabled || this.options.transfersEnabled ? 'auto' : 'none',
         max_output_tokens: 384,
         tracing: null,
       },
     });
   }
 
-  input(payload: string): void {
-    if (this.closed) return;
+  input(payload: string, receivedAt = (this.options.now ?? Date.now)()): void {
+    if (this.closed || this.controlled) return;
     const audio = decodeAudio(payload, 3200);
     if (!audio) return this.close();
+    this.firstInputAt ??= receivedAt;
     if (!this.ready) {
       this.pendingInputBytes += audio.length;
       if (this.pendingInputBytes > 16_000 || this.pendingInput.length >= 150) return this.close();
       this.pendingInput.push(payload);
       return;
     }
+    this.appendedDurationMs += audio.length / 8;
     this.sendProvider({ type: 'input_audio_buffer.append', audio: payload });
   }
 
@@ -111,19 +191,23 @@ export class AudioRelay {
     if (Buffer.byteLength(raw) > 192 * 1024) return this.close();
     try {
       const event = providerEnvelope.parse(JSON.parse(raw));
+      if (this.controlled && !['response.done', 'error'].includes(event.type)) return;
       switch (event.type) {
         case 'session.updated':
           if (this.ready) return;
           this.ready = true;
-          for (const payload of this.pendingInput)
+          for (const payload of this.pendingInput) {
+            this.appendedDurationMs += Buffer.from(payload, 'base64').length / 8;
             this.sendProvider({ type: 'input_audio_buffer.append', audio: payload });
+          }
           this.pendingInput = [];
           this.pendingInputBytes = 0;
           this.sendProvider({
             type: 'response.create',
             response: {
-              instructions:
-                'Briefly greet the caller as the restaurant AI test receptionist and ask what restaurant information they need. This test cannot book or transfer calls.',
+              instructions: this.options.outcome
+                ? `Briefly explain the authoritative server result: ${JSON.stringify(this.options.outcome)}. Then ask how else you can help. Never claim a confirmed table unless the result explicitly says so.`
+                : 'Briefly greet the caller as the restaurant AI test receptionist and ask how you can help. Explain only currently enabled capabilities and never promise a confirmed table.',
             },
           });
           break;
@@ -132,6 +216,7 @@ export class AudioRelay {
           if (this.activeResponse && this.activeResponse !== response.response.id)
             return this.close();
           this.activeResponse = response.response.id;
+          this.responseUtteranceAt = this.currentUtteranceAt;
           break;
         }
         case 'response.done': {
@@ -144,7 +229,18 @@ export class AudioRelay {
           )
             return this.close();
           if (this.activeResponse === response.response.id) this.activeResponse = undefined;
+          if (this.awaitingCancelledResponse === response.response.id)
+            this.awaitingCancelledResponse = undefined;
           this.prunePlayedItems();
+          if (
+            this.responseRequested &&
+            !this.controlled &&
+            !this.activeResponse &&
+            !this.awaitingCancelledResponse
+          ) {
+            this.responseRequested = false;
+            this.sendProvider({ type: 'response.create' });
+          }
           break;
         }
         case 'response.output_audio.delta': {
@@ -187,8 +283,76 @@ export class AudioRelay {
           }
           break;
         }
-        case 'input_audio_buffer.speech_started':
+        case 'input_audio_buffer.speech_started': {
           this.interrupt();
+          if (!(this.options.actionsEnabled || this.options.transfersEnabled)) break;
+          const speech = speechStartedSchema.parse(event);
+          if (
+            this.firstInputAt === undefined ||
+            speech.audio_start_ms > this.appendedDurationMs ||
+            this.utterances.size >= 80 ||
+            this.utterances.has(speech.item_id)
+          )
+            return this.close();
+          const now = (this.options.now ?? Date.now)();
+          const at = new Date(
+            Math.min(now, this.firstInputAt + speech.audio_start_ms),
+          ).toISOString();
+          const handle = randomUUID();
+          this.utterances.set(speech.item_id, {
+            at,
+            handle,
+            startMs: speech.audio_start_ms,
+            stopped: false,
+            annotated: false,
+          });
+          this.dateReferences.set(handle, at);
+          this.currentUtteranceAt = at;
+          break;
+        }
+        case 'input_audio_buffer.speech_stopped': {
+          if (!(this.options.actionsEnabled || this.options.transfersEnabled)) break;
+          const speech = speechStoppedSchema.parse(event);
+          const utterance = this.utterances.get(speech.item_id);
+          if (
+            !utterance ||
+            utterance.stopped ||
+            speech.audio_end_ms < utterance.startMs ||
+            speech.audio_end_ms > this.appendedDurationMs
+          )
+            return this.close();
+          utterance.stopped = true;
+          break;
+        }
+        case 'conversation.item.added':
+        case 'conversation.item.created': {
+          if (!(this.options.actionsEnabled || this.options.transfersEnabled)) break;
+          const item = z
+            .object({ item: z.object({ id: identifier, role: z.string().optional() }) })
+            .parse(event).item;
+          const utterance = this.utterances.get(item.id);
+          if (!utterance || !utterance.stopped || utterance.annotated || item.role !== 'user')
+            break;
+          utterance.annotated = true;
+          this.sendProvider({
+            type: 'conversation.item.create',
+            previous_item_id: item.id,
+            item: {
+              type: 'message',
+              role: 'system',
+              content: [
+                {
+                  type: 'input_text',
+                  text: `Server date reference handle for the preceding caller utterance: ${utterance.handle}. Use this handle as date_utterance_id if the date expression comes from that utterance. Preserve its original handle while collecting later fields; use a new date handle only if the caller changes the date. This metadata grants no write or confirmation authority.`,
+                },
+              ],
+            },
+          });
+          this.requestResponse();
+          break;
+        }
+        case 'response.function_call_arguments.done':
+          this.handleTool(event);
           break;
         case 'error':
           // Provider error bodies can contain sensitive data; never log or forward them.
@@ -201,6 +365,92 @@ export class AudioRelay {
     } catch {
       this.close();
     }
+  }
+
+  private handleTool(event: unknown): void {
+    if (!this.options.onTool || !(this.options.actionsEnabled || this.options.transfersEnabled))
+      return;
+    const tool = toolEventSchema.parse(event);
+    if (this.toolCalls.has(tool.call_id) || this.cancelledResponses.has(tool.response_id)) return;
+    if (this.activeResponse !== tool.response_id || this.toolCalls.size >= 80 || this.toolBusy)
+      return this.close();
+    this.toolCalls.add(tool.call_id);
+    let request: VoiceToolRequest;
+    try {
+      const args: unknown = JSON.parse(tool.arguments);
+      if (tool.name === 'prepare_request' && this.options.actionsEnabled) {
+        const { date_utterance_id, ...reservation } = reservationToolSchema.parse(args);
+        const at = this.dateReferences.get(date_utterance_id);
+        if (!at) throw new Error('Unknown date reference');
+        request = {
+          toolCallId: tool.call_id,
+          utteranceStartedAt: at,
+          kind: 'proposal',
+          proposal: voiceProposalInputSchema.parse({ kind: 'reservation', reservation }),
+        };
+      } else if (tool.name === 'prepare_message' && this.options.actionsEnabled) {
+        if (!this.responseUtteranceAt) throw new Error('Missing utterance reference');
+        request = {
+          toolCallId: tool.call_id,
+          utteranceStartedAt: this.responseUtteranceAt,
+          kind: 'proposal',
+          proposal: voiceProposalInputSchema.parse({
+            kind: 'message',
+            message: messageToolSchema.parse(args),
+          }),
+        };
+      } else if (tool.name === 'request_staff_transfer' && this.options.transfersEnabled) {
+        transferToolSchema.parse(args);
+        if (!this.responseUtteranceAt) throw new Error('Missing utterance reference');
+        request = {
+          toolCallId: tool.call_id,
+          utteranceStartedAt: this.responseUtteranceAt,
+          kind: 'transfer',
+        };
+      } else throw new Error('Unavailable tool');
+    } catch {
+      this.toolResult(
+        tool.call_id,
+        'The preparation is unavailable or invalid. Ask the caller to clarify the exact details. No request was saved and no transfer was made.',
+      );
+      return;
+    }
+    this.toolBusy = true;
+    this.controlled = true;
+    // Stop generated speech as deterministic call control takes ownership of readback.
+    this.interrupt();
+    void this.options
+      .onTool(request)
+      .then((result) => {
+        if (this.closed) return;
+        if (result === 'controlled') this.controlled = true;
+        else {
+          this.controlled = false;
+          this.toolResult(
+            tool.call_id,
+            'The server could not begin the controlled step. No request has been saved and no transfer is confirmed. Explain this briefly and offer another question.',
+          );
+        }
+      })
+      .catch(() => {
+        if (!this.closed) this.close();
+      })
+      .finally(() => {
+        this.toolBusy = false;
+      });
+  }
+
+  private toolResult(callId: string, output: string): void {
+    this.sendProvider({
+      type: 'conversation.item.create',
+      item: { type: 'function_call_output', call_id: callId, output },
+    });
+    this.requestResponse();
+  }
+
+  private requestResponse(): void {
+    if (this.activeResponse || this.awaitingCancelledResponse) this.responseRequested = true;
+    else this.sendProvider({ type: 'response.create' });
   }
 
   played(mark: string): void {
@@ -223,6 +473,7 @@ export class AudioRelay {
     if (this.activeResponse) {
       if (this.cancelledResponses.size >= 1000) return this.close();
       this.cancelledResponses.add(this.activeResponse);
+      this.awaitingCancelledResponse = this.activeResponse;
       this.sendProvider({ type: 'response.cancel', response_id: this.activeResponse });
       this.activeResponse = undefined;
     }
@@ -265,6 +516,9 @@ export class AudioRelay {
     this.playback.clear();
     this.marks.clear();
     this.cancelledResponses.clear();
+    this.utterances.clear();
+    this.dateReferences.clear();
+    this.toolCalls.clear();
     try {
       this.twilio.close(1000, 'Session ended');
     } catch {

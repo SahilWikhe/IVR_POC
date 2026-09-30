@@ -4,11 +4,11 @@ import websocket from '@fastify/websocket';
 import twilio from 'twilio';
 import WebSocket from 'ws';
 import { z } from 'zod';
-import type { Restaurant } from '@hostline/contracts';
 import type { EnabledVoiceConfig, VoiceConfig } from './config.js';
-import { fetchVoiceContext, voiceInstructions } from './context.js';
-import { CallRegistry } from './registry.js';
-import { AudioRelay, decodeAudio, type AudioPeer } from './relay.js';
+import { voiceInstructions } from './context.js';
+import { createVoiceApiClient, type VoiceApiClient } from './client.js';
+import { createCallController, type CallController, type CallControlResult } from './control.js';
+import { AudioRelay, decodeAudio, type AudioPeer, type VoiceToolRequest } from './relay.js';
 
 const callSidSchema = z.string().regex(/^CA[0-9a-fA-F]{32}$/);
 const streamSidSchema = z.string().regex(/^MZ[0-9a-fA-F]{32}$/);
@@ -74,7 +74,8 @@ export interface ProviderSocket extends AudioPeer {
 }
 
 export interface VoiceDependencies {
-  context?: (config: EnabledVoiceConfig) => Promise<Restaurant>;
+  api?: VoiceApiClient;
+  controller?: CallController;
   connectProvider?: (config: EnabledVoiceConfig) => ProviderSocket;
   now?: () => number;
 }
@@ -100,6 +101,7 @@ function signedCall(
   config: EnabledVoiceConfig,
   request: FastifyRequest,
   path: string,
+  inbound = true,
 ): { callSid: string; params: Record<string, string> } | undefined {
   const parsed = z.record(z.string().max(100), z.string().max(2048)).safeParse(request.body);
   if (
@@ -111,28 +113,12 @@ function signedCall(
   const params = parsed.data;
   if (
     params.AccountSid !== config.accountSid ||
-    params.To !== config.phoneNumber ||
+    (inbound && params.To !== config.phoneNumber) ||
     !callSidSchema.safeParse(params.CallSid).success
   )
     return undefined;
-  if (params.Direction !== undefined && params.Direction !== 'inbound') return undefined;
+  if (inbound && params.Direction !== undefined && params.Direction !== 'inbound') return undefined;
   return { callSid: params.CallSid!, params };
-}
-
-function startResponse(config: EnabledVoiceConfig, token: string): string {
-  const response = new twilio.twiml.VoiceResponse();
-  response.say(
-    'You have reached the restaurant AI test receptionist. This test answers questions only. It cannot make reservations, save messages, or transfer calls.',
-  );
-  response
-    .connect()
-    .stream({ url: `${config.publicUrl.replace(/^https:/, 'wss:')}/twilio/media` })
-    .parameter({ name: 'grant', value: token });
-  response.say(
-    'The AI test session has ended. Please contact restaurant staff through your usual contact channel. Goodbye.',
-  );
-  response.hangup();
-  return response.toString();
 }
 
 function openProvider(config: EnabledVoiceConfig): WebSocket {
@@ -171,8 +157,9 @@ export async function createVoiceGateway(
     liveVoiceEnabled: config.enabled,
     mode: config.enabled ? 'sandbox' : 'disabled',
     productionReady: false,
+    reservationRequestsEnabled: config.enabled && config.actionsEnabled,
     reservationWritesEnabled: false,
-    transfersEnabled: false,
+    transfersEnabled: config.enabled && config.transfersEnabled,
   }));
   if (!config.enabled) {
     app.post('/twilio/incoming', async (_request, reply) =>
@@ -182,17 +169,31 @@ export async function createVoiceGateway(
   }
 
   const now = dependencies.now ?? Date.now;
-  const registry = new CallRegistry(config.maxConcurrentCalls, now);
+  const api = dependencies.api ?? createVoiceApiClient(config);
+  const controller =
+    dependencies.controller ??
+    createCallController({
+      accountSid: config.accountSid,
+      authToken: config.authToken,
+      publicUrl: config.publicUrl,
+      maxCallSeconds: config.maxCallSeconds,
+    });
+  const activeCalls = new Map<string, Set<() => void>>();
   const sockets = new Set<WebSocket>();
-  const loadContext = dependencies.context ?? fetchVoiceContext;
   const connect = dependencies.connectProvider ?? openProvider;
 
   app.post('/twilio/incoming', async (request, reply) => {
     const call = signedCall(config, request, '/twilio/incoming');
     if (!call) return reply.code(403).send({ error: 'Invalid provider callback' });
-    const response = registry.incoming(call.callSid, (token) => startResponse(config, token));
-    if (!response) return reply.code(503).send({ error: 'Voice capacity reached' });
-    return reply.type('text/xml').send(response);
+    try {
+      const response = await api.admit({
+        providerCallSid: call.callSid,
+        accountSid: config.accountSid,
+      });
+      return reply.type('text/xml').send(response.twiml);
+    } catch {
+      return reply.code(503).send({ error: 'Voice admission unavailable' });
+    }
   });
 
   app.post('/twilio/status', async (request, reply) => {
@@ -202,10 +203,115 @@ export async function createVoiceGateway(
       ['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(
         call.params.CallStatus ?? '',
       )
-    )
-      registry.end(call.callSid);
+    ) {
+      try {
+        await api.end({ providerCallSid: call.callSid, reason: 'provider_terminal' });
+      } catch {
+        return reply.code(503).send({ error: 'Voice status unavailable' });
+      }
+      for (const close of activeCalls.get(call.callSid) ?? []) close();
+    }
     // Late nonterminal callbacks never reopen a spent grant.
     return reply.code(204).send();
+  });
+
+  app.post('/twilio/confirmation/:token', async (request, reply) => {
+    const token = z.object({ token: z.string().regex(/^[a-f0-9]{64}$/) }).safeParse(request.params);
+    if (!token.success) return reply.code(403).send({ error: 'Invalid provider callback' });
+    const call = signedCall(config, request, `/twilio/confirmation/${token.data.token}`);
+    if (!call) return reply.code(403).send({ error: 'Invalid provider callback' });
+    const confidence =
+      call.params.Confidence === undefined ? undefined : Number(call.params.Confidence);
+    if (
+      confidence !== undefined &&
+      (!Number.isFinite(confidence) || confidence < 0 || confidence > 1)
+    )
+      return reply.code(400).send({ error: 'Invalid confirmation input' });
+    try {
+      const result = await api.confirmation({
+        providerCallSid: call.callSid,
+        confirmationToken: token.data.token,
+        ...(call.params.SpeechResult === undefined
+          ? {}
+          : { speechResult: call.params.SpeechResult }),
+        ...(confidence === undefined ? {} : { confidence }),
+      });
+      return reply.type('text/xml').send(result.twiml);
+    } catch {
+      return reply.code(503).send({ error: 'Voice confirmation unavailable' });
+    }
+  });
+
+  app.post('/twilio/transfer-status/:token', async (request, reply) => {
+    const token = z.object({ token: z.string().regex(/^[a-f0-9]{64}$/) }).safeParse(request.params);
+    if (!token.success) return reply.code(403).send({ error: 'Invalid provider callback' });
+    const call = signedCall(config, request, `/twilio/transfer-status/${token.data.token}`, false);
+    if (
+      !call ||
+      !call.params.CallStatus ||
+      ![
+        'initiated',
+        'ringing',
+        'answered',
+        'in-progress',
+        'completed',
+        'busy',
+        'failed',
+        'no-answer',
+        'canceled',
+      ].includes(call.params.CallStatus)
+    )
+      return reply.code(403).send({ error: 'Invalid provider callback' });
+    if (
+      call.params.ParentCallSid !== undefined &&
+      !callSidSchema.safeParse(call.params.ParentCallSid).success
+    )
+      return reply.code(400).send({ error: 'Invalid transfer binding' });
+    try {
+      await api.transferStatus({
+        transferToken: token.data.token,
+        childCallSid: call.callSid,
+        status: call.params.CallStatus,
+        ...(call.params.ParentCallSid === undefined
+          ? {}
+          : { parentCallSid: call.params.ParentCallSid }),
+      });
+      return reply.code(204).send();
+    } catch {
+      return reply.code(503).send({ error: 'Voice transfer status unavailable' });
+    }
+  });
+
+  app.post('/twilio/transfer-result/:token', async (request, reply) => {
+    const token = z.object({ token: z.string().regex(/^[a-f0-9]{64}$/) }).safeParse(request.params);
+    if (!token.success) return reply.code(403).send({ error: 'Invalid provider callback' });
+    // Dial action callbacks identify the parent inbound leg; Number callbacks above identify the child.
+    const call = signedCall(config, request, `/twilio/transfer-result/${token.data.token}`);
+    if (
+      !call ||
+      !call.params.DialCallStatus ||
+      !['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(call.params.DialCallStatus)
+    )
+      return reply.code(403).send({ error: 'Invalid provider callback' });
+    if (
+      (call.params.DialCallSid !== undefined &&
+        !callSidSchema.safeParse(call.params.DialCallSid).success) ||
+      (call.params.DialBridged !== undefined &&
+        !['true', 'false'].includes(call.params.DialBridged))
+    )
+      return reply.code(400).send({ error: 'Invalid transfer result' });
+    try {
+      const result = await api.transferResult({
+        providerCallSid: call.callSid,
+        transferToken: token.data.token,
+        dialCallStatus: call.params.DialCallStatus,
+        bridged: call.params.DialBridged === 'true',
+        ...(call.params.DialCallSid === undefined ? {} : { dialCallSid: call.params.DialCallSid }),
+      });
+      return reply.type('text/xml').send(result.twiml);
+    } catch {
+      return reply.code(503).send({ error: 'Voice transfer result unavailable' });
+    }
   });
 
   app.get(
@@ -227,9 +333,12 @@ export async function createVoiceGateway(
         return;
       }
       sockets.add(socket);
+      const controlCancellation = new AbortController();
       let closed = false;
       let connected = false;
       let callSid: string | undefined;
+      let generation: string | undefined;
+      let callExpiresAt: number | undefined;
       let streamSid: string | undefined;
       let provider: ProviderSocket | undefined;
       let relay: AudioRelay | undefined;
@@ -238,13 +347,14 @@ export async function createVoiceGateway(
       let windowStart = now();
       let frameCount = 0;
       let audioBytes = 0;
-      let pending: string[] = [];
+      let pending: Array<{ payload: string; receivedAt: number }> = [];
       let pendingBytes = 0;
       let providerTimer: ReturnType<typeof setTimeout> | undefined;
       let durationTimer: ReturnType<typeof setTimeout> | undefined;
       const close = () => {
         if (closed) return;
         closed = true;
+        controlCancellation.abort();
         clearTimeout(startTimer);
         if (providerTimer) clearTimeout(providerTimer);
         if (durationTimer) clearTimeout(durationTimer);
@@ -254,21 +364,133 @@ export async function createVoiceGateway(
         if (provider?.readyState === WebSocket.CONNECTING) provider.terminate();
         else provider?.close(1000, 'Session ended');
         socket.close(1000, 'Session ended');
-        if (callSid) registry.end(callSid);
+        if (callSid) {
+          const registered = activeCalls.get(callSid);
+          registered?.delete(close);
+          if (registered?.size === 0) activeCalls.delete(callSid);
+        }
+        if (callSid && generation) {
+          void api
+            .end({ providerCallSid: callSid, generation, reason: 'stream_closed' })
+            .catch(() => {
+              /* bounded API failure cannot reopen a durable lease */
+            });
+        }
       };
       const startTimer = setTimeout(close, 5000);
       startTimer.unref();
 
-      const startProvider = async () => {
+      const executeTool = async (
+        request: VoiceToolRequest,
+      ): Promise<'controlled' | 'unavailable'> => {
+        if (closed || !callSid || !generation) return 'unavailable';
+        const binding = { providerCallSid: callSid, generation };
+        let preparation;
         try {
-          const restaurant = await loadContext(config);
-          if (closed || !streamSid) return;
+          preparation =
+            request.kind === 'proposal'
+              ? await api.propose({
+                  ...binding,
+                  toolCallId: request.toolCallId,
+                  utteranceStartedAt: request.utteranceStartedAt,
+                  proposal: request.proposal,
+                })
+              : await api.transfer({ ...binding, toolCallId: request.toolCallId });
+        } catch {
+          return 'unavailable';
+        }
+        if (closed) return 'controlled';
+        // Durable compare-and-set precedes the single non-idempotent provider update.
+        // A lost response or repeat tool delivery is never a reason to issue it twice.
+        let dispatch;
+        try {
+          dispatch = await api.dispatch({ ...binding, controlId: preparation.controlId });
+        } catch {
+          close();
+          return 'controlled';
+        }
+        if (!dispatch.dispatch) return dispatch.unavailable ? 'unavailable' : 'controlled';
+        if (!dispatch.twiml) {
+          close();
+          return 'controlled';
+        }
+        // A fulfilled promise can run before an overdue timer. Recheck the
+        // original authoritative deadline immediately before the provider write.
+        if (closed || callExpiresAt === undefined || now() >= callExpiresAt) {
+          try {
+            await api.dispatched({
+              ...binding,
+              controlId: preparation.controlId,
+              outcome: 'rejected',
+            });
+          } catch {
+            /* the dispatch record remains fenced; never send or retry */
+          }
+          close();
+          return 'controlled';
+        }
+        let result: CallControlResult;
+        try {
+          result = await controller.dispatch(callSid, dispatch.twiml, controlCancellation.signal);
+        } catch {
+          result = { outcome: 'unknown' };
+        }
+        try {
+          await api.dispatched({
+            ...binding,
+            controlId: preparation.controlId,
+            outcome: result.outcome,
+          });
+        } catch {
+          // The durable record still has an admitted dispatch. Hold rather than
+          // continuing a call whose authoritative control result is unavailable.
+          close();
+          return 'controlled';
+        }
+        if (result.outcome === 'rejected') return 'unavailable';
+        close();
+        return 'controlled';
+      };
+
+      const startProvider = async (
+        startCallSid: string,
+        startStreamSid: string,
+        streamGrant: string,
+      ) => {
+        try {
+          const context = await api.redeem({
+            providerCallSid: startCallSid,
+            streamSid: startStreamSid,
+            streamGrant,
+          });
+          generation = context.generation;
+          if (closed || !streamSid) {
+            await api.end({ providerCallSid: startCallSid, generation, reason: 'stream_closed' });
+            return;
+          }
+          callExpiresAt = Date.parse(context.expiresAt);
+          const remainingMs = callExpiresAt - now();
+          if (remainingMs <= 0) return close();
+          if (durationTimer) clearTimeout(durationTimer);
+          durationTimer = setTimeout(close, Math.min(remainingMs, config.maxCallSeconds * 1000));
+          durationTimer.unref();
+          const capabilities = {
+            actionsEnabled: config.actionsEnabled && context.actionsEnabled,
+            transfersEnabled: config.transfersEnabled && context.transfersEnabled,
+            outcome: context.outcome,
+          };
           provider = connect(config);
-          relay = new AudioRelay(socket, provider, streamSid, close);
-          for (const payload of pending) relay.input(payload);
+          relay = new AudioRelay(socket, provider, streamSid, close, {
+            ...capabilities,
+            now,
+            onTool: executeTool,
+          });
+          for (const input of pending) relay.input(input.payload, input.receivedAt);
           pending = [];
           pendingBytes = 0;
-          provider.on('open', () => relay?.configure(voiceInstructions(restaurant)));
+          provider.on('open', () =>
+            relay?.configure(voiceInstructions(context.restaurant, capabilities)),
+          );
           provider.on('message', (data, binary) => {
             if (binary) return close();
             const raw = data.toString();
@@ -311,16 +533,21 @@ export async function createVoiceGateway(
               event.start.streamSid !== event.streamSid
             )
               return close();
-            if (!registry.redeem(event.start.callSid, event.start.customParameters.grant, close))
-              return close();
             callSid = event.start.callSid;
+            const registered = activeCalls.get(callSid) ?? new Set<() => void>();
+            registered.add(close);
+            activeCalls.set(callSid, registered);
             streamSid = event.streamSid;
             clearTimeout(startTimer);
             durationTimer = setTimeout(close, config.maxCallSeconds * 1000);
             durationTimer.unref();
             providerTimer = setTimeout(close, 10_000);
             providerTimer.unref();
-            void startProvider();
+            void startProvider(
+              event.start.callSid,
+              event.streamSid,
+              event.start.customParameters.grant,
+            );
             return;
           }
           if (!streamSid || event.streamSid !== streamSid) return close();
@@ -336,11 +563,11 @@ export async function createVoiceGateway(
             lastTimestamp = timestamp;
             audioBytes += audio.length;
             if (audioBytes > 24_000) return close();
-            if (relay) relay.input(event.media.payload);
+            if (relay) relay.input(event.media.payload, tick);
             else {
               pendingBytes += audio.length;
               if (pendingBytes > 16_000 || pending.length >= 150) return close();
-              pending.push(event.media.payload);
+              pending.push({ payload: event.media.payload, receivedAt: tick });
             }
           } else if (event.event === 'mark') relay?.played(event.mark.name);
           else if (event.event === 'stop') {

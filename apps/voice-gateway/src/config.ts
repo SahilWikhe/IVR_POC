@@ -43,6 +43,8 @@ const activeSchema = z.object({
   serviceToken: z.string().min(32).max(512),
   tenantId: z.uuid(),
   model: z.enum(['gpt-realtime', 'gpt-realtime-mini']),
+  actionsEnabled: z.boolean(),
+  transfersEnabled: z.boolean(),
   maxConcurrentCalls: z.coerce.number().int().min(1).max(10),
   maxCallSeconds: z.coerce.number().int().min(15).max(600),
 });
@@ -53,9 +55,11 @@ export type VoiceConfig = EnabledVoiceConfig | { enabled: false; port: number };
 /** No network calls happen during configuration. Invalid values are never included in errors. */
 export function loadVoiceConfig(env: NodeJS.ProcessEnv = process.env): VoiceConfig {
   const enabled = enabledSchema.safeParse(env.LIVE_VOICE_ENABLED ?? 'false');
+  const actions = enabledSchema.safeParse(env.VOICE_ACTIONS_ENABLED ?? 'false');
+  const transfers = enabledSchema.safeParse(env.VOICE_TRANSFERS_ENABLED ?? 'false');
   const port = portSchema.safeParse(env.VOICE_PORT ?? env.PORT ?? '3002');
-  if (!enabled.success || !port.success)
-    throw new Error('Invalid LIVE_VOICE_ENABLED or VOICE_PORT');
+  if (!enabled.success || !port.success || !actions.success || !transfers.success)
+    throw new Error('Invalid voice activation flags or VOICE_PORT');
   if (enabled.data === 'false') return { enabled: false, port: port.data };
   if (env.NODE_ENV === 'production')
     throw new Error('Production voice activation is unavailable: sandbox verification is required');
@@ -69,6 +73,8 @@ export function loadVoiceConfig(env: NodeJS.ProcessEnv = process.env): VoiceConf
     apiUrl: env.API_INTERNAL_URL ?? 'http://127.0.0.1:3001',
     serviceToken: env.VOICE_SERVICE_TOKEN,
     tenantId: env.VOICE_TENANT_ID,
+    actionsEnabled: actions.data === 'true',
+    transfersEnabled: transfers.data === 'true',
     model: env.OPENAI_REALTIME_MODEL ?? 'gpt-realtime',
     maxConcurrentCalls: env.VOICE_MAX_CONCURRENT_CALLS ?? '2',
     maxCallSeconds: env.VOICE_MAX_CALL_SECONDS ?? '300',

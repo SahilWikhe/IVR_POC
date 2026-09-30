@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
+export { buildReadbackTwiml, buildTransferTwiml, TelephonyInputError } from './telephony.js';
 import {
   isoInstantSchema,
   reservationDetailsSchema,

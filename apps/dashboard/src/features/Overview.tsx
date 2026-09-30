@@ -35,9 +35,9 @@ export function Overview({
   const messages = data.inbox.filter((item) => item.kind === 'message');
   const stats = [
     {
-      label: 'Simulated conversations',
+      label: 'Conversations',
       value: data.calls.length,
-      note: 'Most recent practice calls (up to 100)',
+      note: 'Most recent conversations (up to 100)',
       icon: PhoneIncoming,
       tone: 'green',
     },
@@ -206,9 +206,9 @@ export function Overview({
         <div className="section-heading">
           <div>
             <p className="eyebrow">ON THE LINE</p>
-            <h2>Recent practice calls</h2>
+            <h2>Recent conversations</h2>
           </div>
-          <span className="subtle-label">Simulated activity only</span>
+          <span className="subtle-label">Practice and phone activity</span>
         </div>
         {data.calls.length ? (
           <div className="table-scroll">
@@ -228,7 +228,8 @@ export function Overview({
                       <span className="table-call">
                         <Phone size={15} />
                         <span>
-                          Practice call <span className="muted">#{call.id.slice(0, 6)}</span>
+                          {call.mode === 'voice' ? 'Phone call' : 'Practice call'}{' '}
+                          <span className="muted">#{call.id.slice(0, 6)}</span>
                         </span>
                       </span>
                     </td>
@@ -260,9 +261,7 @@ export function Overview({
         ) : (
           <div className="compact-empty">
             <Phone size={20} />
-            <p>
-              No practice calls yet. Start a conversation to see how your receptionist responds.
-            </p>
+            <p>No conversations yet. Try a practice call to see how your receptionist responds.</p>
             <button className="text-button" onClick={() => navigate('simulator')}>
               Try the simulator
               <ArrowRight size={15} />

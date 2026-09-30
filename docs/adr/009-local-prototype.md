@@ -2,6 +2,8 @@
 
 Status: accepted for local development. This supplements [ADR-001 through ADR-008](../DECISIONS.md); it does not replace the target architecture or authorize production rollout.
 
+The phone implementation boundary below describes the initial prototype. [ADR-010](010-phone-actions.md) supersedes that boundary with durable, gated phone-action foundations; real-provider verification and the production gates remain open.
+
 ## Context
 
 The restaurant product needs a reviewable end-to-end workflow before live calls or reservation access. The repository previously held design/security requirements. External identity, hosting, restaurant onboarding, and reservation-vendor access are not established. The project owner has Twilio/OpenAI accounts and will configure secrets separately.

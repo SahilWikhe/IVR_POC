@@ -81,7 +81,7 @@ function say(call: CallSession, text: string, now: Date): CallSession {
 }
 
 // Digest the explicitly selected canonical fields, never object insertion order supplied by a caller.
-function proposalDigest(
+export function proposalDigest(
   callId: string,
   restaurant: Restaurant,
   proposal: Omit<Proposal, 'digest'>,

@@ -1,6 +1,6 @@
 # AI phone receptionist: restaurant pilot
 
-Status: product brief for the accepted request-only pilot. A local synthetic dashboard, simulator, staff inbox, and tenant-isolated persistence are implemented. The optional phone gateway is an FAQ-only sandbox awaiting real-provider verification; live request submission and staff transfers are still pending. The sections below describe the target pilot. See [implementation status](docs/IMPLEMENTATION_STATUS.md) for delivered behavior and [the implementation plan](docs/IMPLEMENTATION_PLAN.md) and [architecture](docs/ARCHITECTURE.md) for the detailed design.
+Status: product brief for the accepted request-only pilot. A local synthetic dashboard, simulator, staff inbox, and tenant-isolated persistence are implemented. The optional phone gateway now includes durable call control, canonical request/message confirmation, and bounded staff-transfer foundations behind disabled test flags. Real-provider verification, private staff context, and production readiness remain pending. The sections below describe the target pilot. See [implementation status](docs/IMPLEMENTATION_STATUS.md) for delivered behavior and [the implementation plan](docs/IMPLEMENTATION_PLAN.md) and [architecture](docs/ARCHITECTURE.md) for the detailed design.
 
 ## Product goal
 

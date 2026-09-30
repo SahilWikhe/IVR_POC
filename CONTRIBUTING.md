@@ -29,7 +29,7 @@ API, voice gateway, migration, and worker entrypoints load a root `.env` when pr
 ```text
 apps/dashboard/         React/Vite staff dashboard
 apps/api/               Fastify auth, configuration, inbox, simulator APIs
-apps/voice-gateway/     Optional Twilio/OpenAI FAQ sandbox
+apps/voice-gateway/     Optional Twilio/OpenAI voice/action sandbox
 apps/worker/            Native PostgreSQL internal job worker
 packages/contracts/    Shared Zod schemas and TypeScript contracts
 packages/domain/       Conversation, time, confirmation, fulfillment rules
@@ -83,11 +83,17 @@ For database changes, include ordered migrations, runtime-role checks, compatibi
 
 Preserve truthful UI and caller status. Staff booking evidence is `STAFF_REPORTED`; guest communication is separate. Simulator confirmation uses a visible explicit button; it does not prove voice confirmation or audio readback delivery. Keep recordings, biometric enrollment, payments, and live customer messaging outside incidental development.
 
+Phone work must preserve [ADR-010](docs/adr/010-phone-actions.md) and [call-control behavior](docs/TWILIO_CALL_CONTROL.md). Models may prepare requests/messages or ask for the configured staff line, but cannot confirm/save, choose tenant identity, or supply a dialing target. Canonical readback uses Twilio `<Say>` outside and before `<Gather>`; a verified call-bound callback and current proposal checks authorize the inbox write. Resolve relative dates from the server-issued handle for the date-bearing utterance. Simulator endpoints must reject phone calls.
+
+Use durable call records, generation checks, one-use grants, callback receipts, and terminal tombstones. Persist dispatch admission before the one external call update; only its atomic winner sends it. Do not automatically repeat an uncertain update. Callback arrival before the REST acknowledgment is a valid race; late acknowledgments and duplicate callbacks must preserve newer or terminal state. Lease expiry and local socket closure do not prove provider termination or justify releasing unresolved capacity.
+
+Voice, request actions, and staff transfers have separate false-by-default flags. Mocked consent or transfer tests do not prove real readback playback, speech recognition, voicemail handling, carrier forwarding, or live callback delivery. Record that evidence separately on a dedicated test number. A staff line being answered is not proof that a person accepted the call, and saved reservation requests remain unconfirmed.
+
 ## Documentation, decisions, and review
 
 Update affected docs with the change, especially [implementation status](docs/IMPLEMENTATION_STATUS.md). Explain implemented behavior, checks run, and operational dependencies. Preserve incomplete requirements in architecture/security docs and link the gap rather than silently weakening them.
 
-ADR-001 through ADR-008 are in [initial decisions](docs/DECISIONS.md). New records live under `docs/adr/`, beginning with [ADR-009](docs/adr/009-local-prototype.md). Record consequential decisions with context, alternatives, consequences, evidence, and reconsideration criteria. Mark superseded records explicitly.
+ADR-001 through ADR-008 are in [initial decisions](docs/DECISIONS.md). Later records include [ADR-009](docs/adr/009-local-prototype.md) and [ADR-010](docs/adr/010-phone-actions.md). Record consequential decisions with context, alternatives, consequences, evidence, and reconsideration criteria. Mark superseded records explicitly.
 
 For the current direct-to-main workflow, keep a reviewable diff and record the concrete change, resulting behavior, verification, and limitations in the handoff. If the owner later requests pull requests, use [the PR template](.github/pull_request_template.md). Review tenant/role access, runtime validation, confirmed-field binding, retry uncertainty, privacy, migration impact, and failure recovery. Authentication, tenant isolation, provider-write, and phone-routing changes need independent review; agent review does not replace accountable launch approval.
 

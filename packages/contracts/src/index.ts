@@ -205,7 +205,7 @@ export type ConversationDraft = z.infer<typeof conversationDraftSchema>;
 export const callSessionSchema = z.object({
   id: idSchema,
   version: z.number().int().positive(),
-  mode: z.literal('simulation'),
+  mode: z.enum(['simulation', 'voice']),
   status: z.enum(['active', 'ended', 'transferred', 'request_saved', 'message_saved']),
   phase: conversationPhaseSchema,
   draft: conversationDraftSchema,
@@ -278,3 +278,5 @@ export const DEMO_TENANTS = {
   harbor: '11111111-1111-4111-8111-111111111111',
   juniper: '22222222-2222-4222-8222-222222222222',
 } as const;
+
+export * from './voice.js';

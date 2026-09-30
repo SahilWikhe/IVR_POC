@@ -10,10 +10,12 @@ import {
   idSchema,
   inboxItemSchema,
   restaurantSchema,
+  voiceCallRecordSchema,
   type CallSession,
   type CallSummary,
   type InboxItem,
   type Restaurant,
+  type VoiceCallRecord,
 } from '@hostline/contracts';
 import { expireFulfillment } from '@hostline/domain';
 import { demoData } from './seed.js';
@@ -49,6 +51,12 @@ export interface TenantTransaction {
   getCall(id: string): Promise<CallSession | null>;
   insertCall(call: CallSession): Promise<void>;
   saveCall(call: CallSession, expectedVersion: number): Promise<void>;
+  getVoiceCall(providerCallSid: string): Promise<VoiceCallRecord | null>;
+  getVoiceCallById(id: string): Promise<VoiceCallRecord | null>;
+  insertVoiceCall(call: VoiceCallRecord): Promise<void>;
+  saveVoiceCall(call: VoiceCallRecord, expectedVersion: number): Promise<void>;
+  countActiveVoiceCalls(now: Date): Promise<number>;
+  lockVoiceAdmission(): Promise<void>;
   getReceipt(key: string): Promise<{ fingerprint: string; result: unknown } | null>;
   putReceipt(key: string, fingerprint: string, result: unknown): Promise<void>;
   audit(actorId: string, action: string, resourceId: string): Promise<void>;
@@ -76,6 +84,8 @@ const jobSchema = z.object({
   lease_token: idSchema,
   attempts: z.number().int().min(1).max(5),
 });
+const providerCallSidSchema = z.string().regex(/^CA[0-9a-fA-F]{32}$/);
+const countSchema = z.object({ count: z.coerce.number().int().min(0) });
 
 function safeDatabaseError(error: unknown): never {
   if (error instanceof PersistenceError) throw error;
@@ -245,6 +255,82 @@ class Transaction implements TenantTransaction {
       ),
     );
   }
+  async getVoiceCall(providerCallSid: string): Promise<VoiceCallRecord | null> {
+    const row = (
+      await this.query(
+        'SELECT document FROM voice_calls WHERE tenant_id=$1 AND provider_call_sid=$2 FOR UPDATE',
+        [this.tenantId, providerCallSidSchema.parse(providerCallSid)],
+      )
+    ).rows[0];
+    return row ? voiceCallRecordSchema.parse(documentSchema.parse(row).document) : null;
+  }
+  async getVoiceCallById(id: string): Promise<VoiceCallRecord | null> {
+    const row = (
+      await this.query('SELECT document FROM voice_calls WHERE tenant_id=$1 AND id=$2 FOR UPDATE', [
+        this.tenantId,
+        idSchema.parse(id),
+      ])
+    ).rows[0];
+    return row ? voiceCallRecordSchema.parse(documentSchema.parse(row).document) : null;
+  }
+  async insertVoiceCall(value: VoiceCallRecord): Promise<void> {
+    const call = voiceCallRecordSchema.parse(value);
+    await this.query(
+      'INSERT INTO voice_calls (tenant_id,id,provider_call_sid,version,state,generation,lease_expires_at,document) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)',
+      [
+        this.tenantId,
+        call.id,
+        call.providerCallSid,
+        call.version,
+        call.state,
+        call.generation,
+        call.leaseExpiresAt,
+        JSON.stringify(call),
+      ],
+    );
+  }
+  async saveVoiceCall(value: VoiceCallRecord, expectedVersion: number): Promise<void> {
+    const call = voiceCallRecordSchema.parse(value);
+    nextVersion(call.version, expectedVersion);
+    requireUpdated(
+      await this.query(
+        "UPDATE voice_calls SET version=$3,state=$4,generation=$5,lease_expires_at=$6,document=$7::jsonb WHERE tenant_id=$1 AND id=$2 AND version=$8 AND provider_call_sid=$9 AND document->>'accountSid'=$10",
+        [
+          this.tenantId,
+          call.id,
+          call.version,
+          call.state,
+          call.generation,
+          call.leaseExpiresAt,
+          JSON.stringify(call),
+          expectedVersion,
+          call.providerCallSid,
+          call.accountSid,
+        ],
+      ),
+    );
+  }
+  async countActiveVoiceCalls(now: Date): Promise<number> {
+    z.date().parse(now);
+    // A control lease expiring does not prove Twilio stopped its hosted
+    // Say/Gather/Dial instructions. Only authoritative terminal state frees
+    // admission; abandoned calls remain held for operator reconciliation.
+    const row = (
+      await this.query(
+        "SELECT count(*) AS count FROM voice_calls WHERE tenant_id=$1 AND state<>'ENDED'",
+        [this.tenantId],
+      )
+    ).rows[0];
+    return countSchema.parse(row).count;
+  }
+  async lockVoiceAdmission(): Promise<void> {
+    const row = (
+      await this.query('SELECT tenant_id FROM restaurants WHERE tenant_id=$1 FOR UPDATE', [
+        this.tenantId,
+      ])
+    ).rows[0];
+    if (!row) throw new PersistenceError('NOT_FOUND', 404, 'Restaurant not found.');
+  }
   async getReceipt(key: string): Promise<{ fingerprint: string; result: unknown } | null> {
     const row = (
       await this.query(
@@ -325,6 +411,22 @@ function pgClient(client: pg.PoolClient): SqlClient {
   };
 }
 
+const migrations = [
+  { version: 1, file: '001_initial.sql' },
+  { version: 2, file: '002_voice_calls.sql' },
+] as const;
+
+async function readMigration(file: string): Promise<string> {
+  const configuredDirectory = process.env['HOSTLINE_MIGRATIONS_DIR'];
+  if (configuredDirectory) return readFile(resolve(configuredDirectory, file), 'utf8');
+  try {
+    return await readFile(new URL(`../migrations/${file}`, import.meta.url), 'utf8');
+  } catch (error) {
+    if (!z.object({ code: z.literal('ENOENT') }).safeParse(error).success) throw error;
+    return readFile(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
+  }
+}
+
 async function applyMigration(
   client: SqlClient,
   execute: (sql: string) => Promise<void>,
@@ -334,34 +436,16 @@ async function applyMigration(
   try {
     await client.query('SELECT pg_advisory_xact_lock(873622019)');
     const table = await client.query("SELECT to_regclass('public.schema_migrations') AS name");
+    const applied = new Set<number>();
     if (table.rows[0]?.name !== null) {
-      const existing = await client.query(
-        'SELECT version FROM schema_migrations WHERE version = 1',
-      );
-      if (existing.rows.length) {
-        await client.query('COMMIT');
-        return;
+      const existing = await client.query('SELECT version FROM schema_migrations');
+      for (const row of existing.rows) {
+        applied.add(z.object({ version: z.number().int().positive() }).parse(row).version);
       }
     }
-    const configuredDirectory = process.env['HOSTLINE_MIGRATIONS_DIR'];
-    let migration: string;
-    if (configuredDirectory) {
-      migration = await readFile(resolve(configuredDirectory, '001_initial.sql'), 'utf8');
-    } else {
-      try {
-        migration = await readFile(
-          new URL('../migrations/001_initial.sql', import.meta.url),
-          'utf8',
-        );
-      } catch (error) {
-        if (!z.object({ code: z.literal('ENOENT') }).safeParse(error).success) throw error;
-        migration = await readFile(
-          new URL('./migrations/001_initial.sql', import.meta.url),
-          'utf8',
-        );
-      }
+    for (const migration of migrations) {
+      if (!applied.has(migration.version)) await execute(await readMigration(migration.file));
     }
-    await execute(migration);
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -448,7 +532,7 @@ export async function createDatabase(
         await client.query("SET LOCAL lock_timeout = '2000ms'");
         await client.query("SELECT set_config('hostline.tenant_id', $1, true)", [tenantId ?? '']);
         const safety = await client.query(
-          "SELECT rolsuper, rolbypassrls, EXISTS (SELECT FROM pg_class WHERE relname IN ('restaurants','calls','inbox','receipts','audit_events','outbox','jobs') AND relowner = pg_roles.oid) AS owns_tables FROM pg_roles WHERE rolname = current_user",
+          "SELECT rolsuper, rolbypassrls, EXISTS (SELECT FROM pg_class WHERE relname IN ('restaurants','calls','inbox','voice_calls','receipts','audit_events','outbox','jobs') AND relowner = pg_roles.oid) AS owns_tables FROM pg_roles WHERE rolname = current_user",
         );
         if (
           safety.rows[0]?.rolsuper !== false ||

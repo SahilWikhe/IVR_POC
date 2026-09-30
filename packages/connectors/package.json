@@ -9,6 +9,7 @@
   "dependencies": {
     "@hostline/contracts": "workspace:*",
     "@hostline/domain": "workspace:*",
-    "zod": "^4.3.0"
+    "zod": "^4.3.0",
+    "twilio": "^5.12.0"
   }
 }

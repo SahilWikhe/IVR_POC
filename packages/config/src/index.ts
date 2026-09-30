@@ -25,7 +25,21 @@ const schema = z.object({
   OIDC_MEMBERSHIPS: z.string().optional(),
   VOICE_SERVICE_TOKEN: z.string().min(32).optional(),
   VOICE_TENANT_ID: z.uuid().optional(),
-  TWILIO_PHONE_NUMBER: z.string().optional(),
+  TWILIO_PHONE_NUMBER: z
+    .string()
+    .regex(/^\+[1-9]\d{7,14}$/)
+    .optional(),
+  TWILIO_ACCOUNT_SID: z
+    .string()
+    .regex(/^AC[a-fA-F0-9]{32}$/)
+    .optional(),
+  LIVE_VOICE_ENABLED: z.enum(['true', 'false']).default('false'),
+  VOICE_MODE: z.literal('sandbox').optional(),
+  VOICE_PUBLIC_URL: z.url().optional(),
+  VOICE_ACTIONS_ENABLED: z.enum(['true', 'false']).default('false'),
+  VOICE_TRANSFERS_ENABLED: z.enum(['true', 'false']).default('false'),
+  VOICE_MAX_CONCURRENT_CALLS: z.coerce.number().int().min(1).max(10).default(2),
+  VOICE_MAX_CALL_SECONDS: z.coerce.number().int().min(15).max(600).default(300),
 });
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
@@ -82,6 +96,35 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       memberships,
     };
   }
+  const liveVoice = value.LIVE_VOICE_ENABLED === 'true';
+  const actionsEnabled = value.VOICE_ACTIONS_ENABLED === 'true';
+  const transfersEnabled = value.VOICE_TRANSFERS_ENABLED === 'true';
+  if (liveVoice || actionsEnabled || transfersEnabled) {
+    if (
+      !liveVoice ||
+      value.VOICE_MODE !== 'sandbox' ||
+      !value.TWILIO_ACCOUNT_SID ||
+      !value.TWILIO_PHONE_NUMBER ||
+      !value.VOICE_PUBLIC_URL ||
+      !value.VOICE_SERVICE_TOKEN ||
+      !value.VOICE_TENANT_ID
+    ) {
+      throw new Error('Voice actions require the complete isolated sandbox routing configuration.');
+    }
+    const voiceOrigin = new URL(value.VOICE_PUBLIC_URL);
+    if (
+      voiceOrigin.protocol !== 'https:' ||
+      voiceOrigin.pathname !== '/' ||
+      voiceOrigin.search ||
+      voiceOrigin.hash ||
+      voiceOrigin.username ||
+      voiceOrigin.password
+    ) {
+      throw new Error(
+        'VOICE_PUBLIC_URL must be an HTTPS origin without credentials, path, or query.',
+      );
+    }
+  }
   return {
     host: value.API_HOST,
     port: value.API_PORT,
@@ -90,6 +133,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     voiceServiceToken: value.VOICE_SERVICE_TOKEN,
     voiceTenantId: value.VOICE_TENANT_ID,
     twilioPhoneNumber: value.TWILIO_PHONE_NUMBER,
+    voice: {
+      enabled: liveVoice,
+      actionsEnabled,
+      transfersEnabled,
+      publicUrl: value.VOICE_PUBLIC_URL ? new URL(value.VOICE_PUBLIC_URL).origin : undefined,
+      accountSid: value.TWILIO_ACCOUNT_SID,
+      phoneNumber: value.TWILIO_PHONE_NUMBER,
+      maxConcurrentCalls: value.VOICE_MAX_CONCURRENT_CALLS,
+      maxCallSeconds: value.VOICE_MAX_CALL_SECONDS,
+    },
     auth: {
       mode: value.AUTH_MODE,
       dashboardOrigin: value.DASHBOARD_ORIGIN,

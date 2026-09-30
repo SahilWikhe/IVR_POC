@@ -22,6 +22,7 @@ import type { Database, TenantTransaction } from '@hostline/database';
 import type { AppConfig } from '@hostline/config';
 import { logEvent } from '@hostline/observability';
 import { registerAuth } from './auth.js';
+import { registerVoiceActions } from './voice.js';
 
 class ApiError extends Error {
   constructor(
@@ -50,6 +51,12 @@ function compareVersion(actual: number, expected: number) {
 async function requiredCall(tx: TenantTransaction, id: string) {
   const call = await tx.getCall(id);
   if (!call) throw new ApiError('NOT_FOUND', 404, 'Call not found.');
+  if (call.mode !== 'simulation')
+    throw new ApiError(
+      'SIMULATION_ONLY',
+      403,
+      'Phone calls cannot be modified through the simulator.',
+    );
   return call;
 }
 
@@ -287,5 +294,6 @@ export async function createApp(config: AppConfig, db: Database) {
       restaurant: await tx.getRestaurant(),
     }));
   });
+  await registerVoiceActions(app, config, db);
   return app;
 }

@@ -1,9 +1,10 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
 import { loadVoiceConfig, type EnabledVoiceConfig } from '../apps/voice-gateway/src/config.js';
 import { createVoiceGateway, type ProviderSocket } from '../apps/voice-gateway/src/gateway.js';
 import { AudioRelay, type AudioPeer } from '../apps/voice-gateway/src/relay.js';
+import type { VoiceApiClient } from '../apps/voice-gateway/src/client.js';
 import { CallRegistry } from '../apps/voice-gateway/src/registry.js';
 import { voiceInstructions } from '../apps/voice-gateway/src/context.js';
 import type { Restaurant } from '../packages/contracts/src/index.js';
@@ -120,6 +121,80 @@ class Peer extends EventEmitter implements AudioPeer, ProviderSocket {
   }
 }
 
+function fixtureApi(): VoiceApiClient {
+  const entries = new Map<
+    string,
+    { token: string; generation: string; ended: boolean; spent: boolean; twiml: string }
+  >();
+  return {
+    admit: vi.fn<VoiceApiClient['admit']>(async ({ providerCallSid }) => {
+      let entry = entries.get(providerCallSid);
+      if (!entry) {
+        const token = 'd'.repeat(64);
+        entry = {
+          token,
+          generation: randomUUID(),
+          ended: false,
+          spent: false,
+          twiml: `<Response><Connect><Stream><Parameter name="grant" value="${token}"/></Stream></Connect></Response>`,
+        };
+        entries.set(providerCallSid, entry);
+      }
+      return {
+        voiceCallId: restaurant.id,
+        generation: entry.generation,
+        tenantId: restaurant.id,
+        twiml: entry.twiml,
+        state: entry.ended ? ('ENDED' as const) : ('WAITING_FOR_STREAM' as const),
+      };
+    }),
+    redeem: vi.fn<VoiceApiClient['redeem']>(async ({ providerCallSid, streamGrant }) => {
+      const entry = entries.get(providerCallSid);
+      if (!entry || entry.ended || entry.spent || entry.token !== streamGrant)
+        throw new Error('Invalid grant');
+      entry.spent = true;
+      return {
+        voiceCallId: restaurant.id,
+        generation: entry.generation,
+        tenantId: restaurant.id,
+        restaurant,
+        expiresAt: new Date(Date.now() + 300_000).toISOString(),
+        outcome: null,
+        actionsEnabled: false,
+        transfersEnabled: false,
+      };
+    }),
+    end: vi.fn<VoiceApiClient['end']>(async ({ providerCallSid }) => {
+      const entry = entries.get(providerCallSid);
+      if (entry) entry.ended = true;
+      else
+        entries.set(providerCallSid, {
+          token: '',
+          generation: randomUUID(),
+          ended: true,
+          spent: true,
+          twiml: '<Response><Hangup/></Response>',
+        });
+      return { state: 'ENDED' as const };
+    }),
+    propose: vi.fn(async () => {
+      throw new Error('Disabled');
+    }),
+    transfer: vi.fn(async () => {
+      throw new Error('Disabled');
+    }),
+    dispatch: vi.fn(async () => ({ dispatch: false, twiml: null, unavailable: false })),
+    dispatched: vi.fn(async () => ({ state: 'CONTROL_PENDING' as const })),
+    confirmation: vi.fn(async () => {
+      throw new Error('Disabled');
+    }),
+    transferStatus: vi.fn(async () => ({ state: 'TRANSFERRING' as const })),
+    transferResult: vi.fn(async () => {
+      throw new Error('Disabled');
+    }),
+  };
+}
+
 describe('voice admission and limits', () => {
   it('is disabled without secrets and refuses incomplete or production activation', async () => {
     expect(loadVoiceConfig({})).toEqual({ enabled: false, port: 3002 });
@@ -150,7 +225,7 @@ describe('voice admission and limits', () => {
   });
 
   it('rejects forged, wrong account, wrong number, query and attacker-origin signatures', async () => {
-    const app = await createVoiceGateway(config());
+    const app = await createVoiceGateway(config(), { api: fixtureApi() });
     try {
       const valid = callback();
       expect(
@@ -233,7 +308,7 @@ describe('voice admission and limits', () => {
     expect(registry.redeem('second', expired!, ended)).toBe(false);
     expect(registry.incoming('third', () => 'overflow')).toBeUndefined();
 
-    const app = await createVoiceGateway(config());
+    const app = await createVoiceGateway(config(), { api: fixtureApi() });
     try {
       const initial = await app.inject(callback());
       expect((await app.inject(callback())).body).toBe(initial.body);
@@ -255,9 +330,9 @@ describe('voice admission and limits', () => {
   });
 
   it('rejects unsigned media upgrades and mismatched call binding before opening a provider', async () => {
-    const context = vi.fn(async () => restaurant);
+    const api = fixtureApi();
     const connect = vi.fn(() => new Peer());
-    const app = await createVoiceGateway(config(), { context, connectProvider: connect });
+    const app = await createVoiceGateway(config(), { api, connectProvider: connect });
     await app.ready();
     try {
       await expect(app.injectWS('/twilio/media')).rejects.toThrow();
@@ -267,7 +342,7 @@ describe('voice admission and limits', () => {
       socket.send(connected);
       socket.send(JSON.stringify(start(grant(response.body), `CA${'e'.repeat(32)}`)));
       await closed;
-      expect(context).not.toHaveBeenCalled();
+      expect(api.redeem).toHaveBeenCalledOnce();
       expect(connect).not.toHaveBeenCalled();
     } finally {
       await app.close();
@@ -278,7 +353,7 @@ describe('voice admission and limits', () => {
     const provider = new Peer();
     const connect = vi.fn(() => provider);
     const app = await createVoiceGateway(config(), {
-      context: async () => restaurant,
+      api: fixtureApi(),
       connectProvider: connect,
     });
     await app.ready();
@@ -321,8 +396,252 @@ describe('voice admission and limits', () => {
     }
   });
 
+  it('does not open a provider when terminal status arrives during a delayed redemption response', async () => {
+    const api = fixtureApi();
+    const baseRedeem = api.redeem;
+    let release: (() => void) | undefined;
+    api.redeem = vi.fn(async (input) => {
+      const context = await baseRedeem(input);
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return context;
+    });
+    const connect = vi.fn(() => new Peer());
+    const app = await createVoiceGateway(config(), { api, connectProvider: connect });
+    await app.ready();
+    try {
+      const admission = await app.inject(callback());
+      const socket = await app.injectWS('/twilio/media', { headers: socketHeaders });
+      const closed = once(socket, 'close');
+      socket.send(connected);
+      socket.send(JSON.stringify(start(grant(admission.body))));
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+      expect(
+        (
+          await app.inject(
+            callback('/twilio/status', { ...callbackParams(), CallStatus: 'completed' }),
+          )
+        ).statusCode,
+      ).toBe(204);
+      await closed;
+      release?.();
+      await vi.waitFor(() =>
+        expect(api.end).toHaveBeenCalledWith(
+          expect.objectContaining({ reason: 'stream_closed', generation: expect.any(String) }),
+        ),
+      );
+      expect(connect).not.toHaveBeenCalled();
+    } finally {
+      release?.();
+      await app.close();
+    }
+  });
+
+  it('authenticates call-bound confirmation and child-leg callbacks on their exact configured paths', async () => {
+    const api = fixtureApi();
+    api.confirmation = vi.fn(async () => ({
+      tenantId: restaurant.id,
+      twiml: '<Response><Say>Request saved for staff review.</Say></Response>',
+      outcome: 'Request saved',
+    }));
+    api.transferResult = vi.fn(async () => ({
+      tenantId: restaurant.id,
+      twiml: '<Response><Hangup/></Response>',
+      outcome: 'Staff call completed',
+    }));
+    const app = await createVoiceGateway(config(), { api });
+    const token = 'd'.repeat(64);
+    try {
+      const confirmPath = `/twilio/confirmation/${token}`;
+      const confirmation = callback(confirmPath, {
+        ...callbackParams(),
+        SpeechResult: 'yes',
+        Confidence: '0.96',
+      });
+      expect((await app.inject(confirmation)).statusCode).toBe(200);
+      expect(api.confirmation).toHaveBeenCalledWith({
+        providerCallSid: call,
+        confirmationToken: token,
+        speechResult: 'yes',
+        confidence: 0.96,
+      });
+      expect(
+        (await app.inject({ ...confirmation, url: `${confirmPath}?unsafe=1` })).statusCode,
+      ).toBe(403);
+      expect(
+        (
+          await app.inject(
+            callback(confirmPath, { ...callbackParams(), Confidence: 'not-a-number' }),
+          )
+        ).statusCode,
+      ).toBe(400);
+      const childSid = `CA${'e'.repeat(32)}`;
+      const childParams = {
+        AccountSid: account,
+        CallSid: childSid,
+        ParentCallSid: call,
+        To: restaurant.transferNumber,
+        Direction: 'outbound-dial',
+        CallStatus: 'answered',
+      };
+      expect(
+        (await app.inject(callback(`/twilio/transfer-status/${token}`, childParams))).statusCode,
+      ).toBe(204);
+      expect(api.transferStatus).toHaveBeenCalledWith({
+        transferToken: token,
+        childCallSid: childSid,
+        parentCallSid: call,
+        status: 'answered',
+      });
+      expect(
+        (
+          await app.inject(
+            callback(`/twilio/transfer-status/${token}`, {
+              ...childParams,
+              AccountSid: `AC${'f'.repeat(32)}`,
+            }),
+          )
+        ).statusCode,
+      ).toBe(403);
+      expect(
+        (
+          await app.inject(
+            callback(`/twilio/transfer-result/${token}`, {
+              ...callbackParams(),
+              DialCallSid: childSid,
+              DialCallStatus: 'completed',
+              DialBridged: 'true',
+            }),
+          )
+        ).statusCode,
+      ).toBe(200);
+      expect(api.transferResult).toHaveBeenCalledWith({
+        providerCallSid: call,
+        transferToken: token,
+        dialCallSid: childSid,
+        dialCallStatus: 'completed',
+        bridged: true,
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it.each(['unknown', 'expired'] as const)(
+    'dispatches controlled readback once or fences an overdue dispatch (%s)',
+    async (scenario) => {
+      let clock = Date.now();
+      const cfg = loadVoiceConfig({ ...environment, VOICE_ACTIONS_ENABLED: 'true' });
+      if (!cfg.enabled) throw new Error('disabled');
+      const api = fixtureApi();
+      const baseRedeem = api.redeem;
+      api.redeem = vi.fn(async (input) => ({ ...(await baseRedeem(input)), actionsEnabled: true }));
+      const controlId = randomUUID();
+      api.propose = vi.fn(async () => ({
+        controlId,
+        twiml: '<Response><Say>Canonical readback</Say></Response>',
+      }));
+      api.dispatch = vi.fn(async () => {
+        if (scenario === 'expired') clock += 301_000;
+        return {
+          dispatch: true,
+          unavailable: false,
+          twiml: '<Response><Say>Canonical readback</Say></Response>',
+        };
+      });
+      api.dispatched = vi.fn(async () => ({ state: 'NEEDS_RECONCILIATION' as const }));
+      const controller = {
+        dispatch: vi.fn(async (_callSid: string, _twiml: string, _signal?: AbortSignal) => ({
+          outcome: 'unknown' as const,
+        })),
+      };
+      const provider = new Peer();
+      const app = await createVoiceGateway(cfg, {
+        now: () => clock,
+        api,
+        controller,
+        connectProvider: () => provider,
+      });
+      await app.ready();
+      try {
+        const admission = await app.inject(callback());
+        const socket = await app.injectWS('/twilio/media', { headers: socketHeaders });
+        const closed = once(socket, 'close');
+        socket.send(connected);
+        socket.send(JSON.stringify(start(grant(admission.body))));
+        await vi.waitFor(() => expect(api.redeem).toHaveBeenCalledOnce());
+        await vi.waitFor(() => expect(provider.listenerCount('open')).toBe(1));
+        provider.emit('open');
+        provider.emit('message', JSON.stringify({ type: 'session.updated' }), false);
+        socket.send(
+          JSON.stringify({
+            event: 'media',
+            sequenceNumber: '2',
+            streamSid: stream,
+            media: {
+              timestamp: '0',
+              chunk: '1',
+              track: 'inbound',
+              payload: Buffer.alloc(160).toString('base64'),
+            },
+          }),
+        );
+        await vi.waitFor(() =>
+          expect(provider.events.some((value) => value.type === 'input_audio_buffer.append')).toBe(
+            true,
+          ),
+        );
+        for (const event of [
+          { type: 'input_audio_buffer.speech_started', item_id: 'caller1', audio_start_ms: 0 },
+          { type: 'input_audio_buffer.speech_stopped', item_id: 'caller1', audio_end_ms: 20 },
+          { type: 'conversation.item.added', item: { id: 'caller1', role: 'user' } },
+          { type: 'response.created', response: { id: 'tool-response' } },
+          {
+            type: 'response.function_call_arguments.done',
+            response_id: 'tool-response',
+            call_id: 'request-tool',
+            name: 'prepare_message',
+            arguments: JSON.stringify({
+              name: 'Synthetic Guest',
+              callbackNumber: '+12125550111',
+              message: 'Please call about a private dinner.',
+            }),
+          },
+        ])
+          provider.emit('message', JSON.stringify(event), false);
+        await closed;
+        expect(api.propose).toHaveBeenCalledOnce();
+        expect(api.dispatch).toHaveBeenCalledOnce();
+        if (scenario === 'unknown') expect(controller.dispatch).toHaveBeenCalledOnce();
+        else expect(controller.dispatch).not.toHaveBeenCalled();
+        expect(api.dispatched).toHaveBeenCalledWith(
+          expect.objectContaining({
+            providerCallSid: call,
+            controlId,
+            outcome: scenario === 'expired' ? 'rejected' : 'unknown',
+          }),
+        );
+        expect(api.end).toHaveBeenCalledWith(
+          expect.objectContaining({
+            providerCallSid: call,
+            generation: expect.any(String),
+            reason: 'stream_closed',
+          }),
+        );
+        if (scenario === 'unknown') {
+          expect(controller.dispatch.mock.calls[0]?.[0]).toBe(call);
+          expect(controller.dispatch.mock.calls[0]?.[1]).toContain('Canonical readback');
+          expect(controller.dispatch.mock.calls[0]?.[2]).toBeInstanceOf(AbortSignal);
+        }
+      } finally {
+        await app.close();
+      }
+    },
+  );
+
   it('enforces the provisional socket cap across simultaneous verified upgrades', async () => {
-    const app = await createVoiceGateway(config());
+    const app = await createVoiceGateway(config(), { api: fixtureApi() });
     await app.ready();
     try {
       const attempted = await Promise.allSettled(
