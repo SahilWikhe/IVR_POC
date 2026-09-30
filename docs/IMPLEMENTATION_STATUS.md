@@ -100,7 +100,9 @@ Local verification on 2026-09-30:
 - Independent implementation review found no remaining blocker for this local milestone after fixes to raw SDK page metadata/array ambiguity, terminal callback replay binding, stale displayed proposals, staff booking copy, dispatch-admission/revocation wording, and failed authority recovery. Review and tests establish local behavior, rather than provider or production acceptance.
 - All **204 local Markdown targets across 22 documents** and `git diff --check` passed. The credential-pattern check is a limited baseline, rather than exhaustive secret detection.
 
-The earlier 151-test result, its hosted run, and documentation commit `e049a9f` describe the preceding phone-action revision. No real Twilio/OpenAI call, native PostgreSQL multi-connection verification, or production deployment is established by this phase. Current hosted CI evidence is recorded separately when observed.
+Implementation commit `d8df6eb` passed its [GitHub Actions push run](https://github.com/SahilWikhe/IVR_POC/actions/runs/36775196176), including required checks, dependency audit, and all eight browser scenarios. This verifies the configured hosted workflow on that code revision; it does not verify branch protection or live-provider acceptance.
+
+The earlier 151-test result, its hosted run, and documentation commit `e049a9f` describe the preceding phone-action revision. No real Twilio/OpenAI call, native PostgreSQL multi-connection verification, or production deployment is established by this phase.
 
 ## Configure the optional phone sandbox
 
