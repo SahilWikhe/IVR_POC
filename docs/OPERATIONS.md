@@ -64,13 +64,14 @@ Alerts need an assigned owner and runbook: persistence failure, unknown vendor w
 | Database unavailable | Stop new writes; never claim a request/message was saved | Restore connectivity, reconcile completed actions, check jobs after recovery |
 | Reservation vendor unavailable before write | Explain limitation and offer a request with caller agreement | Circuit-break adapter; retry read probes within budgets |
 | Vendor write result unknown | Keep action unresolved; do not issue a second booking or fallback that may duplicate it | Reconcile by supported vendor evidence or assign staff resolution; record evidence |
+| Future booking waits beyond `execute_before` | Prevent first dispatch and record `EXPIRED_BEFORE_DISPATCH` only when no attempt was sent | Require fresh agreement/new linked work; if dispatch occurred or is uncertain, continue reconciliation instead |
 | Credential revoked/expired | Disable affected tenant capability and refuse stale worker actions | Rotate through approved secrets workflow, verify authorization, re-enable narrowly |
 | Worker lease expires | Permit a new worker only with correct fencing; retain durable result ledger | Ensure stale worker cannot commit a conflicting result or duplicate an unsafe write |
 | Inbox request becomes stale | Flag for restaurant staff; use only agreed escalation process | Record staff acknowledgment/follow-up, adjust staffing or expectations |
 | Security/tenant-isolation incident | Disable affected access/actions, protect evidence, involve responsible owner | Scope impact, rotate affected credentials if needed, assess notification obligations, verify fix |
 | Unexpected cost/toll abuse | Apply tenant/global budgets and configured fallback | Stop leaked sessions, inspect redacted events, verify provider billing evidence |
 
-Call termination cancels obsolete speech/reads but does not erase a committed request or an attempted vendor write. Reconciliation is durable and continues after a caller disconnects. Do not promise that an already attempted write was canceled merely because its network request was aborted.
+Call termination cancels obsolete speech/reads but does not erase a committed request or an attempted vendor write. A committed future booking still waiting for dispatch remains subject to its immutable approved `execute_before`, including after queue, journal, or rate-limit delays. Reconciliation is durable and continues after a caller disconnects or that deadline passes. Do not promise that an already attempted write was canceled merely because its network request was aborted or its start deadline expired.
 
 Before a future vendor write, a same-call cancellation can atomically win against first dispatch admission. Winning cancellation leaves a terminal no-dispatch outcome; losing the race returns pending/unknown status rather than a promise of cancellation. Disconnect by itself is not such a cancellation. Already saved request changes go to staff in the first release, and canceling an existing vendor reservation remains a separate disabled capability.
 

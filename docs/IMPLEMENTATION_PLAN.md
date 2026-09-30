@@ -58,6 +58,7 @@ Deliverables:
 
 - Simulate calls through the same domain/action service used by live audio. Use deterministic fixtures and distinguish scripted conversation tests from evaluations of a real model.
 - Implement approved hours/menu/FAQ answers, ambiguity clarification, date/time resolution, bounded escalation, message capture, and exact reservation-request readback.
+- Resolve relative dates from the relevant caller utterance's recorded start timestamp in the restaurant timezone; persist that reference and freeze the confirmed explicit date through delayed processing/retries. Test calls crossing midnight and new caller corrections.
 - Bind caller confirmation to the final structured payload, call, tenant/location, and expiry. Invalidate it when details change. Prevent caller-controlled tenant IDs or permissions.
 - Persist one request and its outbox event atomically; handle repeats and disconnects without losing or duplicating the request. Report saved request status only after commit.
 - Build a staff inbox with authenticated access, claim/assignment and optimistic concurrency, status updates, audit history, and callback details. Staff confirm in their existing system, record a reference/evidence, and record guest-notification status separately.
@@ -96,6 +97,7 @@ Deliverables:
 
 - Version domain contracts for capabilities, availability, reservation holds if supported, create/status reconciliation, normalized outcomes, credentials, location mapping, webhooks, and provider-specific extensions.
 - Implement shared request validation, live permission checks, idempotency, action ledger, confirmation binding, write fencing, timeout policy, circuit breakers, rate budgets, audit events, and reconciliation jobs.
+- Persist an immutable caller/staff-approved `execute_before` deadline for future booking writes, derived before approval from the strictest agreed wait, offer validity, and restaurant policy. Check it atomically at first dispatch admission and immediately before send after intervening waits. Test outage/queue/journal delay past expiry, terminal proven-unsent expiry with fresh agreement, and continued reconciliation for already-attempted writes.
 - Define atomic cancellation of a pending confirmed action versus first dispatch admission. Disconnect alone does not withdraw a committed action; an already dispatched action cannot be reported as canceled without authoritative evidence. Journal dispatch intents before sending and preserve recovery holds when outcomes cannot be reconstructed.
 - Build a conformance suite with deterministic fake responses: conflict, rate limiting, auth expiry, unsupported operation, accepted-then-timeout, webhook ordering, replay, and cross-tenant provider location mismatch.
 - Keep Resy/OpenTable adapters disabled with explicit unavailable states. Mock results are labeled synthetic and never selectable for a production call. Expose only reviewed capabilities to the agent.

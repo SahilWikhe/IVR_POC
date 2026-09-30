@@ -167,7 +167,7 @@ Staff claim review using a versioned lease. Before booking in their existing sys
 
 The confirmation boundary is a server-side domain service:
 
-1. Validate a canonical proposal and store a short-lived proposal ID, digest, revision, action kind, tenant/location/call, conversation turn, and expiry. Use a deterministic digest over a versioned canonical representation.
+1. Validate a canonical proposal and store a short-lived proposal ID, digest, revision, action kind, tenant/location/call, conversation turn, and expiry. Resolve relative dates using the server-recorded start timestamp of the relevant caller utterance in the restaurant's timezone; persist that reference timestamp/turn with the proposal. Do not use call start or later worker time. Freeze the resolved explicit date once read back and confirmed; a new relative-date correction uses its own utterance timestamp and requires a new readback. Use a deterministic digest over a versioned canonical representation.
 2. Generate the readback from the server's canonical proposal: full exact date with timezone, time, party size, name, callback details, and any material action detail. The controller binds the final delivered readback turn to its digest; interrupted playback is incomplete and requires another readback. Offer correction. A generic earlier “yes” cannot approve a later proposal.
 3. Conversation orchestration detects an explicit agreement associated with that readback turn; ambiguity, low-confidence transcription, interruption, changed details, or a request for staff cancels the pending confirmation. Repeat rather than assume.
 4. The model can propose a confirmation intent, but cannot manufacture an arbitrary reusable confirmation token. The service validates current call generation and turn linkage, issues/records a confirmation bound to the proposal digest, and exposes its ID only to the trusted controller.
@@ -198,8 +198,10 @@ An external mutation follows an operation ledger:
 ```mermaid
 stateDiagram-v2
     [*] --> PENDING: confirmed action committed with outbox
-    PENDING --> EXECUTING: first dispatch-admission CAS
+    PENDING --> EXECUTING: unexpired first dispatch-admission CAS
+    PENDING --> EXPIRED_BEFORE_DISPATCH: execution deadline reached
     PENDING --> CANCELLED_BEFORE_DISPATCH: current-call cancellation wins CAS
+    EXECUTING --> EXPIRED_BEFORE_DISPATCH: expired / proven never dispatched
     EXECUTING --> SUCCEEDED: verified authoritative result
     EXECUTING --> FAILED: verified rejection / no side effect
     EXECUTING --> UNKNOWN: timeout / ambiguous response / worker crash
@@ -211,6 +213,8 @@ stateDiagram-v2
 
 An expired worker lease after execution began is `UNKNOWN`, not permission to repeat the external write. Reconcile using a vendor-supported idempotency key, stable external reference, or verified lookup method. A retry after uncertainty requires an adapter contract that proves it is safe; otherwise stop automatic writes and queue staff review. New requests for the same business intent must check outstanding unknown operations, not merely create a new idempotency key.
 
+Every future live booking, including a staff-origin write, persists an immutable `execute_before` UTC instant with its approved intent. Derive it from the earliest applicable caller-agreed latest start, verified offer expiry, and restaurant maximum-wait policy; explain the bounded wait when seeking agreement. This is separate from confirmation-token expiry, job leases, and per-attempt network timeouts. The first dispatch-admission transaction requires database time strictly before `execute_before`. Recheck immediately before the network send, including after journal publication, rate-limit waits, or backoff. If time has expired and the current fenced owner can prove no attempt was sent, finish as `EXPIRED_BEFORE_DISPATCH`; do not extend the deadline or reset that operation. A fresh booking requires fresh agreement and a new linked operation after confirming the old one never dispatched. If any attempt was sent or may have been sent, expiry cannot prove failure or cancellation: keep its outcome/reconciliation workflow, including after call disconnect. This deadline limits starting a vendor write; it does not expire saved request inbox items or stop recovery of an already attempted write.
+
 For a future committed vendor action still `PENDING`, explicit cancellation from the same active call/current generation atomically competes with the worker's first dispatch-admission compare-and-set. Cancellation winning creates `CANCELLED_BEFORE_DISPATCH`, invalidates its queued write, and guarantees no dispatch. Admission winning closes this cancellation boundary, even if the caller hears no result yet. After admission, report pending/uncertain outcome and reconcile; do not claim cancellation, retry blindly, or issue an automatic vendor cancel. The worker rechecks current authorization/capability/revocation before admission. Abandoning a draft is different from changing an already saved request, which follows staff workflow in the pilot. Call disconnect alone preserves durably committed requests/actions.
 
 After dispatch admission and before any vendor network write, append minimal immutable dispatch-intent evidence to a restricted recovery journal outside the primary database's restore/rollback domain and wait for durable acknowledgement. No acknowledgement means no dispatch; missing or partial evidence leaves a hold for recovery review. Record resulting success/rejection/uncertainty in that journal as well as the operation ledger. This is not a distributed transaction, and a journalled intent is not proof a write executed or succeeded. Its purpose is to prevent restoring PostgreSQL from silently forgetting an already attempted write. A restored system quarantines jobs and disables write egress, replays journal/deletion evidence, and reconciles every possibly attempted operation before any redrive. The independent journal needs explicit privacy, encryption, access, retention, failure, and availability policies; see [operations](OPERATIONS.md) and [the data model](DATA_MODEL.md).
@@ -221,7 +225,7 @@ Before external dispatch, unavailable capability can fall back to an unconfirmed
 
 Availability is a read, not a lock. Offers expire, caller changes invalidate confirmation, and a vendor can reject a slot won by another caller. Revalidate where supported at submission and trust the authoritative create result. Do not construct local table inventory or assume a lock in PostgreSQL reserves vendor seating.
 
-When a call ends, execute only operations already durably submitted with valid authorization. Background execution rechecks emergency revocation and capabilities; an operation revoked before dispatch becomes blocked. If an external write has already started, reconcile and audit it even after revocation. Notify only through consented channels and configured staff procedures; an ended call is not permission to initiate another call or text.
+When a call ends, execute only operations already durably submitted with valid authorization and an unexpired execution deadline. Background execution rechecks emergency revocation and capabilities; an operation revoked before dispatch becomes blocked. If an external write has already started, reconcile and audit it even after revocation or execution-deadline expiry. Notify only through consented channels and configured staff procedures; an ended call is not permission to initiate another call or text.
 
 ## 7. Staff handoff and message flow
 
@@ -268,7 +272,7 @@ Proposed first-party API contracts, subject to implementation review:
 | Provider webhook | Adapter-specific public route | Vendor-documented verification, account binding, deduplication, body limits. |
 | Media | Adapter-specific WebSocket route | Provider authentication and bound stream grant; strict schema, frame limits. |
 
-These are platform API examples, not Resy, OpenTable, Twilio, or OpenAI endpoints. Use an OpenAPI document and shared schemas when implementing. Public staff errors avoid revealing cross-tenant resource existence. Internal action responses use an explicit discriminated outcome, such as `saved_pending_staff_review`, `confirmed_reservation`, `blocked`, `failed`, or `unknown`; future external delivery has its own outcome. Do not flatten them to a misleading `success: true`.
+These are platform API examples, not Resy, OpenTable, Twilio, or OpenAI endpoints. Use an OpenAPI document and shared schemas when implementing. Public staff errors avoid revealing cross-tenant resource existence. Internal action responses use an explicit discriminated outcome, such as `saved_pending_staff_review`, `confirmed_reservation`, `expired_before_dispatch`, `blocked`, `failed`, or `unknown`; future external delivery has its own outcome. Do not flatten them to a misleading `success: true`.
 
 All mutation contracts require stable idempotency keys, expected record versions when appropriate, a correlation ID, and validated limits. Reusing a key with a different canonical payload fails. HTTP retry safety and external side-effect retry safety are separate guarantees.
 

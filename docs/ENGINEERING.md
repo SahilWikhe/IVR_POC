@@ -30,6 +30,8 @@ An action must pass server-side tenant resolution, authorization, capability che
 
 Persist an action identifier and normalized input fingerprint before externally observable writes. Reusing an idempotency key with different input is an error. Scope keys to tenant, operation, and appropriate call/request context. Make uniqueness a database constraint rather than an in-memory convention. Return an existing outcome for an exact replay when permitted.
 
+Future live bookings need an immutable persisted `execute_before` bound to the approved intent, distinct from confirmation-token expiry and request timeouts. Derive it before approval from caller-agreed wait limits, offer validity, and restaurant policy. Gate first dispatch atomically and recheck immediately before send after intervening waits; proven-unsent expiry is terminal and requires fresh agreement/new linked work. Never extend the deadline on retry or treat an already-sent/uncertain write as expired without reconciliation. This does not expire saved request-only inbox items.
+
 The request-only MVP stores a reservation request directly in the authenticated staff inbox and queues internal follow-up events atomically. Its caller statement can report that the request was saved; it must not report a confirmed table, staff acknowledgment, or future external-channel delivery until the relevant evidence exists. Future provider reservations require a verified provider success and reference. A timeout after submission is an uncertain outcome and requires reconciliation, not an invented failure or an automatic second booking.
 
 Use deterministic mock scenarios for supported operations, unsupported operations, expired availability, conflicting capacity, duplicate invocation, rate limits, timeout-before-write, timeout-after-write, and credential expiry. No mock may suggest that an approved Resy or OpenTable integration already exists.
@@ -60,7 +62,7 @@ Use checked-in, ordered migrations. Prefer expand/backfill/contract changes so o
 
 ## Time, identifiers, and values
 
-Store event instants in UTC and record the restaurant's IANA timezone. Preserve the caller-confirmed local reservation date/time and timezone as well as a resolved instant when appropriate. Resolve phrases such as “tomorrow” using the restaurant's timezone and the call's captured reference time, not the worker's timezone or later execution time.
+Store event instants in UTC and record the restaurant's IANA timezone. Resolve phrases such as “tomorrow” using that timezone and the server-recorded start timestamp of the relevant caller utterance. Persist the reference timestamp and utterance ID with the proposal; do not use call-start time or the later parsing/worker clock. Preserve the caller-confirmed explicit local date/time, timezone, and resolved instant through retries and midnight changes. A relative-date correction uses its new utterance timestamp and requires a new readback/confirmation; delayed replay cannot reinterpret an existing agreed date.
 
 Reject impossible dates, detect nonexistent and repeated daylight-saving times, and clarify ambiguous times with the caller. Do not silently pick an offset or normalize a nonexistent time. Read back the exact calendar date, time, and relevant timezone before submission. Test midnight boundaries, holidays, overnight operating hours, and a daylight-saving change.
 

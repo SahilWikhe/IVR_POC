@@ -20,6 +20,9 @@ Use tests to check outcomes and invariants rather than mirror private implementa
 | Approved hours and menu question | Effective configured facts and holiday exceptions are used; missing/stale facts are escalated | Domain + conversation evaluation |
 | Allergy/cross-contamination question | No invented safety guarantee; documented information only and appropriate staff handoff | Conversation evaluation + voice |
 | Ambiguous party size/date/time | Clarification and exact local date/time readback before confirmation | Domain + conversation |
+| Relative date in a call crossing restaurant-local midnight | Resolve “tomorrow” from the relevant caller utterance's captured reference timestamp in the restaurant's IANA timezone, even when the call started on the previous date | Domain + conversation |
+| Delayed processing in another timezone | Stored utterance reference and confirmed local date/time, timezone and resolved instant survive queue delays, worker restarts and different host timezones without reinterpretation | Domain + worker |
+| Caller gives a new relative date or corrects the date after midnight | New proposal uses the new relevant utterance timestamp; changed details require a new exact readback and confirmation, while the previous confirmed date remains unchanged in its record | Domain + conversation |
 | DST gap or repeated local time | Reject/clarify ambiguity; preserve explicit IANA timezone and selected instant | Domain |
 | Payload changes after readback | Previous caller confirmation cannot authorize changed details | Domain + service |
 | Caller/model injects tenant or permissions | Server context remains authoritative; request fails closed | API + service security |
@@ -27,8 +30,14 @@ Use tests to check outcomes and invariants rather than mirror private implementa
 | Duplicate tool call or webhook | One durable action/request/message, with matching result | Database/service |
 | Persistence fails | No claim of a saved request/message | Service + conversation |
 | Disconnect after request commit | Staff request survives; no duplicate on reconnect/replay | Database + voice |
-| Disconnect after confirmed future action enqueue | Existing submission follows current authorization/reconciliation rules; disconnect alone does not withdraw it | Worker + voice |
+| Disconnect after confirmed future action enqueue | Existing submission follows current authorization, execution-expiry and reconciliation rules; disconnect alone does not withdraw it or extend its execution window | Worker + voice |
 | Cancel pending future action versus dispatch | One atomic winner; winning cancellation sends no write, losing cancellation cannot claim vendor rollback | Database/worker + conversation |
+| Future write waits in a backlog until its execution deadline | Atomic first-dispatch admission requires `now < execute_before`; an operation proven never dispatched expires as `EXPIRED_BEFORE_DISPATCH`, including at exact equality, and sends no vendor write | Database/worker + conversation |
+| Deadline passes after dispatch admission during journal, queue or rate-limit waits | Recheck immediately before send; a proven unsent operation expires without a vendor write, while uncertain dispatch evidence remains held for reconciliation | Database/worker + connector conformance |
+| Deadline derivation and retries | Immutable `execute_before` uses the strictest caller-agreed wait limit, applicable offer expiry and restaurant policy; a new attempt deadline, refreshed lease or job retry never extends it | Domain + database/worker |
+| Deadline passes after vendor write was sent or may have been sent | Reconcile accepted, timed-out and crash-uncertain writes after expiry; do not relabel them canceled/failed solely due to age or permit a second booking | Contract + database/worker |
+| Fresh agreement after a proven undispatched expiry | Fresh readback and approval create a new linked operation with its own deadline; the old operation stays expired with its original payload and deadline | Domain + database/service |
+| Staff-confirmed future write versus request-only inbox follow-up | Live staff-origin provider writes enforce execution expiry; expiration never silently deletes an unconfirmed inbox request or invents its staff-follow-up deadline | Service + worker + dashboard |
 | Two staff claim/fulfill a request | Conditional version/state checks allow one transition; loser receives conflict | Database + dashboard |
 | Staff records a booking | Staff-reported existing-system reference/evidence labeled with provenance; future provider-verified results distinguished, guest notification status remains separate | Service + dashboard |
 | No staff response within agreed target | Request becomes visibly stale; no invented caller promise or automatic confirmation | Worker + dashboard |
@@ -57,7 +66,7 @@ Use tests to check outcomes and invariants rather than mirror private implementa
 
 The request-only connector requires no vendor access and cannot report authoritative availability. Deterministic fake adapters must advertise simulation and remain unavailable to production tenants. OpenTable and Resy share conformance tests but each needs its own authorized sandbox evidence. An operation with unknown vendor support remains disabled, even if the mock implements it.
 
-Test structured contracts and capability declarations, location mapping, date/time formats, errors, auth expiry, rate limits, safe retry classes, idempotency support, write ambiguity, result/status lookup, webhook signatures and replays, reconciliation, and version changes. If a provider lacks idempotent write or reliable lookup, test the constrained behavior and escalation explicitly. Document unsupported capabilities instead of skipping failing tests until everything appears green.
+Test structured contracts and capability declarations, location mapping, date/time formats, errors, auth expiry, rate limits, safe retry classes, idempotency support, write ambiguity, result/status lookup, webhook signatures and replays, reconciliation, and version changes. Exercise the persisted `execute_before` boundary independently from the adapter's per-attempt `deadlineAt`, confirmation expiry and job-lease expiry. Use controlled clocks and synchronization to cover both atomic dispatch admission and the final pre-send check, including journal delays and a worker crash with uncertain dispatch evidence. If a provider lacks idempotent write or reliable lookup, test the constrained behavior and escalation explicitly. Document unsupported capabilities instead of skipping failing tests until everything appears green.
 
 ## Model and voice evaluations
 
