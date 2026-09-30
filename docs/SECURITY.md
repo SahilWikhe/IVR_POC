@@ -1,0 +1,264 @@
+# Security, privacy, and abuse prevention
+
+Status: proposed implementation requirements for the restaurant receptionist. This document describes controls to build and verify; it does not claim that a running service, security certification, vendor agreement, or legal assessment exists. The initial product records **reservation requests for staff review** and never reports that a table is booked. Authorized Resy and OpenTable integrations are future capabilities behind explicit enablement gates.
+
+Read this with [architecture](ARCHITECTURE.md), [implementation plan](IMPLEMENTATION_PLAN.md), [integration design](INTEGRATIONS.md), [contribution requirements](../CONTRIBUTING.md), and [agent instructions](../AGENTS.md). The root [security policy](../SECURITY.md) explains how to report a vulnerability privately.
+
+## 1. Security objectives and boundaries
+
+Protect each restaurant's configuration, messages, reservation requests, customer information, integration credentials, and call processing from other restaurants and unauthorized callers. Preserve the integrity of requests and transfers, limit abuse and spend, and give staff enough visibility to investigate failures without accumulating unnecessary caller data.
+
+The baseline comprises a React/Vite staff dashboard, a TypeScript/Fastify API and persistent voice gateway, a separate worker, PostgreSQL, approved phone and realtime voice providers, and tenant-specific connectors. A tenant is the security boundary; restaurant locations are subordinate resources. If an organization contains several locations, membership and location permissions must be explicit. Do not infer a shared tenant merely because restaurant names or telephone numbers match.
+
+Treat all caller speech, caller ID, model output, retrieved knowledge, imported vendor data, browser input, webhook input, and job payloads as untrusted. Provider authentication proves the event source under that provider's protocol; it does not establish the caller's identity. RLS is defense in depth for server authorization, not a substitute for it. A valid request is still subject to action permission, business-rule validation, confirmation, and abuse controls.
+
+### Trust boundaries
+
+| Boundary | Data crossing it | Required enforcement |
+| --- | --- | --- |
+| Caller / public phone network → phone provider | Spoofable caller ID and arbitrary speech | No caller-ID authentication; bounded calls and outbound destinations |
+| Phone provider → public HTTP and streaming gateway | Call events, delivery retries, audio streams | Vendor signature verification, authenticated stream binding, lifecycle and replay controls |
+| Gateway → voice model provider | Audio, minimum approved knowledge, tool definitions | Scoped service credential, retention/region review, bounded context, no direct privileged access |
+| Model / retrieved text → action service | Proposed tool names and arguments | Allowlisted schemas, authenticated call context, policy and confirmation checks |
+| Staff browser → API / identity provider | Sessions, configuration edits, customer records | OIDC validation, server authorization, CSRF controls, narrow origins and permissions |
+| API / worker → PostgreSQL | Tenant-scoped records and events | Transaction-local tenant context, RLS, composite ownership constraints, least privilege |
+| Outbox → worker / connector | Job references and external writes | Reload trusted records, repeat authorization, idempotency and reconciliation |
+| Connector → official vendor API | Minimum reservation data and credentials | Approved fixed endpoint, tenant-scoped secret, capability gating, response validation |
+| Application → logs, metrics, audit, support | Operational events | Redaction, pseudonymous references, bounded retention, restricted access |
+
+## 2. Threat model
+
+This is a design review register. Every control below needs evidence before its applicable release gate can close. Reassess it when adding a provider, location hierarchy, new tool, integration, or deployment region.
+
+| Threat / failure | Impact | Required control and verification |
+| --- | --- | --- |
+| Forged webhook or fabricated call / media event | Fake requests, data access, billable connections | Verify documented signatures before processing; reject unknown call identities; negative tests with modified payload, URL, token and call ID |
+| Valid callback replay, reorder, or duplicate | Duplicate messages or transfers, corrupted lifecycle | Provider event IDs where available, persisted idempotency, valid transition rules, deduplicated effects; retain legitimate delivery retries |
+| Stream attached to another tenant's call | Audio or customer disclosure | Server-owned call mapping and stream binding; short-lived admission credential if provider supports it; reject call/stream mismatches and concurrent replacement |
+| Tenant ID supplied through URL, token claim, job, tool, or object ID | Cross-tenant reads/writes and credential theft | Validated membership and resource ownership; RLS plus composite foreign keys; tenant-crossing API and worker tests |
+| Caller or FAQ says “ignore rules,” invents a tool, or claims to be staff | Unauthorized side effect or data disclosure | Model proposes actions only; server action allowlist and permission checks; injection fixtures for speech and retrieved text |
+| Model changes details after caller confirmation | Wrong request or booking | Immutable canonical confirmation snapshot bound to call/action/version; reject stale or changed arguments |
+| Timeout after external write, duplicate worker, process crash | Duplicate reservation / uncertain outcome | Stable idempotency key, pending/unknown states, vendor reconciliation; no blind second write |
+| Arbitrary transfer number or forwarding loop | Toll fraud, expensive loops, call loss | Restaurant-approved destinations, outbound allowlist, hop and duration limits, independent fallback route |
+| Continuous calls, silence, long prompts, expensive tools | Denial of service or unbounded spend | Layered quotas, bounded session/token/tool use, tenant and global budget circuit breakers |
+| Malicious dashboard content or imports | XSS, stored injection, SSRF | Text rendering, sanitization where HTML is necessary, strict schema validation; server-fixed integration endpoints |
+| Stolen staff session or elevated role assignment | Exposure of customer data, unsafe configuration | MFA for privileged accounts, secure session lifecycle, server permission matrix, step-up checks and audited changes |
+| Credential leakage through errors, logs, or model prompts | Vendor takeover and tenant data exposure | Vault-based secret storage, dedicated credentials, proactive redaction, secret scanning and rotation |
+| Compromised dependency, CI token, or agent suggestion | Supply-chain execution or deployed vulnerability | Lockfile installs, pinned CI actions/images, limited tokens, review and release gates |
+| Excessive recording / uncontrolled biometric collection | Privacy harm and legal exposure | Raw recording off; minimum collection; region-aware disclosure review; voiceprints deferred and separately gated |
+| Staff cannot receive a request despite a successful save | Unhandled customer expectation | Staff inbox is durable authority; transactional outbox and delivery status; alerts and explicit request-only wording |
+
+Residual exposure includes social engineering, false or misleading caller information, provider outages, data processed by approved providers, and legitimate authenticated staff misusing access. Reduce these through least privilege, constrained workflows, training, monitoring, and incident handling; do not describe them as eliminated.
+
+## 3. Public ingress and live call security
+
+### Phone callbacks
+
+- Select a provider only after reviewing its current signature and delivery documentation. Implement its official verification algorithm or maintained verifier; do not invent an HMAC header format.
+- Verify against the exact public callback URL and the raw bytes or parsed fields required by that algorithm. Configure the public origin on the server. Do not construct a signed URL from arbitrary `Host`, `Forwarded`, or `X-Forwarded-*` input. Trust only the deployed proxy chain and document how it preserves verification inputs.
+- Set strict body-size limits, content-type rules, route-specific parsers, and request timeouts. Authentication must precede business effects; parse only the minimum needed for verification. Constant-time comparison should come from the vetted verifier.
+- Where the provider signs timestamps/nonces, enforce documented clock tolerance and replay handling. Where it does not, do not claim signatures expire: use provider event identity, call lifecycle, and idempotency to prevent repeated effects. Expect valid retransmissions.
+- Validate the called platform number against a server-owned, unique, active number-to-tenant/location mapping. A request's free-form tenant field or caller-supplied number does not choose the tenant. Verify ownership and restaurant authorization when provisioning or changing number forwarding.
+- Preserve caller ID only as contact metadata. Hide it from ordinary logs and do not use it as an account credential. Prefer a verbally confirmed callback number for requests and record its source.
+- Acknowledge validated events within the provider timeout after durable acceptance. Deferred tasks run from the outbox. Never acknowledge a saved request to the caller until its database transaction commits.
+
+### Persistent media connections
+
+- Require TLS (`wss`) and a provider-supported authentication mechanism on connection admission. The integration contract must explain whether the handshake is signed, uses an authenticated header, or requires a server-generated admission token in supported stream metadata. An unguessable call ID alone is insufficient.
+- If a token is necessary, make it short-lived, single-use for admission, scoped to a call/provider/tenant and allowed stream purpose, with a server-side consumed record. Do not put reusable service credentials in a URL. Redact any provider-required admission metadata from access logs and diagnostics.
+- Resolve the call's tenant from the authenticated call record. Match provider account, call ID, stream ID, and expected call state; validate the initial stream message before forwarding audio. Subsequent messages cannot switch tenant or call context. Limit active media streams per call and use a deliberate replacement policy after disconnects.
+- Reject unsupported message types, audio encodings, oversized frames, excessive frame rates, and invalid lifecycle sequences. Limit connection lifetime, idle time, audio queue depth, and memory per stream. Apply backpressure and close connections cleanly on tenant suspension or call termination.
+- Do not pass a public model API key to the browser or phone provider. The gateway owns its provider connection and service credentials.
+- Distinguish a temporary interruption from a new call. Recover only through an authenticated, expected stream transition; a reconnect must not repeat an already committed tool action.
+
+## 4. Identity, permissions, and tenant isolation
+
+### Staff identity and sessions
+
+Use a managed OIDC identity provider. Prefer an API-mediated authorization-code flow with PKCE and a server-side session for this dashboard. If the implementation chooses a SPA bearer-token flow instead, document the altered token/XSS risk and validation design before shipping it; do not combine partial implementations of both flows.
+
+- Validate `state`, `nonce`, PKCE, exact issuer/audience and redirect URI, token expiry, allowed signing algorithms, and JWKS keys. Use a maintained OIDC library, cached keys with bounded refresh, and safe failure on key errors. Never trust decoded claims before verification.
+- Session cookies must be `Secure`, `HttpOnly`, and `SameSite` appropriate to the deployment and OIDC redirect flow, with no broad domain. Prefer the `__Host-` prefix. Rotate the session on login or privilege change, enforce idle and absolute expiry, revoke sessions on membership removal and logout, and avoid bearer tokens in persistent browser storage.
+- Require MFA for owners, administrators, production support, and integration/configuration management; consider MFA for all staff. Re-authenticate or step up before high-impact role, secret, transfer-destination, or deletion changes. Privileged access expires and is audited.
+- Use explicit invitation acceptance, verified membership assignment, and controlled ownership transfer. Email domain or a caller's statement does not imply restaurant membership.
+
+### Proposed permission matrix
+
+| Principal | Allowed purpose | Restrictions |
+| --- | --- | --- |
+| Restaurant owner | Membership and location configuration, integration enablement, operational access | Only own tenant; step-up for sensitive settings; cannot grant platform operations privileges |
+| Restaurant administrator | Approved knowledge, routing, request operations | No owner transfer or platform access; integration management needs an explicit permission |
+| Restaurant staff | Read and resolve assigned location inbox; limited caller detail access | No secret retrieval, role changes, arbitrary export, or cross-location access by default |
+| Read-only reviewer | Approved operational metrics and redacted outcomes | No mutation or default access to caller contact details |
+| Call action service | Current call's allowed tools | Server-bound tenant/location/call; no staff role or unrestricted lookup |
+| Background worker | Process authorized persisted jobs | Per-job tenant context; narrowly scoped DB operations and connector access |
+| Platform operator | Service maintenance through separate operational identity | No implicit customer-content access; documented, time-limited support access with audit |
+
+Implement permissions as named operations (for example `requests.resolve` or `integrations.manage`) checked by the server on each route/tool/worker operation. Do not rely on UI hiding or generic “authenticated” guards. Tests must cover revoked membership and suspended tenants. Cache membership and policy only with bounded expiry plus an invalidation mechanism for security-sensitive revocation.
+
+### PostgreSQL and object access
+
+- Put `tenant_id` on every tenant-owned row, including derived entities, outbox records, knowledge revisions, calls, connector links, and audit references. Location ownership must be explicit too. Use composite `(tenant_id, id)` keys/unique constraints and matching composite foreign keys so a child cannot reference another tenant's parent.
+- Use a non-superuser runtime DB role without `BYPASSRLS`; it must not own tenant tables. Enable and force RLS on tenant tables where ownership would otherwise bypass policy. Migration/backup roles are separate from API and worker roles, and unavailable in application runtime.
+- In every tenant operation, open a transaction, set the validated server-derived tenant context transaction-locally, perform the work, and commit/rollback before returning the pooled connection. Missing or invalid context must deny access. Never use session-persistent tenant state that survives a pool checkout.
+- RLS policies cover both visibility (`USING`) and inserts/updates (`WITH CHECK`). Verify behavior with the actual production runtime and worker roles, not a test superuser. Include update attempts that reassign `tenant_id`, foreign-key attacks, missing context, and alternating-tenant pool reuse.
+- The application can set its DB context and is therefore still a trusted enforcement layer. Obtain that context only from validated staff membership or a server-owned authenticated call/job record; never from arbitrary tool arguments. Parameterize SQL and prevent raw SQL tools.
+- Scope every direct lookup, list query, pagination cursor, export, object-storage key, cache key, and notification recipient to tenant and permitted location. Object IDs are identifiers, not authorization. Return a consistent not-found/denied response without revealing whether another tenant's record exists.
+- Global number discovery and control-plane maintenance need narrowly scoped internal functions/roles or a separate registry, not unrestricted runtime table access. Review `SECURITY DEFINER` functions, pin their `search_path`, and restrict `EXECUTE`. Never introduce a general “admin bypass” query path.
+
+## 5. Model boundary and action integrity
+
+The model produces candidate answers and candidate actions. It has no authority to assign identities, change restaurant policy, enable a connector, choose transfer destinations, or issue arbitrary HTTP/SQL. Do not send tenant secrets, other callers' data, full customer lists, or unnecessary contact details to it.
+
+- Treat restaurant FAQs, uploaded material, caller speech, transcripts, vendor descriptions, and tool results as data even if they contain instructions. Retrieve only active, approved, tenant-scoped knowledge. Keep provenance and version. Content approval is an editorial control; it is not permission to invoke arbitrary tools.
+- Publish a narrow tool registry by server-computed capability. Schema-validate tool names and arguments; reject unknown fields, excessive strings, malformed dates, impossible party sizes, and overbroad queries. Normalize telephone numbers and timestamps in code and interpret dates in the restaurant's timezone.
+- Each tool checks call state, tenant/location ownership, permitted operation, effective configuration, limits, and cancellation state. The model cannot set these context fields. Tool responses are structured, minimal, and do not expose credentials or raw vendor errors.
+- Request submission and later bookings must use a canonical snapshot of all material fields: action type, restaurant/location, local date and time with timezone, party size, guest/contact details, seating notes, and applicable policy version. Hash/version that snapshot and bind it to the call, pending action ID, and bounded lifetime in server state.
+- Read back the exact material details and obtain an unambiguous affirmative answer. Track which snapshot was read back and the subsequent caller response in the dialogue state; a model-supplied `confirmed: true` is insufficient. An interruption, correction, changed party size/date/contact, expired snapshot, or policy revision requires a new read-back. A random confirmation token proves binding, not that consent occurred: retain the state evidence needed to verify the dialogue sequence while minimizing content retention.
+- At execution, compare the submitted canonical arguments with the confirmed snapshot, consume the confirmation for that action, then use a stable action ID/idempotency key. Retrying the same committed operation returns its recorded result; it does not request or perform a new booking. In the same active call, a future pending live action can be canceled by a server-authorized compare-and-set competing with first dispatch admission; winning cancellation guarantees no dispatch, while losing the race returns pending/unknown status. Disconnect alone preserves a committed action. Changing or withdrawing an already saved request goes through staff in the MVP; canceling an existing vendor reservation remains a separate disabled capability.
+- For the MVP, persist a **request**, return its request reference, and explicitly say it is awaiting restaurant confirmation. Staff workflow status must not imply live vendor inventory or confirmed seating. A future booking confirmation requires a verified successful vendor result and reference.
+- Existing-reservation lookups, cancellations, customer-history retrieval, payment, or account changes are disabled in the MVP. Each future sensitive operation needs its own caller verification and permission policy; a name, caller ID, voice match, or reservation reference alone may not suffice. Minimize information revealed before verification.
+- Allergy/cross-contamination questions go to staff; approved dietary facts do not justify a safety guarantee. Never infer emergency handling capability. Configure escalation language and staff/fallback routes appropriate to the pilot.
+
+## 6. Reliable workers, outbox, and vendor boundaries
+
+- Commit the request/message, action result, idempotency record, and delivery outbox event atomically. Queue delivery occurs afterward. A successful queue publish without a database commit does not mean the request exists.
+- Outbox payloads contain minimum identifiers and event version, not secrets or full transcripts. On execution, reload the trusted record and bind tenant/location from it; do not treat a queue-provided tenant, destination, or role as authorization. Check action permission, connector binding, destination approval, suspension, and revocation again before a side effect.
+- Cross-tenant job discovery needs a separate narrow dispatcher role/function that returns bounded job/tenant references without caller content. The worker must validate that association against a trusted claim/locator before entering its tenant-scoped transaction; an arbitrary queue tenant hint cannot select another tenant's record. Review and test this exceptional discovery path explicitly rather than granting the normal worker `BYPASSRLS`.
+- Claim jobs with a bounded lease, track attempts, and handle duplicate delivery, crash-before/after-side-effect, expired lease, and out-of-order events. Use idempotent consumers. Dead letters and reconciliation dashboards must remain tenant-scoped and access-controlled.
+- Revocation blocks new external mutations; it must not discard saved requests or pretend an already-dispatched write failed. Permit narrowly scoped outcome reconciliation and audit for in-flight writes after suspension/revocation, without issuing another create/change/cancel action. Define the credential access needed for reconciliation and escalate to staff if revocation prevents a reliable lookup.
+- Manual staff fulfillment has the same uncertainty boundary: record `IN_FULFILLMENT` before staff book through an external system. Expiry of that staff claim, loss of a dashboard session, or an interrupted update moves the item to `NEEDS_RECONCILIATION`, not back into an unclaimed booking queue. Require authorized staff to verify and record existing-system evidence before reopening or resolving it. The platform cannot technically fence booking clicks in a third-party website; visible holds, staff procedures, and reconciliation are required to prevent a second staff booking.
+- Minimize worker DB privileges and isolate integration credential access. A worker needs the current job's tenant, not unrestricted customer enumeration. Check authorization in the worker even if the API checked it at enqueue time.
+- Enable Resy/OpenTable capabilities only after official API/partner access is approved, restaurant authorization is recorded, applicable terms are reviewed, and sandbox/contract tests pass. No scraping, undocumented endpoints, shared restaurant login credentials, or fabricated API assumptions.
+- Default both adapters to disabled/unavailable. Capability discovery is server-owned and distinguishes supported, configured, authorized, healthy, and temporarily disabled. Do not expose a create/modify/cancel tool because a connector name exists in configuration.
+- Outbound vendor hosts/base URLs are code-controlled and allowlisted per supported environment. Tenant-configurable web URLs are not API destinations. Disable automatic redirects or validate every hop; limit timeouts/response sizes, prohibit local/private/link-local destinations, and use constrained egress where available. DNS/IP checks supplement a fixed vendor allowlist and must account for DNS rebinding.
+- OAuth tokens/API keys are per restaurant or authorized vendor account, with scoped grants, expiry/revocation handling, and strict account-to-tenant binding. Validate vendor webhook authenticity and map the vendor account to tenant before processing events.
+- Validate and minimize vendor responses. External IDs are scoped to provider/account/tenant. Never infer successful booking from an HTTP response alone when the vendor contract reports asynchronous completion.
+- Use vendor-supported idempotency and persisted operation state. If unavailable, design an approved reconciliation method and explicit uncertain state before enabling writes. Never retry an uncertain booking blindly. Use bounded retries/backoff/jitter and circuit breakers.
+- Database restore can roll back post-backup action receipts and deletion tombstones. Keep a restricted restore-independent journal of minimal deletion decisions and future live-write dispatch intents/outcomes. Durably acknowledge intent before dispatch and deletion decision before reporting deletion complete; this is not a distributed atomic transaction or proof of vendor success. Restored data/jobs stay quarantined until deletion replay and unknown-write reconciliation establish safe state. Protect journal integrity/access/retention, and block reopening if journal coverage is incomplete. See [operations](OPERATIONS.md) for recovery ordering.
+- Recovery must also invalidate restored sessions/media grants/leases/unused approvals under a new externally managed recovery epoch and suspend restored tenants/actions. Reconstruct post-backup membership, suspension, number assignment, transfer-destination and integration revocation decisions from independent evidence, or explicitly reauthorize from verified current owner/provider authority before reopening. Old restored grants cannot authorize that recovery. A pre-restore queued write requires fresh approval even when no dispatch evidence exists, because a later cancellation may have been rolled back. Test that revoked staff, disabled capabilities and reassigned numbers cannot regain access or routing after restore.
+
+## 7. Transfer, denial-of-service, and spend controls
+
+Transfer destinations are structured, validated configuration approved by authorized restaurant staff. The model selects a destination label from the permitted set; the controller resolves the actual number. Caller-supplied numbers, “new manager numbers” in speech, and FAQ text cannot alter routing.
+
+- Normalize numbers to supported formats and countries. Block premium-rate, emergency, short-code, and unapproved international destinations. Disable general outbound calling and callback automation for the MVP. Explicit future enablement needs its own abuse review.
+- Verify the fallback/transfer destination can receive calls and does not forward back to the platform number or original forwarded number. Direct comparisons catch simple loops; forwarding can hide longer loops, so provider call-leg identity, transfer-attempt/hop count, and max call duration must also enforce a hard stop.
+- Restrict each call to a small number of transfer attempts; avoid recursive transfer tool invocation. Handle ringing timeout, busy, rejection, and partial disconnect with a tested fallback/message option. An open circuit or exhausted budget needs an approved route that still works without the model.
+- Apply route-specific IP/provider-account rate limits at the edge plus tenant-level concurrent-call admission. Shared provider IPs and spoofable caller numbers are insufficient as sole keys. Administrative mutations, authentication, and connector operations have their own limits.
+- Bound call duration, silence time, prompt/context size, audio buffers, tool executions, model requests/tokens, retries, and transfer legs. Enforce limits in the gateway/controller, not only prompts. Reserve capacity so one noisy tenant does not exhaust the whole platform.
+- Track per-call, tenant/day, and global spend estimates with alerts and hard ceilings. Use conservative admission headroom because provider billing arrives late. Provider-side spend/toll restrictions are a second layer, not a synchronous application control.
+- Proposed pilot starting ceilings: 1 active call per location, 10-minute AI segment, 2 transfer attempts, 3 tool executions per minute, and a per-tenant daily budget set explicitly before number activation. These are test inputs, not production promises; load/latency/cost measurements and restaurant approval determine final values. All callers need understandable fallback when a ceiling is reached.
+
+## 8. Web dashboard, API, and secrets
+
+- Use TLS throughout externally reachable routes; configure HSTS after validating the deployed domain. Terminate private service traffic securely and avoid publicly exposing DB, job administration, health internals, or debug endpoints.
+- For cookie sessions, protect state-changing requests with CSRF tokens and Origin verification; SameSite cookies alone are insufficient. Permit only explicit dashboard origins, methods, and headers in CORS. Never reflect arbitrary origins with credentials. WebSocket browser endpoints additionally check Origin; Origin alone is not provider stream authentication.
+- Do not render caller or imported content through unsanitized HTML. Use React text escaping, restrictive CSP (including `frame-ancestors`), safe URL handling, and reviewed sanitization if rich text is needed. Disallow executable markup and user-controlled script URLs. Avoid stack traces and sensitive details in client errors.
+- Enforce server body limits, schema validation, pagination/limit ceilings, parameterized queries, predictable errors, and request timeouts. Restrict file imports by type/size and safe parser; avoid external fetches initiated from uploaded references. Validate settings semantically, not only by TypeScript type.
+- Store secret values in a managed vault/KMS-backed secret system, accessible only to the service role that needs them. Store tenant ownership and vault references in PostgreSQL. Never store plaintext integration secrets in frontend bundles, fixtures, committed `.env` files, model context, queue payloads, or audit records.
+- Use separate environments, credentials, provider accounts and databases where practical. Test data must be synthetic or approved anonymized exports. Do not point local agent runs at production secrets or real caller records.
+- Use workload identity/short-lived credentials where supported; scope API keys to required operations and rotate on a documented schedule and after suspected exposure. Show only masked credential status in the dashboard, not the stored secret. Define revocation behavior for in-flight calls and worker jobs.
+- Redact at log creation and in error/reporting integrations. Denylist common credential fields and auth headers, plus allowlist safe operational event fields. Test redaction using synthetic secrets and phone numbers. Redaction does not justify retaining arbitrary payload dumps.
+
+## 9. Privacy, disclosure, and retention
+
+Data categories include caller contact details and request content; call/session metadata; audio processed live by providers; restaurant configuration; staff identity/membership; integration tokens; and pseudonymous operational events. Even a phone number hash or pseudonymous call reference can remain personal data when linkable. Treat access, deletion, retention, and provider processing accordingly.
+
+### Collection and provider settings
+
+- Default raw call recording and persisted full transcripts to **off**. Live audio/transcription may still be processed by phone and model providers; disable avoidable retention/training features where the vendor supports contractual settings and disclose remaining processing. “No recording” does not mean “no external processing.”
+- Collect only request/message fields needed for staff follow-up. Prefer structured outcomes over conversation histories. If short staff summaries are enabled, restrict their content, access and lifetime; do not put sensitive incidental conversation into an unrestricted summary.
+- Do not solicit payment-card data, account passwords, government identifiers, or unrelated health information. If a caller volunteers sensitive material, avoid repeating or persisting it and follow the approved staff-escalation procedure. Structured notes must not turn incidental conversation into a permanent customer profile.
+- Identify the product as an AI receptionist in the greeting. Determine the pilot's caller regions, restaurant jurisdiction, applicable recording/consent rules, privacy notices, and business-vendor roles before activation. Recording, transcript storage, automated decision rules and biometric processing need separate review. Do not assert a universal consent rule or legal compliance.
+- Verify phone/model provider processing locations, retention, deletion options, training use, subprocessors, breach commitments, and contractual/data-processing terms. Select a deployment region only after checking all linked providers; keeping PostgreSQL in one region does not establish end-to-end residency.
+- Route customer-data export/deletion requests through verified restaurant/platform procedures. Avoid revealing whether a telephone number has historical records before authorization. Handle records held by external reservation systems according to the approved connector contract and responsibilities.
+
+### Proposed initial retention values
+
+These are provisional engineering defaults for review with the pilot restaurant and appropriate privacy/legal advisers. They are not validated legal requirements. Document any override, purpose, approver, and deletion effects before retaining more data.
+
+| Category | Proposed default | Implementation / qualification |
+| --- | --- | --- |
+| Raw audio / full stored transcript | Disabled; no application persistence | Configure provider retention separately; ephemeral buffers released after call termination |
+| Request/message contact data and approved short summary | Delete 30 days after closure, with 90-day maximum from creation | Warn staff before deletion of unresolved records; active follow-up must not silently become indefinite retention |
+| Call outcome metadata (no contact details or free text) | 30 days | Pseudonymous call and tenant references, timings, status and error class only |
+| Redacted application/error logs | 14 days | No audio, caller text, phone numbers, names, tokens or vendor payloads |
+| Security/authorization audit events | 90 days | Minimum event fields; tenant/resource IDs remain restricted and may be linkable |
+| Temporary action/confirmation state | Expire at call end or short action timeout | Store required finalized action evidence only in the authorized request/action record |
+| Idempotency/deduplication records | At least the documented delivery/retry/reconciliation horizon | Minimize to action keys/status; final period depends on selected provider and connector contracts |
+| Encrypted backups | Target maximum 35 days | Verify managed backup/PITR settings and access; deleted data can persist until expiry |
+
+Implement scheduled deletion with monitoring and evidence of completion for primary storage, indexes/caches, object storage, outbox/dead letters, and supported provider data. Do not claim immediate removal from immutable backups: limit access and lifetime and reapply deletion tombstones after restoration. Document exceptions such as a narrowly scoped incident/legal hold, responsible approver, end date, and customer notification obligations. Retention behavior is a tested release requirement, not just a settings page.
+
+Separate contact/content deletion from minimal action evidence. A deletion job must not erase the durable idempotency outcome, fulfillment/reconciliation hold, or pseudonymous audit/tombstone while the approved deduplication/reconciliation horizon still requires it. Retain only justified operation identifiers, state, safe evidence references and expiry; remove guest names, telephone numbers, free-text notes and canonical payloads according to their policy. A pending uncertainty hold is not permission for indefinite contact-data retention. Resolve conflicts through an explicit reviewed policy and warn/escalate unresolved work before contact data expires.
+
+### Future voice recognition and synthetic-voice signals
+
+Both are excluded from the initial implementation and require an explicit feature/region gate.
+
+- Voiceprint enrollment requires a verified identity, freely given explicit opt-in where applicable, clear purpose/retention/processor disclosures, an equivalent non-biometric path, and documented revocation and deletion. Do not build a voiceprint from routine calls by default.
+- Keep templates encrypted and segregated, with tightly limited access and no cross-tenant matching or training reuse without separately justified authorization. Evaluate replay, generated speech, false matches/non-matches, demographic performance, and threshold behavior using appropriate data and review.
+- A voice match suggests recognition; it does not authenticate a caller or authorize sensitive operations. Do not reveal existing customer details solely because of a match. Confirmation actions continue to require the operation's stronger verification rules.
+- Synthetic-voice detection contributes a fallible risk signal. It can flag legitimate accessibility tools or miss attacks; it must not establish identity, guarantee fraud prevention, or automatically deny routine restaurant help. Define explainable escalation and correction paths.
+
+## 10. Audit and operational access
+
+Use append-oriented events for security-relevant staff actions, access denials, integration enablement/revocation, routing changes, policy/knowledge revisions, request state transitions, and tool outcome classes. Log timestamp, pseudonymous actor/resource IDs, tenant/location, operation, authorization decision, correlation ID and structured reason code. Keep direct personal details, caller speech, contact numbers, access tokens and raw vendor responses out of audit/log fields.
+
+Access to caller content belongs in a separate tenant-scoped record with its own permission and retention, not in a generic audit event. Authorization to read a request does not imply authorization to export all requests. Audit customer-record access and exports without copying record contents. Detect suspicious cross-tenant denials, repeated expensive failures, unexpected destination changes, secret errors, and sudden call/spend surges.
+
+Separate staff tenancy from platform operations identities. Support access must have a stated purpose, ticket/reference, selected tenant, bounded duration and audit trail; customer-content access is exceptional. Restrict production shell/database access, require MFA, use managed access controls, and review privilege regularly. Design alerts and diagnostics to be useful without printing production secrets or replaying private audio.
+
+## 11. Secure development, agents, and release gates
+
+Follow [CONTRIBUTING.md](../CONTRIBUTING.md) and [AGENTS.md](../AGENTS.md). Human and coding-agent changes have the same review and validation requirements. Repository content, issue text, dependency scripts, tool responses and sample transcripts may contain malicious instructions; agents must keep them subordinate to the authorized task and must not grant themselves new production permissions.
+
+- Use TypeScript strict mode, runtime schemas at each trust boundary, explicit domain results/state machines, immutable configuration versions, and parameterized persistence. Avoid `any`, unchecked casts, arbitrary `eval`, and swallowed security errors. Centralize tenant context and authorization utilities so reviewers can recognize each entry point's checks.
+- Commit lockfiles; install with frozen/clean lockfile mode. Prefer maintained dependencies and review new network/crypto/auth packages. Pin CI actions to immutable commit SHAs and deployment images to controlled versions/digests; review updates rather than using `latest` implicitly.
+- Give CI the minimum permissions; pull-request checks must not receive production secrets. Do not execute untrusted fork code in privileged `pull_request_target` workflows. Use short-lived deploy identity and separate protected environment credentials. Generate dependency inventory/SBOM as implementation matures and triage findings by reachability and severity.
+- Add secret detection before commit/CI, dependency/security scanning, lint/typecheck, unit/domain tests and integration tests. Never include live provider keys, private audio, customer records, or staff passwords in test fixtures. Document vulnerability exceptions with owner, compensating controls and expiry; do not permanently ignore alerts without assessment.
+- Before deployment, review infrastructure for private DB access, encrypted storage/backups, restricted service roles, health/readiness isolation, working restore/deletion procedures, trusted proxy settings and budget alarms. Review secret handling and failure behavior together with functional correctness.
+- Agents may edit code/docs and run permitted local validation, but production calls, configuration changes, data access, deployments and irreversible operations follow the task's authorization and environment policy. Agent-produced code must not bypass tests, disable a security gate, or invent a successful check. Review diff scope and evidence before merging.
+
+### Required test families
+
+| Area | Tests that establish meaningful evidence |
+| --- | --- |
+| Ingress | Forged/modified signature; public-URL/proxy mismatch; valid retry; duplicate/reordered callback; unknown call ID; oversized input |
+| Media | Unauthorized stream; expired/consumed admission token; tenant/call mismatch; duplicate stream; unexpected events; flood/backpressure and disconnect |
+| Tenancy / permissions | Two tenants and two locations across every CRUD/list/export/tool/worker path; revoked membership; RLS actual-role enforcement; pool reuse and foreign-key attacks |
+| Agent actions | Caller/FAQ injection; fabricated confirmation; changed snapshot; interrupted confirmation; cancel/race; unsupported tool/capability; allergy escalation |
+| Reliability | Crash before/after commit and publish; duplicate job; delivery failure; unknown external write result; idempotent retry; manual `IN_FULFILLMENT` claim expiry remains held for reconciliation; bounded dead-letter behavior |
+| Transfers / abuse | Caller-provided destination rejected; configured number loop; forwarded hidden loop bounded; unanswered route; hard duration/concurrency/spend ceilings |
+| Browser / API | Session rotation/revocation; OIDC validation failures; CSRF; forbidden origin; stored-script strings rendered inert; rate/body limits |
+| Privacy / operations | Log/exception redaction; no default audio/transcript persistence; retention/deletion including restore; credential revocation; authorized support access |
+
+### Deployment gates
+
+1. **Local prototype:** Only synthetic data and mock providers. Schema/authorization/domain tests pass. Security-relevant decisions are documented; request-only wording and disabled connector capabilities are tested.
+2. **Restricted test number:** Provider authenticity and stream admission pass real-provider tests; transfer/fallback and loop limits verified; tenant-isolation integration tests pass; per-call/tenant spend ceilings enabled. No uncontrolled public forwarding.
+3. **Restaurant pilot:** Approved knowledge/routing, staff inbox ownership, AI/privacy disclosures, provider contracts/regions/retention, MFA/roles, incident contacts, deletion/backup behavior, monitoring, and restaurant authorization are recorded. Review all high/critical findings and unresolved medium findings that expose customer data or authorize side effects. No high/critical unresolved exploit path may ship without a documented, time-bounded risk decision by the accountable product/security owner.
+4. **Official reservation writes:** Approved vendor access and account binding, exact confirmation, idempotency/reconciliation, uncertain-result wording, and contract tests pass. Ordinary creation requires the approved contact and confirmation policy; it does not expose existing customer records. Sensitive lookup/change/cancel operations require a separate operation-specific verification grant, and restaurant policy may require additional verification for creation. Audit, disable/revoke, pre-dispatch cancellation, and restore-journal recovery paths are tested. A provider SDK compiling is not enough to open this gate.
+5. **Biometrics or broader verticals:** Separate threat/privacy review and operation-specific acceptance criteria; do not inherit a restaurant pilot's conclusions automatically.
+
+Until owners are assigned, the repository maintainer is responsible for tracking these gates. Missing owners or a missing decision are unresolved dependencies, not implicit approval.
+
+## 12. Incident response and open dependencies
+
+Write and exercise a runbook before the pilot. Cover: detection and triage; who can disable new calls/tools/connectors; an independent approved phone fallback; credential/session revocation; evidence preservation with minimal data; tenant impact assessment; restaurant and provider contacts; legally required notification decisions; restore/reconciliation; and a documented corrective-action review. Do not let an emergency diagnostic dump introduce more caller-data exposure.
+
+On suspected compromise, contain the affected capability/tenant/service without deleting the only forensic evidence. Rotate exposed credentials, invalidate affected sessions/admission tokens, suspend external writes when outcome integrity is uncertain, inspect tenant access and outbound calls, and reconcile pending actions before restart. Distinguish service interruption from confirmed personal-data compromise. Notifications require verified facts and designated responsibility; never promise a universal legal deadline.
+
+The following dependencies remain open before implementation/activation:
+
+| Dependency | Evidence needed / residual risk |
+| --- | --- |
+| Phone and realtime providers | Documented callback/media authentication, call transfer/forwarding behavior, concurrency, quotas, billing, data processing and retention; their outages remain an external risk |
+| Pilot restaurant and caller regions | Approved workflow, staff availability/fallback, disclosure language, retention values, controller/processor responsibilities and review of applicable law |
+| Identity/deployment/secret infrastructure | Chosen OIDC/MFA/session design, service-role/RLS demonstration, vault/rotation, private network, backups and trusted proxy settings |
+| Resy/OpenTable authorization | Official partnership/API availability, permitted scopes, sandbox, tenant authorization and idempotency/reconciliation support; neither is assumed available |
+| Security ownership and response | Named release approvers, private reporting channel, incident contacts, alert coverage and on-call/fallback responsibilities |
+| Scale and cost envelope | Real audio latency/load measurements, provider budget controls and tested admission/fallback behavior; initial numerical limits require tuning |
+
+Review this document alongside the architecture review register whenever these dependencies change. Record verified controls, failed tests, residual risk, owner and next action; do not replace the proposed status with a compliance claim.
