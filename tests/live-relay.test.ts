@@ -386,7 +386,7 @@ describe('optional Live transcript capture', () => {
 });
 
 describe('Live continuous audio protocol', () => {
-  it('starts client delegation without storage, preserves PCMU silence and appends one greeting', () => {
+  it('preloads the opening as app instructions, preserves PCMU silence and sends one start cue', () => {
     const f = fixture({}, false);
     f.input(160);
     expect(f.provider.events).toEqual([
@@ -399,6 +399,18 @@ describe('Live continuous audio protocol', () => {
           instructions: 'Approved restaurant facts; proposals require server-controlled readback.',
           audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: 'marin' } },
           delegation: { type: 'client' },
+          input: [
+            {
+              type: 'message',
+              role: 'developer',
+              content: [
+                {
+                  type: 'input_text',
+                  text: 'Opening instructions: Greet the caller now in English, then pause and listen. Wait until the application says "Begin the opening" before executing these instructions.',
+                },
+              ],
+            },
+          ],
         },
       },
     ]);
@@ -412,7 +424,7 @@ describe('Live continuous audio protocol', () => {
         type: 'session.instructions.append',
         event_id: expect.any(String),
         delegation_id: null,
-        content: 'Greet the caller now in English, then pause and listen.',
+        content: 'Begin the opening now.',
       },
     ]);
     expect(f.provider.events).toContainEqual({
@@ -478,6 +490,109 @@ describe('Live continuous audio protocol', () => {
       expect(f.closed).toHaveBeenCalledOnce();
       expect(f.diagnostic).toHaveBeenCalledOnce();
       expect(f.telephone.readyState).toBe(3);
+      f.dispose();
+    },
+  );
+
+  const protocolFailures: Array<{
+    code: LiveWorkflowStage;
+    start?: boolean;
+    reject(f: ReturnType<typeof fixture>): void;
+  }> = [
+    {
+      code: 'protocol_configuration_invalid',
+      reject: (f) => f.relay.configure('Private duplicate instructions'),
+    },
+    {
+      code: 'protocol_input_audio_invalid',
+      reject: (f) => f.relay.input('Private invalid audio!'),
+    },
+    {
+      code: 'protocol_envelope_invalid',
+      reject: (f) => f.relay.providerEvent('{Private invalid JSON'),
+    },
+    {
+      code: 'protocol_event_before_ready',
+      start: false,
+      reject: (f) => f.audio(),
+    },
+    {
+      code: 'protocol_instruction_ack_invalid',
+      reject: (f) =>
+        f.event({ type: 'session.instructions.appended', private: 'Private missing ACK' }),
+    },
+    {
+      code: 'protocol_output_audio_invalid',
+      reject: (f) =>
+        f.event({ type: 'session.output_audio.delta', delta: 'Private invalid output!' }),
+    },
+    {
+      code: 'protocol_delegation_invalid',
+      reject: (f) =>
+        f.event({
+          type: 'session.delegation.created',
+          offset_ms: 10,
+          delegation: { id: 'Private identifier', type: 'delegation', target: 'unauthorized' },
+        }),
+    },
+    {
+      code: 'protocol_handler_failed',
+      reject: (f) => {
+        // A finite but unusable clock reaches the existing date conversion.
+        // Its exception must be distinguishable without leaking the fragment.
+        f.relay.input(Buffer.alloc(800, 0xff).toString('base64'), 1e20);
+        f.transcript('Private identifier', 'Private text');
+      },
+    },
+  ];
+  it.each(protocolFailures)('identifies $code without retaining rejected content', (failure) => {
+    const capture = vi.fn<NonNullable<LiveRelayOptions['onTranscript']>>();
+    const f = fixture({ onTranscript: capture }, failure.start ?? true);
+    failure.reject(f);
+    expect(f.stage.mock.calls).toEqual([
+      ...(failure.start === false ? [] : [['session_ready']]),
+      [failure.code],
+    ]);
+    expect(f.diagnostic.mock.calls).toEqual([['provider_protocol_error']]);
+    expect(f.closed).toHaveBeenCalledOnce();
+    expect(f.telephone.readyState).toBe(3);
+    expect(f.onDelegate).not.toHaveBeenCalled();
+    expect(f.onTool).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+    expect(JSON.stringify([f.stage.mock.calls, f.diagnostic.mock.calls])).not.toContain('Private');
+    f.event({ type: 'session.closed' });
+    expect(f.closed).toHaveBeenCalledOnce();
+  });
+
+  it.each(
+    (['user', 'assistant'] as const).flatMap((role) =>
+      (['invalid', 'before_input', 'reversed', 'ahead'] as const).map((reason) => ({
+        role,
+        reason,
+      })),
+    ),
+  )(
+    'identifies $role transcript $reason rejection before capture or delegation',
+    ({ role, reason }) => {
+      const capture = vi.fn<NonNullable<LiveRelayOptions['onTranscript']>>();
+      const f = fixture({ onTranscript: capture });
+      if (reason !== 'before_input') f.input();
+      const startMs = reason === 'invalid' ? -1 : reason === 'reversed' ? 200 : 0;
+      const endMs = reason === 'ahead' ? 1401 : 100;
+      f.transcript('Private rejected identifier', 'Private rejected text', startMs, endMs, role);
+      const source = role === 'user' ? 'caller' : 'assistant';
+      expect(f.stage.mock.calls).toEqual([
+        ['session_ready'],
+        [`protocol_${source}_transcript_${reason}`],
+      ]);
+      expect(f.diagnostic.mock.calls).toEqual([['provider_protocol_error']]);
+      expect(f.closed).toHaveBeenCalledOnce();
+      expect(capture).not.toHaveBeenCalled();
+      expect(f.onDelegate).not.toHaveBeenCalled();
+      expect(f.onTool).not.toHaveBeenCalled();
+      expect(JSON.stringify([f.stage.mock.calls, f.diagnostic.mock.calls])).not.toContain(
+        'Private',
+      );
       f.dispose();
     },
   );
@@ -610,7 +725,7 @@ describe('Live delegated action boundaries', () => {
     f.dispose();
   });
 
-  it('uses the date-bearing fragment before midnight and freezes speech during canonical control', async () => {
+  it('uses the date-bearing fragment before midnight and preserves caller corrections during canonical control', async () => {
     vi.useFakeTimers();
     let release: ((value: 'controlled' | 'unavailable') => void) | undefined;
     const onTool = vi.fn<(request: VoiceToolRequest) => Promise<'controlled' | 'unavailable'>>(
@@ -653,12 +768,21 @@ describe('Live delegated action boundaries', () => {
     f.input();
     f.transcript('controlled', 'Caller speech during deterministic control', 700, 750);
     expect(f.telephone.events).toHaveLength(beforeAudio);
-    expect(f.provider.events).toHaveLength(beforeInput);
+    expect(f.provider.events).toHaveLength(beforeInput + 1);
     release?.('unavailable');
     await vi.advanceTimersByTimeAsync(0);
+    const stop = f.provider.events.findLast(
+      (event) => event.type === 'session.instructions.append',
+    );
+    expect(stop?.content).toContain('Stop speaking');
+    f.event({ type: 'session.instructions.appended', client_event_id: stop?.event_id });
+    f.audio(8000);
+    f.advance(1000);
+    await vi.advanceTimersByTimeAsync(1000);
     expect(f.provider.events.at(-1)).toMatchObject({
-      type: 'session.commentary.append',
-      delegation_id: 'delegation1',
+      type: 'session.instructions.append',
+      delegation_id: null,
+      content: expect.stringContaining('Keep all details'),
     });
     f.relay.played('p1'); // Late clear acknowledgment does not credit newer output.
     f.audio(16_000);
@@ -1118,5 +1242,282 @@ describe('Live incomplete task continuation and workflow diagnostics', () => {
     expect(f.closed).not.toHaveBeenCalled();
     f.dispose();
     expect(f.closed).toHaveBeenCalledOnce();
+  });
+});
+
+describe('Live readback ownership and playback fencing', () => {
+  async function settleSpeech(f: ReturnType<typeof fixture>) {
+    const stop = f.provider.events.findLast(
+      (event) => event.type === 'session.instructions.append',
+    );
+    expect(stop?.content).toContain('Stop speaking');
+    f.event({ type: 'session.instructions.appended', client_event_id: stop?.event_id });
+    f.audio(8000);
+    await vi.advanceTimersByTimeAsync(1000);
+  }
+
+  it.each(['played', 'interrupted', 'early_keypad', 'future_transcript', 'late_ack'] as const)(
+    'keeps the prepared readback bound to current playback (%s)',
+    async (scenario) => {
+      vi.useFakeTimers();
+      let spoken: string | null | undefined;
+      const f = fixture({
+        now: Date.now,
+        actionsEnabled: true,
+        onDelegate: async () => ({
+          kind: 'tool',
+          name: 'prepare_message',
+          callId: 'readback-tool',
+          arguments: JSON.stringify({
+            name: 'Synthetic Guest',
+            callbackNumber: '+12125550111',
+            message: 'Please call.',
+          }),
+        }),
+        onTool: async () => {
+          spoken = await f.relay.speakReadback('Say yes after the tone.');
+          return spoken ? 'controlled' : 'unavailable';
+        },
+      });
+      f.input();
+      f.transcript('caller-task', 'Please leave a message.');
+      f.audio(); // Unplayed old audio must be invalidated before readback.
+      f.delegate();
+      await vi.advanceTimersByTimeAsync(700);
+      await settleSpeech(f);
+      const command = f.provider.events.findLast((e) => e.type === 'session.instructions.append');
+      expect(command?.content).toContain('Read exactly');
+      if (scenario !== 'late_ack')
+        f.event({ type: 'session.instructions.appended', client_event_id: command?.event_id });
+      f.event({
+        type: 'session.output_audio.delta',
+        delta: Buffer.alloc(800, 0x90).toString('base64'),
+      });
+      f.transcript(
+        'readback-text',
+        'Say yes after the tone.',
+        100,
+        scenario === 'future_transcript' ? 700 : 200,
+        'assistant',
+      );
+      f.audio(4800);
+      if (scenario === 'late_ack') {
+        expect(f.telephone.events.filter((e) => e.event === 'mark')).toHaveLength(1);
+        f.event({ type: 'session.instructions.appended', client_event_id: command?.event_id });
+        expect(f.telephone.events.filter((e) => e.event === 'mark').length).toBeGreaterThan(1);
+      }
+      f.relay.played('p1'); // Cleared old mark is not readback playback.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(spoken).toBeUndefined();
+      if (scenario === 'interrupted')
+        f.transcript('correction', 'Actually change the message.', 200, 300);
+      if (scenario === 'early_keypad') f.relay.interruptReadback();
+      for (const event of f.telephone.events)
+        if (event.event === 'mark') f.relay.played((event.mark as { name: string }).name);
+      await vi.advanceTimersByTimeAsync(300);
+      if (scenario === 'future_transcript') {
+        expect(spoken).toBeUndefined();
+        f.input();
+        await vi.advanceTimersByTimeAsync(300);
+      }
+      if (scenario === 'played' || scenario === 'future_transcript' || scenario === 'late_ack') {
+        expect(spoken).toBe('Say yes after the tone.');
+        expect(f.relay.readbackIsCurrent).toBe(true);
+        f.relay.interruptReadback();
+        expect(f.relay.readbackIsCurrent).toBe(false);
+      } else {
+        expect(spoken).toBeNull();
+        expect(f.relay.readbackIsCurrent).toBe(false);
+        await settleSpeech(f);
+        expect(
+          f.provider.events.findLast((e) => e.type === 'session.instructions.append')?.content,
+        ).toContain('Keep all details');
+      }
+      f.dispose();
+    },
+  );
+
+  it.each(['admitted', 'deferred'] as const)(
+    'requires a fresh caller reply and delegation after %s readback interruption',
+    async (timing) => {
+      vi.useFakeTimers();
+      let attempts = 0;
+      const delegate = vi.fn<LiveRelayOptions['onDelegate']>(async () => ({
+        kind: 'tool',
+        name: 'prepare_message',
+        callId: `synthetic-readback-${++attempts}`,
+        arguments: JSON.stringify({
+          name: 'Synthetic Guest',
+          callbackNumber: '+12125550111',
+          message: 'Please call about the patio.',
+        }),
+      }));
+      const f = fixture({
+        now: Date.now,
+        actionsEnabled: true,
+        onDelegate: delegate,
+        onTool: async () =>
+          (await f.relay.speakReadback('Say yes after the tone.')) ? 'controlled' : 'unavailable',
+      });
+      f.input();
+      const original =
+        'Leave a message about the patio. My name is Synthetic Guest, callback plus one two one two five five five zero one one one.';
+      f.transcript('initial-details', original);
+      f.delegate();
+      await vi.advanceTimersByTimeAsync(700);
+      f.delegate('during-readback');
+      await settleSpeech(f);
+      f.transcript('interrupting-backchannel', 'Yeah.', 100, timing === 'deferred' ? 700 : 200);
+      await vi.advanceTimersByTimeAsync(0);
+      f.delegate('during-recovery');
+
+      const beforeStaleOutput = f.telephone.events.length;
+      f.event({
+        type: 'session.output_audio.delta',
+        delta: Buffer.alloc(800, 0x90).toString('base64'),
+      });
+      if (timing === 'admitted')
+        f.transcript('stale-assistant-tail', 'Old unfinished readback.', 200, 300, 'assistant');
+      expect(f.telephone.events).toHaveLength(beforeStaleOutput);
+      await settleSpeech(f);
+      expect(
+        f.provider.events.findLast((event) => event.type === 'session.instructions.append')
+          ?.content,
+      ).toContain('Then listen');
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(delegate).toHaveBeenCalledOnce();
+
+      f.delegate('stale-retry');
+      f.input(); // Admits the already-received future fragment without a new revision.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(delegate).toHaveBeenCalledOnce();
+      f.transcript('explicit-retry', 'Please read the details again.', 300, 400);
+      f.delegate('stale-retry'); // Its old ID cannot become authority after newer speech.
+      f.delegate('during-readback');
+      f.delegate('during-recovery');
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(delegate).toHaveBeenCalledOnce();
+      f.delegate('fresh-retry');
+      await vi.advanceTimersByTimeAsync(700);
+      expect(delegate).toHaveBeenCalledTimes(2);
+      expect(
+        delegate.mock.calls[1]?.[0].transcript
+          .filter((entry) => entry.role === 'user')
+          .map((entry) => entry.text),
+      ).toEqual([original, 'Yeah.', 'Please read the details again.']);
+      f.dispose();
+    },
+  );
+
+  it.each(['readback', 'recovery'] as const)(
+    'waits for deferred assistant text and a stable interval before leaving the %s boundary',
+    async (boundary) => {
+      vi.useFakeTimers();
+      let spoken: string | null | undefined;
+      const f = fixture({
+        now: Date.now,
+        actionsEnabled: true,
+        onDelegate: async () => ({
+          kind: 'tool',
+          name: 'prepare_message',
+          callId: 'synthetic-boundary',
+          arguments: JSON.stringify({
+            name: 'Synthetic Guest',
+            callbackNumber: '+12125550111',
+            message: 'Please call.',
+          }),
+        }),
+        onTool: async () => {
+          spoken = await f.relay.speakReadback('Say yes after the tone.');
+          return spoken ? 'controlled' : 'unavailable';
+        },
+      });
+      f.input();
+      f.transcript('request', 'Please leave a message.');
+      f.delegate();
+      await vi.advanceTimersByTimeAsync(700);
+      if (boundary === 'recovery') {
+        await settleSpeech(f);
+        f.transcript('interruption', 'Wait.', 100, 200);
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      const stop = f.provider.events.findLast(
+        (event) => event.type === 'session.instructions.append',
+      );
+      expect(stop?.content).toContain('Stop speaking');
+      f.event({ type: 'session.instructions.appended', client_event_id: stop?.event_id });
+      f.audio(8000);
+      f.transcript('deferred-old-answer', 'Old unfinished answer.', 300, 700, 'assistant');
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(
+        f.provider.events.findLast((event) => event.type === 'session.instructions.append'),
+      ).toBe(stop);
+      expect(f.telephone.events.filter((event) => event.event === 'media')).toHaveLength(0);
+
+      f.input();
+      await vi.advanceTimersByTimeAsync(975);
+      expect(
+        f.provider.events.findLast((event) => event.type === 'session.instructions.append'),
+      ).toBe(stop);
+      await vi.advanceTimersByTimeAsync(25);
+      const next = f.provider.events.findLast(
+        (event) => event.type === 'session.instructions.append',
+      );
+      if (boundary === 'recovery') expect(next?.content).toContain('Then listen');
+      else {
+        expect(next?.content).toContain('Read exactly');
+        f.event({ type: 'session.instructions.appended', client_event_id: next?.event_id });
+        f.event({
+          type: 'session.output_audio.delta',
+          delta: Buffer.alloc(800, 0x90).toString('base64'),
+        });
+        f.transcript('current-readback', 'Say yes after the tone.', 700, 800, 'assistant');
+        f.audio(4800);
+        for (const event of f.telephone.events)
+          if (event.event === 'mark') f.relay.played((event.mark as { name: string }).name);
+        await vi.advanceTimersByTimeAsync(300);
+        expect(spoken).toBe('Say yes after the tone.');
+      }
+      expect(f.closed).not.toHaveBeenCalled();
+      f.dispose();
+    },
+  );
+
+  it('closes instead of resuming or retrying when old speech cannot settle after interruption', async () => {
+    vi.useFakeTimers();
+    const delegate = vi.fn<LiveRelayOptions['onDelegate']>(async () => ({
+      kind: 'tool',
+      name: 'prepare_message',
+      callId: 'synthetic-readback',
+      arguments: JSON.stringify({
+        name: 'Synthetic Guest',
+        callbackNumber: '+12125550111',
+        message: 'Please call.',
+      }),
+    }));
+    const f = fixture({
+      now: Date.now,
+      actionsEnabled: true,
+      onDelegate: delegate,
+      onTool: async () =>
+        (await f.relay.speakReadback('Say yes after the tone.')) ? 'controlled' : 'unavailable',
+    });
+    f.input();
+    f.transcript('task', 'Please leave a message.');
+    f.delegate();
+    await vi.advanceTimersByTimeAsync(700);
+    await settleSpeech(f);
+    f.transcript('interruption', 'Wait.', 100, 200);
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(f.closed).toHaveBeenCalledOnce();
+    expect(f.stage).toHaveBeenCalledWith('readback_boundary_timeout');
+    expect(delegate).toHaveBeenCalledOnce();
+    expect(
+      f.provider.events.some((event) =>
+        String(event.content).includes('Would you like me to read the details again?'),
+      ),
+    ).toBe(false);
+    f.dispose();
   });
 });

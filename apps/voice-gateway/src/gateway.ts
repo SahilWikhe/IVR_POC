@@ -26,6 +26,7 @@ import {
 } from './live-relay.js';
 import { createLiveBackend } from './live-backend.js';
 import { MediaRateLimiter, type MediaRateLimitCode } from './media-rate.js';
+import { confirmationTone } from './confirmation-tone.js';
 import { createVoiceApiClient, VoiceControlError, type VoiceApiClient } from './client.js';
 import { createCallController, type CallController, type CallControlResult } from './control.js';
 import {
@@ -239,6 +240,10 @@ export async function createVoiceGateway(
   }
 
   const now = dependencies.now ?? Date.now;
+  const tone = confirmationTone();
+  app.get('/twilio/confirmation-tone.wav', async (_request, reply) =>
+    reply.header('cache-control', 'public, max-age=86400').type('audio/wav').send(tone),
+  );
   const api = dependencies.api ?? createVoiceApiClient(config);
   const controller =
     dependencies.controller ??
@@ -259,6 +264,7 @@ export async function createVoiceGateway(
       const response = await api.admit({
         providerCallSid: call.callSid,
         accountSid: config.accountSid,
+        ...(config.model === 'gpt-live-1' ? { openingMode: 'gpt_live' as const } : {}),
       });
       return reply.type('text/xml').send(response.twiml);
     } catch {
@@ -704,6 +710,7 @@ export async function createVoiceGateway(
                   toolCallId: request.toolCallId,
                   utteranceStartedAt: request.utteranceStartedAt,
                   proposal: request.proposal,
+                  ...(config.model === 'gpt-live-1' ? { readbackMode: 'gpt_live' as const } : {}),
                 })
               : await api.transfer({
                   ...binding,
@@ -720,12 +727,37 @@ export async function createVoiceGateway(
         }
         stage(request.kind === 'proposal' ? 'proposal_prepared' : 'transfer_prepared');
         if (closed) return 'controlled';
+        let readbackTranscript: string | undefined;
+        if (request.kind === 'proposal' && config.model === 'gpt-live-1') {
+          const text = 'readbackText' in preparation ? preparation.readbackText : undefined;
+          const spoken =
+            typeof text === 'string' && relay instanceof LiveAudioRelay
+              ? await relay.speakReadback(text)
+              : null;
+          if (closed) return 'controlled';
+          if (spoken === null) {
+            try {
+              await api.cancelPrepared({ ...binding, controlId: preparation.controlId });
+            } catch {
+              close();
+              return 'controlled';
+            }
+            return 'unavailable';
+          }
+          readbackTranscript = spoken;
+        }
+        controlOwned = true;
+        if (policyTimer) clearTimeout(policyTimer);
         // Durable compare-and-set precedes the single non-idempotent provider update.
         // A lost response or repeat tool delivery is never a reason to issue it twice.
         let dispatch;
         try {
           stage('dispatch_started');
-          dispatch = await api.dispatch({ ...binding, controlId: preparation.controlId });
+          dispatch = await api.dispatch({
+            ...binding,
+            controlId: preparation.controlId,
+            ...(readbackTranscript === undefined ? {} : { readbackTranscript }),
+          });
         } catch {
           stage('dispatch_failed');
           close();
@@ -758,7 +790,11 @@ export async function createVoiceGateway(
         }
         let result: CallControlResult;
         try {
-          result = await controller.dispatch(callSid, dispatch.twiml, controlCancellation.signal);
+          result =
+            readbackTranscript !== undefined &&
+            (!(relay instanceof LiveAudioRelay) || !relay.readbackIsCurrent)
+              ? { outcome: 'rejected', code: 'ABORTED_BEFORE_DISPATCH' }
+              : await controller.dispatch(callSid, dispatch.twiml, controlCancellation.signal);
         } catch {
           result = { outcome: 'unknown' };
         }
@@ -790,8 +826,9 @@ export async function createVoiceGateway(
       const executeTool = async (
         request: VoiceToolRequest,
       ): Promise<'controlled' | 'unavailable'> => {
-        controlOwned = true;
-        if (policyTimer) clearTimeout(policyTimer);
+        const liveReadback = config.model === 'gpt-live-1' && request.kind === 'proposal';
+        controlOwned = !liveReadback;
+        if (!liveReadback && policyTimer) clearTimeout(policyTimer);
         const result = await performTool(request);
         if (result === 'unavailable' && !closed) {
           controlOwned = false;
@@ -818,6 +855,8 @@ export async function createVoiceGateway(
           diagnosticId = context.voiceCallId;
           generation = context.generation;
           transcriptCallId = context.voiceCallId;
+          if (context.openingMode === 'gpt_live' && config.model !== 'gpt-live-1')
+            throw new Error('Voice opening mode mismatch');
           stage('stream_bound');
           if (closed || !streamSid) {
             await api.end({ providerCallSid: startCallSid, generation, reason: 'stream_closed' });
@@ -842,6 +881,7 @@ export async function createVoiceGateway(
           const capabilities = {
             ...policyCapabilities,
             outcome: context.outcome,
+            outcomeSpoken: context.outcomeSpoken ?? true,
           };
           provider = connect(config);
           const relayOptions = {
@@ -955,6 +995,8 @@ export async function createVoiceGateway(
               pending.push({ payload: event.media.payload, receivedAt: tick });
             }
           } else if (event.event === 'mark') relay?.played(event.mark.name);
+          else if (event.event === 'dtmf' && relay instanceof LiveAudioRelay)
+            relay.interruptReadback();
           else if (event.event === 'stop') {
             if (event.stop.callSid !== callSid || event.stop.accountSid !== config.accountSid)
               return fail('media_protocol_invalid');

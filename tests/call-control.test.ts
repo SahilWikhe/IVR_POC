@@ -5,6 +5,7 @@ import type HttpResponse from 'twilio/lib/http/response.js';
 import {
   buildConfirmationRetryTwiml,
   buildReadbackTwiml,
+  buildSilentConfirmationTwiml,
   buildTransferTwiml,
   TelephonyInputError,
 } from '@hostline/connectors';
@@ -35,6 +36,35 @@ afterEach(() => {
 });
 
 describe('provider-authored canonical call instructions', () => {
+  it('collects a signed confirmation silently after an application-verified Live readback', () => {
+    const xml = buildSilentConfirmationTwiml({
+      publicUrl: configuration.publicUrl,
+      confirmationToken: token,
+    });
+    expect(xml).toContain('<Play>https://voice.example.test/twilio/confirmation-tone.wav</Play>');
+    expect(xml.slice(xml.indexOf('<Gather'), xml.indexOf('</Gather>'))).not.toContain('<Say');
+    expect(xml.slice(0, xml.indexOf('<Gather'))).not.toContain('<Say');
+    expect(xml).toContain(`action="https://voice.example.test/twilio/confirmation/${token}"`);
+    expect(xml).toContain('input="speech dtmf"');
+    expect(xml).toContain('numDigits="1"');
+    expect(xml).toContain('actionOnEmptyResult="true"');
+    expect(xml).not.toContain('Say yes');
+    expect(xml).toContain('I could not confirm that your request was saved.');
+    expect(xml).toContain('<Hangup/>');
+    expect(() =>
+      buildSilentConfirmationTwiml({
+        publicUrl: 'https://evil.example.test/path',
+        confirmationToken: token,
+      }),
+    ).toThrow(TelephonyInputError);
+    expect(() =>
+      buildSilentConfirmationTwiml({
+        publicUrl: configuration.publicUrl,
+        confirmationToken: 'invalid',
+      }),
+    ).toThrow(TelephonyInputError);
+  });
+
   it('finishes canonical readback before speech or keypad collection and never commits on missing input', () => {
     const canonicalEnd = twiml.indexOf('</Say>');
     expect(twiml.slice(0, canonicalEnd)).toContain(readback);

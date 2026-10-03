@@ -21,12 +21,16 @@ const redemptionResponse = z
     restaurant: restaurantSchema,
     expiresAt: z.iso.datetime({ offset: true }),
     outcome: z.string().max(500).nullable(),
+    outcomeSpoken: z.boolean().optional(),
+    openingMode: z.enum(['twilio', 'gpt_live']).optional(),
     actionsEnabled: z.boolean(),
     transfersEnabled: z.boolean(),
     configurationVersion: z.number().int().positive(),
   })
   .strict();
-const preparationResponse = z.object({ controlId: uuid, twiml }).strict();
+const preparationResponse = z
+  .object({ controlId: uuid, twiml, readbackText: z.string().min(1).max(3000).optional() })
+  .strict();
 const dispatchResponse = z
   .object({ dispatch: z.boolean(), twiml: twiml.nullable(), unavailable: z.boolean() })
   .strict();
@@ -62,6 +66,8 @@ const controlErrorCode = z.enum([
   'PHONE_POLICY_REVOKED',
   'CALL_NOT_ACTIVE',
   'STALE_GENERATION',
+  'READBACK_MISMATCH',
+  'CANCELLATION_TOO_LATE',
 ]);
 export class VoiceControlError extends Error {
   constructor(readonly code: z.infer<typeof controlErrorCode> | 'CONTROL_UNAVAILABLE') {
@@ -83,6 +89,7 @@ export interface VoiceApiClient {
   admit(input: {
     providerCallSid: string;
     accountSid: string;
+    openingMode?: 'twilio' | 'gpt_live';
   }): Promise<z.infer<typeof admissionResponse>>;
   redeem(input: {
     providerCallSid: string;
@@ -100,12 +107,18 @@ export interface VoiceApiClient {
       toolCallId: string;
       utteranceStartedAt: string;
       proposal: VoiceProposalInput;
+      readbackMode?: 'twilio' | 'gpt_live';
     },
   ): Promise<z.infer<typeof preparationResponse>>;
   transfer(
     input: CallBinding & { toolCallId: string; context?: TransferContext },
   ): Promise<z.infer<typeof preparationResponse>>;
-  dispatch(input: CallBinding & { controlId: string }): Promise<z.infer<typeof dispatchResponse>>;
+  dispatch(
+    input: CallBinding & { controlId: string; readbackTranscript?: string },
+  ): Promise<z.infer<typeof dispatchResponse>>;
+  cancelPrepared(
+    input: CallBinding & { controlId: string },
+  ): Promise<z.infer<typeof stateResponse>>;
   dispatched(
     input: CallBinding & { controlId: string; outcome: 'accepted' | 'rejected' | 'unknown' },
   ): Promise<z.infer<typeof stateResponse>>;
@@ -206,6 +219,7 @@ export function createVoiceApiClient(
     propose: (input) => post('propose', input, preparationResponse),
     transfer: (input) => post('transfer', input, preparationResponse),
     dispatch: (input) => post('dispatch', input, dispatchResponse),
+    cancelPrepared: (input) => post('cancel-prepared', input, stateResponse),
     dispatched: (input) => post('dispatched', input, stateResponse),
     confirmation: (input) => post('confirmation', input, callbackResponse),
     transferStatus: (input) => post('transfer-status', input, stateResponse),

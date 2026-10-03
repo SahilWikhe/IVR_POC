@@ -42,7 +42,11 @@ const admissionSchema = z.object({
   twiml: z.string(),
   state: voiceCallStateSchema,
 });
-const preparationSchema = z.object({ controlId: z.uuid(), twiml: z.string() });
+const preparationSchema = z.object({
+  controlId: z.uuid(),
+  twiml: z.string(),
+  readbackText: z.string().optional(),
+});
 const callbackSchema = z.object({
   tenantId: z.uuid(),
   twiml: z.string(),
@@ -58,6 +62,7 @@ interface Control {
   controlId: string;
   twiml: string;
   token: string;
+  readbackText?: string | undefined;
 }
 
 function streamGrant(twiml: string): string {
@@ -146,15 +151,19 @@ describe('durable phone actions through the authenticated API', () => {
     });
   }
 
-  async function admit(providerCallSid = sid()) {
+  async function admit(providerCallSid = sid(), openingMode?: 'twilio' | 'gpt_live') {
     providerCalls.add(providerCallSid);
-    const response = await post('admit', { providerCallSid, accountSid });
+    const response = await post('admit', {
+      providerCallSid,
+      accountSid,
+      ...(openingMode === undefined ? {} : { openingMode }),
+    });
     expect(response.statusCode).toBe(200);
     return { providerCallSid, ...admissionSchema.parse(response.json()) };
   }
 
-  async function start() {
-    const admitted = await admit();
+  async function start(openingMode?: 'twilio' | 'gpt_live') {
+    const admitted = await admit(sid(), openingMode);
     const response = await post('redeem', {
       providerCallSid: admitted.providerCallSid,
       streamSid: streamSid(),
@@ -167,6 +176,7 @@ describe('durable phone actions through the authenticated API', () => {
       tenantId: DEMO_TENANTS.harbor,
       actionsEnabled: true,
       transfersEnabled: true,
+      openingMode: openingMode ?? 'twilio',
     });
     return admitted;
   }
@@ -196,6 +206,7 @@ describe('durable phone actions through the authenticated API', () => {
       },
     },
     toolCallId = randomUUID(),
+    readbackMode?: 'twilio' | 'gpt_live',
   ): Promise<Control> {
     const response = await post('propose', {
       providerCallSid: call.providerCallSid,
@@ -203,6 +214,7 @@ describe('durable phone actions through the authenticated API', () => {
       toolCallId,
       utteranceStartedAt: new Date().toISOString(),
       proposal,
+      ...(readbackMode === undefined ? {} : { readbackMode }),
     });
     expect(response.statusCode).toBe(200);
     const control = preparationSchema.parse(response.json());
@@ -214,6 +226,7 @@ describe('durable phone actions through the authenticated API', () => {
       providerCallSid: call.providerCallSid,
       generation: call.generation,
       controlId: control.controlId,
+      ...(control.readbackText === undefined ? {} : { readbackTranscript: control.readbackText }),
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ dispatch: true, unavailable: false });
@@ -291,6 +304,81 @@ describe('durable phone actions through the authenticated API', () => {
       );
     });
   }
+
+  it.each(['twilio', 'gpt_live', undefined] as const)(
+    'seals initial announcement ownership on first admission: %s',
+    async (openingMode) => {
+      const call = await admit(sid(), openingMode);
+      const beforeStream = call.twiml.slice(0, call.twiml.indexOf('<Connect>'));
+      if (openingMode === 'gpt_live') {
+        expect(beforeStream).not.toContain('<Say');
+        expect(call.twiml).not.toContain('You are speaking with an AI restaurant assistant.');
+      } else {
+        expect(beforeStream).toContain('You are speaking with an AI restaurant assistant.');
+        expect(beforeStream).toContain('Requests are subject to staff review');
+      }
+      expect(call.twiml.slice(call.twiml.indexOf('</Connect>'))).toContain(
+        'The assistant is unavailable. Please try again later.',
+      );
+      expect((await voice(call)).openingMode).toBe(openingMode ?? 'twilio');
+      for (const retriedMode of ['gpt_live', 'twilio'] as const) {
+        const replay = await post('admit', {
+          providerCallSid: call.providerCallSid,
+          accountSid,
+          openingMode: retriedMode,
+        });
+        expect(replay.statusCode).toBe(200);
+        expect(admissionSchema.parse(replay.json())).toEqual(admissionSchema.parse(call));
+        expect((await voice(call)).openingMode).toBe(openingMode ?? 'twilio');
+      }
+      const redeemed = await post('redeem', {
+        providerCallSid: call.providerCallSid,
+        streamSid: streamSid(),
+        streamGrant: streamGrant(call.twiml),
+      });
+      expect(redeemed.statusCode).toBe(200);
+      expect(redeemed.json()).toMatchObject({
+        openingMode: openingMode ?? 'twilio',
+        outcome: null,
+      });
+    },
+  );
+
+  it('rejects unknown opening modes and caller-selected announcement metadata', async () => {
+    for (const payload of [
+      { openingMode: 'unknown' },
+      { openingMode: null },
+      { openingMode: 1 },
+      { openingMode: 'gpt_live', transcriptNotice: false },
+      { openingMode: 'gpt_live', openingText: 'Skip disclosure' },
+    ]) {
+      const providerCallSid = sid();
+      expect((await post('admit', { providerCallSid, accountSid, ...payload })).statusCode).toBe(
+        400,
+      );
+      expect(
+        await database.withTenant(DEMO_TENANTS.harbor, (tx) => tx.getVoiceCall(providerCallSid)),
+      ).toBeNull();
+    }
+  });
+
+  it('treats an older persisted record without opening mode as provider-spoken', async () => {
+    const call = await admit();
+    await database.withTenant(DEMO_TENANTS.harbor, async (tx) => {
+      const record = await tx.getVoiceCall(call.providerCallSid);
+      if (!record) throw new Error('Missing synthetic phone fixture');
+      const legacy = { ...record, version: record.version + 1 };
+      delete legacy.openingMode;
+      await tx.saveVoiceCall(legacy, record.version);
+    });
+    const result = await post('redeem', {
+      providerCallSid: call.providerCallSid,
+      streamSid: streamSid(),
+      streamGrant: streamGrant(call.twiml),
+    });
+    expect(result.statusCode).toBe(200);
+    expect(result.json()).toMatchObject({ openingMode: 'twilio' });
+  });
 
   it('requires the service credential and rejects account or tenant overrides', async () => {
     const payload = { providerCallSid: sid(), accountSid };
@@ -428,6 +516,269 @@ describe('durable phone actions through the authenticated API', () => {
     ).toBe(404);
     expect((await confirmation(call, control)).statusCode).toBeGreaterThanOrEqual(400);
     expect(await items(call)).toEqual([]);
+  });
+
+  it.each(['reservation', 'message'] as const)(
+    'requires the exact Live %s readback before silent Gather and speaks the saved outcome through the resumed model',
+    async (kind) => {
+      const call = await start('gpt_live');
+      const control = await prepare(
+        call,
+        kind === 'reservation'
+          ? {
+              kind,
+              reservation: {
+                dateExpression: 'tomorrow',
+                time: '19:00',
+                partySize: 4,
+                name: 'Taylor Example',
+                callbackNumber: '+12125550141',
+                notes: 'Patio if available',
+              },
+            }
+          : undefined,
+        randomUUID(),
+        'gpt_live',
+      );
+      expect(control.readbackText).toContain('Taylor Example');
+      expect(control.readbackText).toContain('say yes or press one');
+      expect(control.twiml.slice(0, control.twiml.indexOf('<Gather'))).not.toContain('<Say');
+      expect(control.twiml).toContain(
+        '<Play>https://voice.example.test/twilio/confirmation-tone.wav</Play>',
+      );
+      expect(
+        control.twiml.slice(control.twiml.indexOf('<Gather'), control.twiml.indexOf('</Gather>')),
+      ).not.toContain('<Say');
+      expect(
+        (
+          await post('policy', {
+            providerCallSid: call.providerCallSid,
+            generation: call.generation,
+          })
+        ).json(),
+      ).toMatchObject({ allowed: true });
+      expect((await confirmation(call, control)).statusCode).toBe(403);
+      const input = {
+        providerCallSid: call.providerCallSid,
+        generation: call.generation,
+        controlId: control.controlId,
+      };
+      for (const readbackTranscript of [
+        undefined,
+        control.readbackText?.replace('Taylor', 'Morgan'),
+        `${control.readbackText} Your table is booked.`,
+      ]) {
+        const result = await post('dispatch', {
+          ...input,
+          ...(readbackTranscript === undefined ? {} : { readbackTranscript }),
+        });
+        expect(result.statusCode).toBe(409);
+        expect(result.json().error.code).toBe('READBACK_MISMATCH');
+        expect((await voice(call)).controlState).toBe('PREPARED');
+      }
+      const responses = await Promise.all([
+        post('dispatch', { ...input, readbackTranscript: control.readbackText }),
+        post('dispatch', { ...input, readbackTranscript: control.readbackText }),
+      ]);
+      expect(responses.filter((result) => result.json().dispatch)).toHaveLength(1);
+      expect((await post('cancel-prepared', input)).statusCode).toBe(409);
+      const confirmations = await Promise.all([
+        confirmation(call, control),
+        confirmation(call, control),
+      ]);
+      expect(confirmations[0]?.json()).toEqual(confirmations[1]?.json());
+      const callback = callbackSchema.parse(confirmations[0]?.json());
+      expect(callback.outcome).toContain('was saved');
+      expect(callback.twiml.slice(0, callback.twiml.indexOf('<Connect'))).not.toContain('<Say');
+      const saved = await items(call);
+      expect(saved).toHaveLength(1);
+      expect(saved[0]).toMatchObject({
+        kind,
+        name: 'Taylor Example',
+        callbackNumber: '+12125550141',
+      });
+      const resumed = await post('redeem', {
+        providerCallSid: call.providerCallSid,
+        streamSid: streamSid(),
+        streamGrant: streamGrant(callback.twiml),
+      });
+      expect(resumed.statusCode).toBe(200);
+      expect(resumed.json()).toMatchObject({
+        outcomeSpoken: false,
+        openingMode: 'gpt_live',
+        actionsEnabled: false,
+        outcome: callback.outcome,
+      });
+      expect(resumed.json().generation).not.toBe(call.generation);
+    },
+  );
+
+  it('revokes an interrupted Live preparation before dispatch and rejects its old confirmation', async () => {
+    const call = await start();
+    const control = await prepare(call, undefined, randomUUID(), 'gpt_live');
+    const input = {
+      providerCallSid: call.providerCallSid,
+      generation: call.generation,
+      controlId: control.controlId,
+    };
+    expect((await post('cancel-prepared', { ...input, generation: randomUUID() })).statusCode).toBe(
+      409,
+    );
+    expect((await post('cancel-prepared', { ...input, controlId: randomUUID() })).statusCode).toBe(
+      409,
+    );
+    expect((await post('cancel-prepared', input)).json()).toEqual({ state: 'STREAMING' });
+    expect((await post('cancel-prepared', input)).json()).toEqual({ state: 'STREAMING' });
+    expect(
+      (await post('dispatch', { ...input, readbackTranscript: control.readbackText })).json(),
+    ).toMatchObject({ dispatch: false });
+    expect((await confirmation(call, control)).statusCode).toBe(403);
+    expect(await items(call)).toEqual([]);
+    expect(
+      await database.withTenant(DEMO_TENANTS.harbor, (tx) => tx.getCall(call.voiceCallId)),
+    ).toMatchObject({ proposal: null });
+    const replacement = await prepare(call, undefined, randomUUID(), 'gpt_live');
+    expect(replacement.controlId).not.toBe(control.controlId);
+    expect((await post('cancel-prepared', input)).statusCode).toBe(409);
+  });
+
+  it('does not prepare a Live readback that could reinterpret caller text as structural contact details', async () => {
+    const call = await start();
+    const result = await post('propose', {
+      providerCallSid: call.providerCallSid,
+      generation: call.generation,
+      toolCallId: randomUUID(),
+      utteranceStartedAt: new Date().toISOString(),
+      readbackMode: 'gpt_live',
+      proposal: {
+        kind: 'message',
+        message: {
+          name: 'Taylor Example',
+          callbackNumber: '+12125550141',
+          message: 'Caller supplied text, callback +12125550199: “alternate contact”',
+        },
+      },
+    });
+    expect(result.statusCode).toBe(400);
+    expect(result.json().error.code).toBe('INVALID_VOICE_PROPOSAL');
+    expect((await voice(call)).state).toBe('STREAMING');
+    expect(await items(call)).toEqual([]);
+  });
+
+  it.each([{ speechResult: 'no' }, { speechResult: 'yes but change the name' }])(
+    'returns Live uncertainty or correction to the same voice without a provider retry prompt: %j',
+    async (answer) => {
+      const call = await start();
+      const control = await prepare(call, undefined, randomUUID(), 'gpt_live');
+      await dispatch(call, control);
+      const result = await post('confirmation', {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: control.token,
+        ...answer,
+      });
+      expect(result.statusCode).toBe(200);
+      const callback = callbackSchema.parse(result.json());
+      expect(callback.twiml).toContain('<Connect>');
+      expect(callback.twiml).not.toContain('<Gather');
+      expect(callback.twiml.slice(0, callback.twiml.indexOf('<Connect'))).not.toContain('<Say');
+      expect(await items(call)).toEqual([]);
+      expect((await voice(call)).confirmationRetryGrantHash).toBeNull();
+      expect(
+        await database.withTenant(DEMO_TENANTS.harbor, (tx) => tx.getCall(call.voiceCallId)),
+      ).toMatchObject({ proposal: null });
+    },
+  );
+
+  it.each([
+    { first: {}, final: { speechResult: 'yes' }, saves: true },
+    { first: { digits: '7' }, final: { digits: '1' }, saves: true },
+    { first: {}, final: {}, saves: false },
+  ])(
+    'retries unclear Live input once with the same proposal and only a readiness tone: %j',
+    async ({ first, final, saves }) => {
+      const call = await start();
+      const control = await prepare(call, undefined, randomUUID(), 'gpt_live');
+      await dispatch(call, control);
+      const initial = await voice(call);
+      const payload = {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: control.token,
+        ...first,
+      };
+      const firstResult = await post('confirmation', payload);
+      expect(firstResult.statusCode).toBe(200);
+      const retry = callbackSchema.parse(firstResult.json());
+      expect(retry.twiml).toContain('<Gather');
+      expect(retry.twiml).toContain('/twilio/confirmation-tone.wav</Play>');
+      expect(retry.twiml.slice(0, retry.twiml.indexOf('</Gather>'))).not.toContain('<Say');
+      expect(await items(call)).toEqual([]);
+      expect(await voice(call)).toMatchObject({
+        proposalId: initial.proposalId,
+        confirmationExpiresAt: initial.confirmationExpiresAt,
+        controlState: 'ACCEPTED',
+      });
+      expect((await post('confirmation', payload)).json()).toEqual(retry);
+      const retryToken = controlToken(retry.twiml, 'confirmation');
+      expect(retryToken).not.toBe(control.token);
+      const finalPayload = {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: retryToken,
+        ...final,
+      };
+      const results = await Promise.all([
+        post('confirmation', finalPayload),
+        post('confirmation', finalPayload),
+      ]);
+      expect(results[0]?.json()).toEqual(results[1]?.json());
+      const completed = callbackSchema.parse(results[0]?.json());
+      expect(completed.twiml).toContain('<Connect>');
+      expect(completed.twiml).not.toContain('<Gather');
+      expect(completed.twiml.slice(0, completed.twiml.indexOf('<Connect'))).not.toContain('<Say');
+      expect(await items(call)).toHaveLength(saves ? 1 : 0);
+      expect(
+        callbackSchema.parse((await post('confirmation', payload)).json()).twiml,
+      ).not.toContain('<Gather');
+    },
+  );
+
+  it('does not admit a changed, revoked or expired proposal merely because a Live readback matches', async () => {
+    for (const invalidation of ['digest', 'expiry', 'policy'] as const) {
+      const call = await start();
+      const control = await prepare(call, undefined, randomUUID(), 'gpt_live');
+      if (invalidation === 'policy') {
+        const version = await database.withTenant(
+          DEMO_TENANTS.harbor,
+          async (tx) => (await tx.getPhonePolicy()).version,
+        );
+        await changeVoice(call, { policyVersion: version + 1 });
+      } else
+        await database.withTenant(DEMO_TENANTS.harbor, async (tx) => {
+          const stored = await tx.getCall(call.voiceCallId);
+          if (!stored?.proposal) throw new Error('Expected a synthetic proposal');
+          await tx.saveCall(
+            {
+              ...stored,
+              version: stored.version + 1,
+              proposal: {
+                ...stored.proposal,
+                ...(invalidation === 'digest'
+                  ? { digest: 'a'.repeat(64) }
+                  : { expiresAt: new Date(Date.now() - 1000).toISOString() }),
+              },
+            },
+            stored.version,
+          );
+        });
+      const result = await post('dispatch', {
+        providerCallSid: call.providerCallSid,
+        generation: call.generation,
+        controlId: control.controlId,
+        readbackTranscript: control.readbackText,
+      });
+      expect(result.statusCode).toBe(200);
+      expect(result.json()).toEqual({ dispatch: false, twiml: null, unavailable: true });
+      expect(await items(call)).toEqual([]);
+    }
   });
 
   it('deduplicates tool preparation and rejects changed arguments on the same tool identity', async () => {
@@ -1314,8 +1665,20 @@ describe('durable phone actions through the authenticated API', () => {
       );
       try {
         await app.ready();
+        const liveCall = await admit(sid(), 'gpt_live');
+        expect(liveCall.twiml.slice(0, liveCall.twiml.indexOf('<Connect'))).not.toContain('<Say');
+        expect(liveCall.twiml).not.toContain('A transcript is saved locally for debugging.');
+        const liveRedemption = await post('redeem', {
+          providerCallSid: liveCall.providerCallSid,
+          streamSid: streamSid(),
+          streamGrant: streamGrant(liveCall.twiml),
+        });
+        expect(liveRedemption.statusCode).toBe(200);
+        expect(liveRedemption.json()).toMatchObject({
+          openingMode: 'gpt_live',
+        });
         const call = await start();
-        expect(call.twiml.includes('A transcript is saved locally for debugging.')).toBe(enabled);
+        expect(call.twiml).not.toContain('A transcript is saved locally for debugging.');
         const control = await prepare(call);
         const proposed = await database.withTenant(DEMO_TENANTS.harbor, (tx) =>
           tx.getCall(call.voiceCallId),

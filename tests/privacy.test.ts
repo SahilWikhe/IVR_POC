@@ -425,6 +425,25 @@ describe('approved caller-content minimization', () => {
       (await inspectRecoveryReadiness({ binding, checkpoint: result.checkpoint, authority })).ready,
     ).toBe(true);
   });
+  it('minimizes the separately rendered Live readback from preparation receipts', async () => {
+    const value = await fixture();
+    await query(
+      'UPDATE receipts SET result=result || $3::jsonb WHERE tenant_id=$1 AND idempotency_key=$2',
+      [
+        tenant,
+        `voice:tool:${value.callId}:test-tool`,
+        JSON.stringify({ readbackText: `${privateText} callback +12125550144` }),
+      ],
+    );
+    await enable();
+    expect(
+      await runPrivacyBatch({ persistence, binding, authority, tenantId: tenant, now }),
+    ).toMatchObject({ planned: 1, minimized: 1 });
+    const all = JSON.stringify(await rows());
+    expect(all).not.toContain(privateText);
+    expect(all).not.toContain('readbackText');
+    expect(all).not.toContain('+12125550144');
+  });
   it('never admits active calls, fulfillment uncertainty, unresolved dispatches, young records, or legal holds', async () => {
     await fixture(tenant, { call: { status: 'active' } });
     await fixture(otherTenant, { inbox: { state: 'NEEDS_RECONCILIATION' } });

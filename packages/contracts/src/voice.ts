@@ -48,10 +48,14 @@ export const voiceCallRecordSchema = z
     streamGrantHash: sha256,
     streamGrantExpiresAt: instant,
     entryTwiml: z.string().max(20_000),
+    // Initial announcement ownership is sealed at admission; old records use Twilio.
+    openingMode: z.enum(['twilio', 'gpt_live']).optional(),
     controlId: id.nullable(),
     controlKind: voiceControlKindSchema.nullable(),
     controlState: voiceControlStateSchema.nullable(),
     controlTwiml: z.string().max(20_000).nullable(),
+    // Omitted legacy records use provider speech for readback and outcomes.
+    readbackMode: z.enum(['twilio', 'gpt_live']).optional(),
     confirmationGrantHash: sha256.nullable(),
     // One additional, call/proposal-bound confirmation after uncertain input.
     // Older records omit this field and have no retry authority.

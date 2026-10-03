@@ -73,21 +73,23 @@ function appendConfirmationGather(
   publicUrl: string,
   confirmationToken: string,
   retry: boolean,
+  silent = false,
 ): void {
-  response
-    .gather({
-      action: `${new URL(publicUrl).origin}/twilio/confirmation/${confirmationToken}`,
-      method: 'POST',
-      input: ['speech', 'dtmf'],
-      numDigits: 1,
-      timeout: 5,
-      speechTimeout: 'auto',
-      maxSpeechTime: 5,
-      hints: 'yes, no',
-      language: 'en-US',
-      actionOnEmptyResult: true,
-    })
-    .say(
+  const gather = response.gather({
+    action: `${new URL(publicUrl).origin}/twilio/confirmation/${confirmationToken}`,
+    method: 'POST',
+    input: ['speech', 'dtmf'],
+    numDigits: 1,
+    timeout: 5,
+    speechTimeout: 'auto',
+    maxSpeechTime: 5,
+    hints: 'yes, no',
+    language: 'en-US',
+    actionOnEmptyResult: true,
+  });
+  if (silent) gather.play(`${new URL(publicUrl).origin}/twilio/confirmation-tone.wav`);
+  else
+    gather.say(
       { language: 'en-US' },
       retry
         ? 'I could not clearly confirm. Say yes or press 1 to save this request for staff review. Say no or press 2 to cancel.'
@@ -100,6 +102,24 @@ function appendConfirmationGather(
     'I could not confirm that your request was saved. Please try again later.',
   );
   response.hangup();
+}
+
+/** Used only after the gateway verifies GPT-Live readback and completed playback. */
+export function buildSilentConfirmationTwiml(input: {
+  publicUrl: string;
+  confirmationToken: string;
+}): string {
+  const parsed = confirmationRetrySchema.safeParse(input);
+  if (!parsed.success) throw new TelephonyInputError();
+  const response = new twilio.twiml.VoiceResponse();
+  appendConfirmationGather(
+    response,
+    parsed.data.publicUrl,
+    parsed.data.confirmationToken,
+    false,
+    true,
+  );
+  return serialize(response);
 }
 
 /** The API supplies the immutable canonical readback and a server-issued bound token. */

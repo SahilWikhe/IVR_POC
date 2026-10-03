@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { loadVoiceConfig, type EnabledVoiceConfig } from '../apps/voice-gateway/src/config.js';
 import {
   createVoiceGateway,
@@ -17,8 +18,13 @@ import type { OperationalEvent, VoiceTranscriptSink } from '../packages/observab
 import type { VoiceApiClient } from '../apps/voice-gateway/src/client.js';
 import type { CallController } from '../apps/voice-gateway/src/control.js';
 import { CallRegistry } from '../apps/voice-gateway/src/registry.js';
-import { voiceInstructions } from '../apps/voice-gateway/src/context.js';
-import type { Restaurant } from '../packages/contracts/src/index.js';
+import { liveOpening, voiceInstructions } from '../apps/voice-gateway/src/context.js';
+import {
+  liveReadbackChunks,
+  liveReadbackMatches,
+  liveReadbackText,
+  type Restaurant,
+} from '../packages/contracts/src/index.js';
 
 const account = `AC${'a'.repeat(32)}`;
 const call = `CA${'b'.repeat(32)}`;
@@ -203,6 +209,7 @@ function fixtureApi(): VoiceApiClient {
       throw new Error('Disabled');
     }),
     dispatch: vi.fn(async () => ({ dispatch: false, twiml: null, unavailable: false })),
+    cancelPrepared: vi.fn(async () => ({ state: 'STREAMING' as const })),
     dispatched: vi.fn(async () => ({ state: 'CONTROL_PENDING' as const })),
     confirmation: vi.fn(async () => {
       throw new Error('Disabled');
@@ -265,7 +272,342 @@ async function openTestStream(
   return { app, socket, provider, connect, playback, response, audio, diagnostics };
 }
 
+describe('GPT-Live opening voice', () => {
+  const startup = z.object({
+    session: z.object({
+      input: z.tuple([
+        z.object({
+          role: z.literal('developer'),
+          content: z.tuple([z.object({ type: z.literal('input_text'), text: z.string() })]),
+        }),
+      ]),
+    }),
+  });
+  it.each([false, true])(
+    'keeps one short Live greeting without debugging commentary with capture %s',
+    async (gatewayCapture) => {
+      const api = fixtureApi();
+      const redeem = api.redeem;
+      api.redeem = vi.fn(async (input) => ({
+        ...(await redeem(input)),
+        openingMode: 'gpt_live' as const,
+      }));
+      const f = await openTestStream(api, undefined, {
+        ...config(),
+        model: 'gpt-live-1',
+        debugTranscripts: gatewayCapture,
+      });
+      try {
+        expect(api.admit).toHaveBeenCalledWith({
+          providerCallSid: call,
+          accountSid: account,
+          openingMode: 'gpt_live',
+        });
+        const commands = f.provider.events.filter(
+          (event) => event.type === 'session.instructions.append',
+        );
+        expect(commands).toHaveLength(1);
+        expect(commands[0]?.content).toBe('Begin the opening now.');
+        const session = f.provider.events.find((event) => event.type === 'session.start');
+        const opening = startup.parse(session).session.input[0].content[0].text;
+        expect(opening).toContain("Thanks for calling Synthetic Harbor. I'm the AI receptionist.");
+        expect(opening).not.toContain('transcript');
+        expect(opening).not.toContain('debugging');
+        expect(opening).toContain('How can I help?');
+        expect(opening).not.toContain('Requests are subject to staff review');
+        expect(Buffer.byteLength(opening)).toBeLessThanOrEqual(650);
+        expect(session).toMatchObject({
+          session: { model: 'gpt-live-1', audio: { output: { voice: 'marin' } } },
+        });
+      } finally {
+        await f.app.close();
+      }
+    },
+  );
+
+  it.each([true, false])(
+    'does not repeat opening notices on a resumed call (spoken=%s)',
+    async (outcomeSpoken) => {
+      const api = fixtureApi();
+      const redeem = api.redeem;
+      api.redeem = vi.fn(async (input) => ({
+        ...(await redeem(input)),
+        openingMode: 'gpt_live' as const,
+        outcome: 'Your request was saved for staff review. Your table is not confirmed.',
+        outcomeSpoken,
+      }));
+      const f = await openTestStream(api, undefined, {
+        ...config(),
+        model: 'gpt-live-1',
+        debugTranscripts: true,
+      });
+      try {
+        const commands = f.provider.events.filter(
+          (event) => event.type === 'session.instructions.append',
+        );
+        expect(commands).toHaveLength(1);
+        expect(commands[0]?.content).toBe('Begin the opening now.');
+        const opening = startup.parse(
+          f.provider.events.find((event) => event.type === 'session.start'),
+        ).session.input[0].content[0].text;
+        expect(opening).not.toContain('Thanks for calling');
+        expect(opening).not.toContain('A transcript is saved');
+        expect(opening).not.toContain("I'm the AI receptionist");
+        expect(opening.includes('Your request was saved for staff review.')).toBe(!outcomeSpoken);
+        expect(opening).toContain('How else can I help?');
+      } finally {
+        await f.app.close();
+      }
+    },
+  );
+
+  it('preserves the AI identity with a maximum-length multibyte restaurant name', () => {
+    const opening = liveOpening(
+      { ...restaurant, name: '食'.repeat(100) },
+      {
+        actionsEnabled: true,
+        transfersEnabled: false,
+        outcome: null,
+      },
+    );
+    expect(Buffer.byteLength(opening)).toBeLessThanOrEqual(480);
+    expect(opening).toContain(`Thanks for calling ${'食'.repeat(100)}. I'm the AI receptionist.`);
+    expect(opening).not.toContain('transcript');
+  });
+
+  it('does not start a legacy model after a Live-owned opening was admitted', async () => {
+    const api = fixtureApi();
+    const redeem = api.redeem;
+    api.redeem = vi.fn(async (input) => ({
+      ...(await redeem(input)),
+      openingMode: 'gpt_live' as const,
+    }));
+    const connect = vi.fn(() => new Peer());
+    const diagnostics: OperationalEvent[] = [];
+    const app = await createVoiceGateway(config(), {
+      api,
+      connectProvider: connect,
+      onDiagnostic: (event) => diagnostics.push(event),
+    });
+    try {
+      await app.ready();
+      const admission = await app.inject(callback());
+      const socket = await app.injectWS('/twilio/media', { headers: socketHeaders });
+      socket.send(connected);
+      socket.send(JSON.stringify(start(grant(admission.body))));
+      await vi.waitFor(() =>
+        expect(diagnostics).toEqual(
+          expect.arrayContaining([expect.objectContaining({ code: 'provider_setup_failed' })]),
+        ),
+      );
+      expect(connect).not.toHaveBeenCalled();
+      const redeemed = await vi.mocked(api.redeem).mock.results[0]?.value;
+      await vi.waitFor(() =>
+        expect(api.end).toHaveBeenCalledWith({
+          providerCallSid: call,
+          generation: redeemed?.generation,
+          reason: 'stream_closed',
+        }),
+      );
+    } finally {
+      await app.close();
+    }
+  });
+});
+
 describe('GPT-Live gateway policy and request handoff', () => {
+  const readbackText = liveReadbackText(
+    'Please review your reservation request: 4 people on 2026-10-04 at 19:00 (America/New_York), under Synthetic Guest, callback +12125550111. This is a request for staff review; your table is not confirmed.',
+  );
+  const readCommand = 'Read exactly this text, without additions. Then stay silent: ';
+  type LiveFixture = Awaited<ReturnType<typeof openTestStream>>;
+
+  async function settleSpeechBoundary(
+    f: LiveFixture,
+    advance: (milliseconds: number) => void,
+    count = 1,
+  ) {
+    const stops = () =>
+      f.provider.events.filter(
+        (event) =>
+          typeof event.content === 'string' && event.content.startsWith('Stop speaking now.'),
+      );
+    await vi.waitFor(() => expect(stops()).toHaveLength(count));
+    f.provider.emit(
+      'message',
+      JSON.stringify({
+        type: 'session.instructions.appended',
+        client_event_id: stops()[count - 1]!.event_id,
+      }),
+      false,
+    );
+    f.provider.emit(
+      'message',
+      JSON.stringify({
+        type: 'session.output_audio.delta',
+        delta: Buffer.alloc(8000, 255).toString('base64'),
+      }),
+      false,
+    );
+    advance(1000);
+  }
+
+  async function startRequest(f: LiveFixture, advance: (milliseconds: number) => void) {
+    f.socket.send(
+      JSON.stringify({
+        event: 'media',
+        sequenceNumber: '2',
+        streamSid: stream,
+        media: {
+          track: 'inbound',
+          timestamp: '0',
+          chunk: '1',
+          payload: Buffer.alloc(3200, 255).toString('base64'),
+        },
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(f.provider.events.some((event) => event.type === 'session.input_audio.append')).toBe(
+        true,
+      ),
+    );
+    f.provider.emit(
+      'message',
+      JSON.stringify({
+        type: 'session.input_transcript.delta',
+        event_id: 'live-input-1',
+        delta: 'Tomorrow at seven for four, Synthetic Guest, 2125550111.',
+        start_ms: 0,
+        end_ms: 300,
+      }),
+      false,
+    );
+    f.provider.emit(
+      'message',
+      JSON.stringify({
+        type: 'session.delegation.created',
+        event_id: 'live-delegate-1',
+        offset_ms: 350,
+        delegation: { id: 'live-task-1', type: 'delegation', target: 'client' },
+      }),
+      false,
+    );
+    await settleSpeechBoundary(f, advance);
+    await vi.waitFor(() =>
+      expect(
+        f.provider.events.some(
+          (event) => typeof event.content === 'string' && event.content.startsWith(readCommand),
+        ),
+      ).toBe(true),
+    );
+  }
+
+  async function playReadback(f: LiveFixture, advance: (milliseconds: number) => void) {
+    let sequence = 3;
+    f.socket.on('message', (data) => {
+      const event = JSON.parse(data.toString());
+      if (event.event === 'mark' && f.socket.readyState === 1)
+        f.socket.send(
+          JSON.stringify({
+            event: 'mark',
+            sequenceNumber: String(sequence++),
+            streamSid: stream,
+            mark: event.mark,
+          }),
+        );
+    });
+    const chunks = liveReadbackChunks(readbackText);
+    for (let index = 0; index < chunks.length; index += 1) {
+      const commands = () =>
+        f.provider.events.filter(
+          (event) => typeof event.content === 'string' && event.content.startsWith(readCommand),
+        );
+      await vi.waitFor(() => expect(commands()).toHaveLength(index + 1));
+      const instruction = commands()[index]!;
+      expect(JSON.parse((instruction.content as string).slice(readCommand.length))).toBe(
+        chunks[index],
+      );
+      f.provider.emit(
+        'message',
+        JSON.stringify({
+          type: 'session.instructions.appended',
+          client_event_id: instruction.event_id,
+        }),
+        false,
+      );
+      f.provider.emit(
+        'message',
+        JSON.stringify({
+          type: 'session.output_transcript.delta',
+          event_id: randomUUID(),
+          delta: chunks[index],
+          start_ms: 0,
+          end_ms: 300,
+        }),
+        false,
+      );
+      f.provider.emit(
+        'message',
+        JSON.stringify({
+          type: 'session.output_audio.delta',
+          delta: Buffer.concat([Buffer.alloc(800, 128), Buffer.alloc(4800, 255)]).toString(
+            'base64',
+          ),
+        }),
+        false,
+      );
+      advance(350);
+    }
+    return () => sequence++;
+  }
+
+  async function requestFixture() {
+    const api = fixtureApi();
+    const redeem = api.redeem;
+    api.redeem = vi.fn(async (input) => ({ ...(await redeem(input)), actionsEnabled: true }));
+    const controlId = randomUUID();
+    api.propose = vi.fn(async () => ({ controlId, twiml: '<Response/>', readbackText }));
+    api.dispatch = vi.fn(async () => ({
+      dispatch: true,
+      twiml: '<Response><Gather input="speech dtmf"/></Response>',
+      unavailable: false,
+    }));
+    const controller: CallController = {
+      dispatch: vi.fn(async () => ({ outcome: 'accepted' as const })),
+    };
+    const delegate = vi.fn<NonNullable<VoiceDependencies['delegate']>>(async ({ transcript }) => ({
+      kind: 'tool',
+      name: 'prepare_request',
+      callId: 'live-call-tool',
+      arguments: JSON.stringify({
+        dateExpression: 'tomorrow',
+        date_utterance_id: transcript.find((part) => part.role === 'user')?.dateReference,
+        time: '19:00',
+        partySize: 4,
+        name: 'Synthetic Guest',
+        callbackNumber: '+12125550111',
+        notes: '',
+      }),
+    }));
+    let clock = Date.now();
+    const f = await openTestStream(
+      api,
+      () => clock,
+      { ...config(), model: 'gpt-live-1', actionsEnabled: true },
+      controller,
+      delegate,
+    );
+    return {
+      f,
+      api,
+      controller,
+      controlId,
+      advance: (milliseconds: number) => {
+        clock += milliseconds;
+      },
+    };
+  }
+
   it.each([true, false])(
     'checks continuous audio before releasing it (allowed=%s)',
     async (allowed) => {
@@ -331,10 +673,10 @@ describe('GPT-Live gateway policy and request handoff', () => {
       const redeem = api.redeem;
       api.redeem = vi.fn(async (input) => ({ ...(await redeem(input)), actionsEnabled: true }));
       const controlId = randomUUID();
-      api.propose = vi.fn(async () => ({ controlId, twiml: '<Response/>' }));
+      api.propose = vi.fn(async () => ({ controlId, twiml: '<Response/>', readbackText }));
       api.dispatch = vi.fn(async () => ({
         dispatch: true,
-        twiml: '<Response><Say>Canonical readback</Say><Gather/></Response>',
+        twiml: '<Response><Gather input="speech dtmf"/></Response>',
         unavailable: false,
       }));
       const controller: CallController = {
@@ -356,9 +698,10 @@ describe('GPT-Live gateway policy and request handoff', () => {
           }),
         }),
       );
+      let clock = Date.now();
       const f = await openTestStream(
         api,
-        undefined,
+        () => clock,
         {
           ...config(),
           model: 'gpt-live-1',
@@ -374,50 +717,19 @@ describe('GPT-Live gateway policy and request handoff', () => {
         },
       );
       try {
-        f.socket.send(
-          JSON.stringify({
-            event: 'media',
-            sequenceNumber: '2',
-            streamSid: stream,
-            media: {
-              track: 'inbound',
-              timestamp: '0',
-              chunk: '1',
-              payload: Buffer.alloc(3200, 255).toString('base64'),
-            },
-          }),
-        );
-        await vi.waitFor(() =>
-          expect(
-            f.provider.events.some((event) => event.type === 'session.input_audio.append'),
-          ).toBe(true),
-        );
-        f.provider.emit(
-          'message',
-          JSON.stringify({
-            type: 'session.input_transcript.delta',
-            event_id: 'live-input-1',
-            delta: 'Tomorrow at seven for four, Synthetic Guest, 2125550111.',
-            start_ms: 0,
-            end_ms: 300,
-          }),
-          false,
-        );
-        f.provider.emit(
-          'message',
-          JSON.stringify({
-            type: 'session.delegation.created',
-            event_id: 'live-delegate-1',
-            offset_ms: 350,
-            delegation: { id: 'live-task-1', type: 'delegation', target: 'client' },
-          }),
-          false,
-        );
+        await startRequest(f, (milliseconds) => {
+          clock += milliseconds;
+        });
+        expect(controller.dispatch).not.toHaveBeenCalled();
+        await playReadback(f, (milliseconds) => {
+          clock += milliseconds;
+        });
         await vi.waitFor(() => expect(controller.dispatch).toHaveBeenCalledOnce());
         expect(api.propose).toHaveBeenCalledWith(
           expect.objectContaining({
             providerCallSid: call,
             toolCallId: 'live-call-tool',
+            readbackMode: 'gpt_live',
             proposal: {
               kind: 'reservation',
               reservation: {
@@ -431,6 +743,13 @@ describe('GPT-Live gateway policy and request handoff', () => {
             },
           }),
         );
+        expect(controller.dispatch).toHaveBeenCalledWith(
+          call,
+          '<Response><Gather input="speech dtmf"/></Response>',
+          expect.any(AbortSignal),
+        );
+        const admittedTranscript = vi.mocked(api.dispatch).mock.calls[0]?.[0].readbackTranscript;
+        expect(liveReadbackMatches(readbackText, admittedTranscript ?? '')).toBe(true);
         expect(api.confirmation).not.toHaveBeenCalled();
         expect(api.dispatched).toHaveBeenCalledWith(
           expect.objectContaining({ controlId, outcome: 'accepted' }),
@@ -494,6 +813,121 @@ describe('GPT-Live gateway policy and request handoff', () => {
       }
     },
   );
+
+  it.each(['speech', 'keypad'] as const)(
+    'cancels the prepared proposal when %s interrupts Live readback',
+    async (kind) => {
+      const { f, api, controller, controlId, advance } = await requestFixture();
+      try {
+        await startRequest(f, advance);
+        if (kind === 'speech')
+          f.provider.emit(
+            'message',
+            JSON.stringify({
+              type: 'session.input_transcript.delta',
+              event_id: 'readback-correction',
+              delta: 'Actually make it five people.',
+              start_ms: 300,
+              end_ms: 400,
+            }),
+            false,
+          );
+        else
+          f.socket.send(
+            JSON.stringify({
+              event: 'dtmf',
+              sequenceNumber: '3',
+              streamSid: stream,
+              dtmf: { track: 'inbound_track', digit: '1' },
+            }),
+          );
+        await vi.waitFor(() =>
+          expect(api.cancelPrepared).toHaveBeenCalledWith(
+            expect.objectContaining({ controlId, providerCallSid: call }),
+          ),
+        );
+        expect(api.dispatch).not.toHaveBeenCalled();
+        expect(controller.dispatch).not.toHaveBeenCalled();
+        expect(api.confirmation).not.toHaveBeenCalled();
+        await settleSpeechBoundary(f, advance, 2);
+        await vi.waitFor(() =>
+          expect(
+            f.provider.events.some(
+              (event) =>
+                typeof event.content === 'string' &&
+                event.content.includes('Nothing has been saved.'),
+            ),
+          ).toBe(true),
+        );
+      } finally {
+        await f.app.close();
+      }
+    },
+  );
+
+  it('rejects an admitted dispatch if a correction arrives while its API reply is pending', async () => {
+    const { f, api, controller, controlId, advance } = await requestFixture();
+    let admit: ((value: Awaited<ReturnType<VoiceApiClient['dispatch']>>) => void) | undefined;
+    api.dispatch = vi.fn<VoiceApiClient['dispatch']>(
+      async () =>
+        new Promise((resolve) => {
+          admit = resolve;
+        }),
+    );
+    try {
+      await startRequest(f, advance);
+      await playReadback(f, advance);
+      await vi.waitFor(() => expect(admit).toBeTypeOf('function'));
+      f.provider.emit(
+        'message',
+        JSON.stringify({
+          type: 'session.input_transcript.delta',
+          event_id: 'late-readback-correction',
+          delta: 'No, change the time.',
+          start_ms: 300,
+          end_ms: 400,
+        }),
+        false,
+      );
+      admit?.({ dispatch: true, twiml: '<Response><Gather/></Response>', unavailable: false });
+      await vi.waitFor(() =>
+        expect(api.dispatched).toHaveBeenCalledWith(
+          expect.objectContaining({ controlId, outcome: 'rejected' }),
+        ),
+      );
+      expect(controller.dispatch).not.toHaveBeenCalled();
+      expect(api.confirmation).not.toHaveBeenCalled();
+    } finally {
+      await f.app.close();
+    }
+  });
+
+  it('keeps checking policy while the Live readback is pending', async () => {
+    const { f, api, controller, advance } = await requestFixture();
+    try {
+      await startRequest(f, advance);
+      vi.mocked(api.policy).mockResolvedValue({
+        allowed: false,
+        configurationVersion: restaurant.version,
+        actionsEnabled: false,
+        transfersEnabled: false,
+      });
+      await vi.waitFor(
+        () => expect(f.provider.events.some((event) => event.type === 'session.close')).toBe(true),
+        { timeout: 6000 },
+      );
+      expect(api.policy).toHaveBeenCalledTimes(2);
+      expect(controller.dispatch).not.toHaveBeenCalled();
+      expect(api.dispatch).not.toHaveBeenCalled();
+      expect(f.diagnostics).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ event: 'voice.stream_closed', code: 'policy_denied' }),
+        ]),
+      );
+    } finally {
+      await f.app.close();
+    }
+  }, 8000);
 });
 
 describe('bounded media arrival and playback acknowledgments', () => {

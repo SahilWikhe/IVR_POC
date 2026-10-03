@@ -3,6 +3,12 @@ import { z } from 'zod';
 import { voiceProposalInputSchema } from '@hostline/contracts';
 import type { VoiceTranscriptEvent } from '@hostline/observability';
 import {
+  LiveReadback,
+  LiveSpeechBoundary,
+  audiblePcmu,
+  type LiveReadbackDiagnostic,
+} from './live-readback.js';
+import {
   decodeAudio,
   type AudioPeer,
   type RelayDiagnosticCode,
@@ -22,7 +28,19 @@ export interface LiveDelegationInput {
 export type LiveDelegationResult =
   | { kind: 'reply'; text: string; awaitingCaller?: boolean }
   | { kind: 'tool'; name: string; arguments: string; callId: string };
+type LiveProtocolFailure =
+  | 'protocol_configuration_invalid'
+  | 'protocol_input_audio_invalid'
+  | 'protocol_envelope_invalid'
+  | 'protocol_event_before_ready'
+  | 'protocol_instruction_ack_invalid'
+  | 'protocol_output_audio_invalid'
+  | `protocol_${'caller' | 'assistant'}_transcript_${'invalid' | 'before_input' | 'reversed' | 'ahead'}`
+  | 'protocol_delegation_invalid'
+  | 'protocol_handler_failed';
 export type LiveWorkflowStage =
+  | LiveReadbackDiagnostic
+  | LiveProtocolFailure
   | 'session_ready'
   | 'delegation_requested'
   | 'backend_started'
@@ -37,6 +55,9 @@ export type LiveWorkflowStage =
   | 'control_handoff_started'
   | 'control_handoff_unavailable'
   | 'control_handoff_accepted'
+  | 'readback_playback_started'
+  | 'readback_playback_checked'
+  | 'readback_playback_rejected'
   | 'control_handoff_failed';
 export interface LiveRelayOptions extends RelayOptions {
   opening: string;
@@ -116,6 +137,13 @@ export class LiveAudioRelay {
   private configured = false;
   private closed = false;
   private controlled = false;
+  private controlRevision = 0;
+  private readback: LiveReadback | undefined;
+  private recoveryBoundary: LiveSpeechBoundary | undefined;
+  private retryAfterRevision: number | undefined;
+  private approvedReadbackRevision: number | undefined;
+  private controlSpeechMs = 0;
+  private readbackFailed = false;
   private pendingInput: string[] = [];
   private pendingInputBytes = 0;
   private firstInputAt: number | undefined;
@@ -154,7 +182,7 @@ export class LiveAudioRelay {
   configure(instructions: string): void {
     if (this.closed) return;
     if (this.configured || !appendText.safeParse(this.options.opening).success)
-      return this.close('provider_protocol_error');
+      return this.protocolFailure('protocol_configuration_invalid');
     this.configured = true;
     this.send(this.provider, {
       type: 'session.start',
@@ -165,14 +193,42 @@ export class LiveAudioRelay {
         instructions,
         audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: 'marin' } },
         delegation: { type: 'client' },
+        // Startup input is available immediately. A short, one-time cue below
+        // avoids streaming the entire greeting into the running timeline.
+        input: [
+          {
+            type: 'message',
+            role: 'developer',
+            content: [
+              {
+                type: 'input_text',
+                text: `Opening instructions: ${this.options.opening} Wait until the application says "Begin the opening" before executing these instructions.`,
+              },
+            ],
+          },
+        ],
       },
     });
   }
 
   input(payload: string, receivedAt = (this.options.now ?? Date.now)()): void {
-    if (this.closed || this.controlled) return;
+    if (this.closed) return;
     const audio = decodeAudio(payload, 3200);
-    if (!audio || !Number.isFinite(receivedAt)) return this.close('provider_protocol_error');
+    if (!audio || !Number.isFinite(receivedAt))
+      return this.protocolFailure('protocol_input_audio_invalid');
+    if (this.readback)
+      for (let offset = 0; offset < audio.length; offset += 160)
+        this.readback.callerAudio(audio.subarray(offset, offset + 160));
+    if (this.approvedReadbackRevision !== undefined) {
+      for (let offset = 0; offset < audio.length; offset += 160) {
+        const frame = audio.subarray(offset, offset + 160);
+        this.controlSpeechMs = audiblePcmu(frame) ? this.controlSpeechMs + frame.length / 8 : 0;
+        if (this.controlSpeechMs >= 160) {
+          this.interruptReadback();
+          break;
+        }
+      }
+    }
     this.firstInputAt ??= receivedAt;
     if (!this.ready) {
       this.pendingInputBytes += audio.length;
@@ -206,15 +262,20 @@ export class LiveAudioRelay {
       return;
     }
     if (Buffer.byteLength(raw) > 192 * 1024) return this.close('relay_buffer_limit');
+    let event: z.infer<typeof envelopeSchema>;
     try {
-      const event = envelopeSchema.parse(JSON.parse(raw));
+      event = envelopeSchema.parse(JSON.parse(raw));
+    } catch {
+      return this.protocolFailure('protocol_envelope_invalid');
+    }
+    try {
       if (event.type === 'error') return this.close('provider_error');
       if (event.type === 'session.closed') {
         this.providerFinalized = true;
         return this.close();
       }
       if (event.type === 'session.started') {
-        if (!this.configured) return this.close('provider_protocol_error');
+        if (!this.configured) return this.protocolFailure('protocol_event_before_ready');
         if (this.ready) return;
         this.ready = true;
         this.stage('session_ready');
@@ -226,11 +287,26 @@ export class LiveAudioRelay {
           type: 'session.instructions.append',
           event_id: randomUUID(),
           delegation_id: null,
-          content: this.options.opening,
+          content: 'Begin the opening now.',
         });
         return;
       }
-      if (this.controlled) return;
+      if (event.type === 'session.instructions.appended') {
+        const parsed = z.object({ client_event_id: identifier }).safeParse(event);
+        if (!parsed.success) return this.protocolFailure('protocol_instruction_ack_invalid');
+        const ack = parsed.data;
+        this.readback?.acknowledge(ack.client_event_id);
+        this.recoveryBoundary?.acknowledge(ack.client_event_id);
+        return;
+      }
+      if (
+        this.controlled &&
+        !this.readback &&
+        !this.recoveryBoundary &&
+        event.type !== 'session.input_transcript.delta' &&
+        event.type !== 'session.delegation.created'
+      )
+        return;
       if (
         [
           'session.output_audio.delta',
@@ -240,37 +316,24 @@ export class LiveAudioRelay {
         ].includes(event.type) &&
         !this.ready
       )
-        return this.close('provider_protocol_error');
+        return this.protocolFailure('protocol_event_before_ready');
       switch (event.type) {
         case 'session.output_audio.delta': {
-          const delta = z.object({ delta: z.string().max(128 * 1024) }).parse(event);
-          const audio = decodeAudio(delta.delta, 96 * 1024);
-          if (!audio) return this.close('provider_protocol_error');
+          const parsed = z.object({ delta: z.string().max(128 * 1024) }).safeParse(event);
+          if (!parsed.success) return this.protocolFailure('protocol_output_audio_invalid');
+          const audio = decodeAudio(parsed.data.delta, 96 * 1024);
+          if (!audio) return this.protocolFailure('protocol_output_audio_invalid');
+          if (this.recoveryBoundary) {
+            this.recoveryBoundary.output(audio);
+            return;
+          }
           // Live emits a continuous stream, including silence. There are no
           // response/item playback boundaries or Realtime cancellation events.
-          for (let offset = 0; offset < audio.length; offset += 800) {
-            const part = audio.subarray(offset, offset + 800);
-            if (this.queuedOutputBytes + part.length > 16_000 || this.marks.size >= 200)
-              return this.close('relay_buffer_limit');
-            const mark = `p${++this.markCounter}`;
-            this.marks.set(mark, part.length);
-            this.queuedOutputBytes += part.length;
-            if (
-              !this.send(this.twilio, {
-                event: 'media',
-                streamSid: this.streamSid,
-                media: { payload: part.toString('base64') },
-              })
-            )
-              return;
-            if (
-              !this.send(this.twilio, {
-                event: 'mark',
-                streamSid: this.streamSid,
-                mark: { name: mark },
-              })
-            )
-              return;
+          const frameBytes = this.readback ? 160 : 800;
+          for (let offset = 0; offset < audio.length; offset += frameBytes) {
+            const part = audio.subarray(offset, offset + frameBytes);
+            if (this.readback && !this.readback.output(part)) continue;
+            if (!this.playAudioFrame(part)) return;
           }
           return;
         }
@@ -282,12 +345,25 @@ export class LiveAudioRelay {
           );
           return;
         case 'session.delegation.created': {
-          const { delegation } = delegationSchema.parse(event);
+          const parsed = delegationSchema.safeParse(event);
+          if (!parsed.success) return this.protocolFailure('protocol_delegation_invalid');
+          const { delegation } = parsed.data;
           if (this.delegations.has(delegation.id)) return;
           if (this.delegations.size >= 80) return this.close('relay_buffer_limit');
+          if (
+            this.controlled ||
+            (this.retryAfterRevision !== undefined &&
+              this.callerRevision <= this.retryAfterRevision)
+          ) {
+            // Remember a stale request so replaying its ID after later speech
+            // cannot turn the failed readback into an automatic retry.
+            this.delegations.set(delegation.id, { id: delegation.id, state: 'settled' });
+            return;
+          }
+          this.retryAfterRevision = undefined;
           // A new provider request supersedes unfinished local work. Keep one
           // current task, so a repeated delegation cannot prepare two proposals.
-          for (const task of this.delegations.values()) task.state = 'settled';
+          this.settleDelegations();
           this.cancelBackend();
           this.delegations.set(delegation.id, { id: delegation.id, state: 'waiting' });
           this.stage('delegation_requested');
@@ -299,21 +375,24 @@ export class LiveAudioRelay {
           return;
       }
     } catch {
-      this.close('provider_protocol_error');
+      this.protocolFailure('protocol_handler_failed');
     }
   }
 
   private transcript(event: unknown, role: 'user' | 'assistant'): void {
-    const fragment = transcriptSchema.parse(event);
+    const source = role === 'user' ? 'caller' : 'assistant';
+    const parsed = transcriptSchema.safeParse(event);
+    if (!parsed.success) return this.protocolFailure(`protocol_${source}_transcript_invalid`);
+    const fragment = parsed.data;
     if (this.transcriptEvents.has(fragment.event_id)) return;
-    if (
-      this.firstInputAt === undefined ||
-      fragment.end_ms < fragment.start_ms ||
-      // Live's approximate fragment boundaries can precede the next audio
-      // append. Defer bounded lookahead rather than minting a future reference.
-      fragment.end_ms > this.forwardedDurationMs + 1000
-    )
-      return this.close('provider_protocol_error');
+    if (this.firstInputAt === undefined)
+      return this.protocolFailure(`protocol_${source}_transcript_before_input`);
+    if (fragment.end_ms < fragment.start_ms)
+      return this.protocolFailure(`protocol_${source}_transcript_reversed`);
+    // Live's approximate fragment boundaries can precede the next audio
+    // append. Defer bounded lookahead rather than minting a future reference.
+    if (fragment.end_ms > this.forwardedDurationMs + 1000)
+      return this.protocolFailure(`protocol_${source}_transcript_ahead`);
     const bytes = Buffer.byteLength(JSON.stringify(fragment));
     if (
       this.fragments.length + this.pendingFragments.length >= 1024 ||
@@ -332,12 +411,14 @@ export class LiveAudioRelay {
     this.pendingFragmentBytes += bytes;
     this.transcriptEvents.add(fragment.event_id);
     if (role === 'user') {
+      if (this.controlled) this.readbackFailed = true;
+      this.readback?.cancel();
       // Invalidate work immediately, even while this fragment waits for audio.
       this.callerRevision += 1;
       if (this.delegateTimer) clearTimeout(this.delegateTimer);
       this.delegateTimer = undefined;
       const active = this.activeDelegation;
-      if (active && !active.controller.signal.aborted) {
+      if (active?.task.state === 'running' && !active.controller.signal.aborted) {
         active.task.state = 'waiting';
         this.cancelBackend();
       }
@@ -347,6 +428,25 @@ export class LiveAudioRelay {
         if (task.state === 'awaiting_caller') task.state = 'waiting';
     }
     this.flushTranscripts();
+  }
+
+  private playAudioFrame(part: Uint8Array): boolean {
+    if (this.closed) return false;
+    if (this.queuedOutputBytes + part.length > 16_000 || this.marks.size >= 200) {
+      this.close('relay_buffer_limit');
+      return false;
+    }
+    const mark = `p${++this.markCounter}`;
+    this.marks.set(mark, part.length);
+    this.queuedOutputBytes += part.length;
+    return (
+      this.send(this.twilio, {
+        event: 'media',
+        streamSid: this.streamSid,
+        media: { payload: Buffer.from(part).toString('base64') },
+      }) &&
+      this.send(this.twilio, { event: 'mark', streamSid: this.streamSid, mark: { name: mark } })
+    );
   }
 
   private flushTranscripts(): void {
@@ -373,6 +473,10 @@ export class LiveAudioRelay {
         endMs: fragment.endMs,
         entry,
       });
+      if (fragment.role === 'assistant') {
+        this.readback?.text(fragment.text);
+        this.recoveryBoundary?.text();
+      }
       // Preserve arrival order and exact spacing, including late/overlapping
       // fragments. Approximate timing cannot reorder a speaker's words.
       if (Buffer.byteLength(JSON.stringify(this.fragments.map((value) => value.entry))) > 48 * 1024)
@@ -392,6 +496,7 @@ export class LiveAudioRelay {
     if (
       this.closed ||
       this.controlled ||
+      this.retryAfterRevision !== undefined ||
       this.pendingFragments.some((fragment) => fragment.role === 'user') ||
       !this.fragments.some((value) => value.entry.role === 'user')
     )
@@ -410,6 +515,7 @@ export class LiveAudioRelay {
     if (
       this.closed ||
       this.controlled ||
+      this.retryAfterRevision !== undefined ||
       this.activeDelegation ||
       this.pendingFragments.some((fragment) => fragment.role === 'user')
     )
@@ -537,10 +643,13 @@ export class LiveAudioRelay {
       return;
     }
     this.controlled = true;
+    this.settleDelegations();
+    this.controlRevision = this.callerRevision;
+    this.readbackFailed = false;
     this.clearPlayback();
     if (this.closed) return;
-    // All model output/input is suppressed while deterministic server control
-    // prepares the canonical readback. A model tool never confirms or saves.
+    // Ordinary model output/delegation is suppressed during server control.
+    // Input stays continuous so corrections can invalidate the readback.
     this.capture({
       kind: 'tool_proposal',
       tool:
@@ -562,8 +671,43 @@ export class LiveAudioRelay {
     if (this.closed) return;
     if (outcome === 'unavailable') {
       this.stage('control_handoff_unavailable');
-      this.controlled = false;
-      this.commentary(delegationId, unavailable);
+      this.settleDelegations();
+      if (this.readbackFailed) {
+        this.clearPlayback();
+        const boundary = new LiveSpeechBoundary({
+          instructions: (eventId, content) => {
+            this.send(this.provider, {
+              type: 'session.instructions.append',
+              event_id: eventId,
+              delegation_id: null,
+              content,
+            });
+          },
+          drained: () => this.playbackAndTranscriptDrained(),
+          diagnostic: (code) => this.stage(code),
+          now: this.options.now ?? Date.now,
+        });
+        this.recoveryBoundary = boundary;
+        const quiet = await boundary.run();
+        if (this.recoveryBoundary === boundary) this.recoveryBoundary = undefined;
+        if (this.closed) return;
+        if (!quiet) return this.close('provider_error');
+        // This includes received-but-deferred fragments: admission later does
+        // not create a newer caller revision or authorize another preparation.
+        this.retryAfterRevision = this.callerRevision;
+        this.settleDelegations();
+        this.controlled = false;
+        this.send(this.provider, {
+          type: 'session.instructions.append',
+          event_id: randomUUID(),
+          delegation_id: null,
+          content:
+            'Resume normal conversation. Say only: "Nothing has been saved. Would you like me to read the details again? Please wait for the tone before confirming." Then listen. Keep all details already collected. Do not delegate or prepare again until the caller explicitly asks to retry or gives a new correction after this question.',
+        });
+      } else {
+        this.controlled = false;
+        this.commentary(delegationId, unavailable);
+      }
     } else if (outcome === 'controlled') this.stage('control_handoff_accepted');
     else {
       this.stage('control_handoff_failed');
@@ -580,12 +724,78 @@ export class LiveAudioRelay {
     });
   }
 
+  /** Only the gateway supplies API-authored text; this is not a model tool. */
+  async speakReadback(text: string): Promise<string | null> {
+    this.readbackFailed = true;
+    if (
+      this.closed ||
+      !this.controlled ||
+      this.controlRevision !== this.callerRevision ||
+      this.readback
+    )
+      return null;
+    this.clearPlayback();
+    this.approvedReadbackRevision = undefined;
+    const readback = new LiveReadback(text, {
+      instructions: (eventId, content) => {
+        this.send(this.provider, {
+          type: 'session.instructions.append',
+          event_id: eventId,
+          delegation_id: null,
+          content,
+        });
+      },
+      drained: () => this.playbackAndTranscriptDrained(),
+      diagnostic: (code) => this.stage(code),
+      playBuffered: (audio) => {
+        this.playAudioFrame(audio);
+      },
+      now: this.options.now ?? Date.now,
+    });
+    this.readback = readback;
+    this.stage('readback_playback_started');
+    const transcript = await readback.run();
+    if (this.readback === readback) this.readback = undefined;
+    if (transcript === null) this.clearPlayback();
+    if (this.closed || this.controlRevision !== this.callerRevision || transcript === null) {
+      this.stage('readback_playback_rejected');
+      return null;
+    }
+    this.approvedReadbackRevision = this.callerRevision;
+    this.readbackFailed = false;
+    this.controlSpeechMs = 0;
+    this.stage('readback_playback_checked');
+    return transcript;
+  }
+
+  get readbackIsCurrent(): boolean {
+    return (
+      !this.closed &&
+      this.approvedReadbackRevision !== undefined &&
+      this.approvedReadbackRevision === this.callerRevision
+    );
+  }
+
+  interruptReadback(): void {
+    if (!this.controlled) return;
+    this.readbackFailed = true;
+    this.approvedReadbackRevision = undefined;
+    this.callerRevision += 1;
+    this.readback?.cancel();
+  }
+
   played(mark: string): void {
     if (this.closed) return;
     const bytes = this.marks.get(mark);
     if (bytes === undefined) return;
     this.queuedOutputBytes -= bytes;
     this.marks.delete(mark);
+  }
+
+  private playbackAndTranscriptDrained(): boolean {
+    return (
+      this.marks.size === 0 && !this.pendingFragments.some((entry) => entry.role === 'assistant')
+    );
   }
 
   private clearPlayback(): void {
@@ -622,6 +832,13 @@ export class LiveAudioRelay {
     }
   }
 
+  private protocolFailure(code: LiveProtocolFailure): void {
+    // Only fixed reason codes cross the diagnostic boundary; rejected text,
+    // event identifiers, audio and raw validation/provider errors never do.
+    this.stage(code);
+    this.close('provider_protocol_error');
+  }
+
   private capture(event: VoiceTranscriptEvent): void {
     if (!this.options.onTranscript) return;
     try {
@@ -641,9 +858,19 @@ export class LiveAudioRelay {
     active.controller.abort();
   }
 
+  private settleDelegations(): void {
+    if (this.delegateTimer) clearTimeout(this.delegateTimer);
+    this.delegateTimer = undefined;
+    for (const task of this.delegations.values()) task.state = 'settled';
+  }
+
   close(reason?: RelayDiagnosticCode): void {
     if (this.closed) return;
     this.closed = true;
+    this.readback?.cancel();
+    this.readback = undefined;
+    this.recoveryBoundary?.cancel();
+    this.recoveryBoundary = undefined;
     if (reason) {
       try {
         this.options.onDiagnostic?.(reason);

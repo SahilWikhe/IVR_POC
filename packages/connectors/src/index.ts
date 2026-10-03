@@ -3,6 +3,7 @@ import { z } from 'zod';
 export {
   buildConfirmationRetryTwiml,
   buildReadbackTwiml,
+  buildSilentConfirmationTwiml,
   buildTransferTwiml,
   TelephonyInputError,
 } from './telephony.js';

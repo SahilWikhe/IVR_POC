@@ -406,11 +406,15 @@ function minimizeReceipt(
   }
   if (key.startsWith(`voice:tool:${call.id}:`)) {
     const parsed = z
-      .object({ controlId: uuid, twiml: z.string().max(20_000) })
+      .object({
+        controlId: uuid,
+        twiml: z.string().max(20_000),
+        readbackText: z.string().max(3000).optional(),
+      })
       .strict()
       .safeParse(result);
     if (!parsed.success) fail('UNKNOWN_RECEIPT');
-    return { ...parsed.data, twiml: terminalTwiml };
+    return { controlId: parsed.data.controlId, twiml: terminalTwiml };
   }
   if (/^voice:(?:confirmation|transfer-result):[a-f0-9]{64}$/.test(key)) {
     const parsed = z

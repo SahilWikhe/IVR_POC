@@ -7,6 +7,9 @@ import {
   providerCallSidSchema,
   providerStreamSidSchema,
   voiceProposalInputSchema,
+  liveReadbackText,
+  liveReadbackMatches,
+  liveReadbackChunks,
   type CallSession,
   type Restaurant,
   type PhonePolicy,
@@ -20,6 +23,7 @@ import {
 } from '@hostline/domain';
 import {
   buildReadbackTwiml,
+  buildSilentConfirmationTwiml,
   buildConfirmationRetryTwiml,
   buildTransferTwiml,
   TelephonyInputError,
@@ -82,6 +86,21 @@ const equal = (a: string, b: string) => {
     right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 };
+
+function renderLiveReadback(readback: string): string {
+  try {
+    const text = liveReadbackText(readback);
+    if (text.length > 3000) throw new Error('Readback exceeds its bound');
+    if (liveReadbackChunks(text).length > 12) throw new Error('Readback exceeds its chunk bound');
+    return text;
+  } catch {
+    throw new VoiceError(
+      'INVALID_VOICE_PROPOSAL',
+      400,
+      'These details could not be safely read back. Please simplify the message or notes and try again.',
+    );
+  }
+}
 
 function hangup(message = 'This call has ended. If you still need help, please try again later.') {
   const response = new twilio.twiml.VoiceResponse();
@@ -279,7 +298,13 @@ export async function registerVoiceActions(
     Date.parse(record.createdAt) + config.voice.maxCallSeconds * 1000;
   const remaining = (record: VoiceCallRecord, now: Date) =>
     Math.floor((deadline(record) - now.getTime()) / 1000);
-  const newRecord = async (tx: TenantTransaction, sid: string, now: Date, terminal = false) => {
+  const newRecord = async (
+    tx: TenantTransaction,
+    sid: string,
+    now: Date,
+    terminal = false,
+    openingMode: 'twilio' | 'gpt_live' = 'twilio',
+  ) => {
     const call = createVoiceSession(await tx.getRestaurant(), now);
     const grant = token();
     const record: VoiceCallRecord = {
@@ -301,11 +326,11 @@ export async function registerVoiceActions(
         : streamTwiml(
             publicUrl(),
             grant,
-            'You are speaking with an AI restaurant assistant. Requests are subject to staff review and do not confirm a reservation.' +
-              (config.voice.debugTranscripts
-                ? ' A transcript is saved locally for debugging.'
-                : ''),
+            openingMode === 'gpt_live'
+              ? undefined
+              : 'You are speaking with an AI restaurant assistant. Requests are subject to staff review and do not confirm a reservation.',
           ),
+      openingMode,
       controlId: null,
       controlKind: null,
       controlState: null,
@@ -354,7 +379,11 @@ export async function registerVoiceActions(
       return callbackResult(next, hangup(outcome));
     }
     const grant = token();
-    const twiml = streamTwiml(publicUrl(), grant, outcome);
+    const twiml = streamTwiml(
+      publicUrl(),
+      grant,
+      record.readbackMode === 'gpt_live' ? undefined : outcome,
+    );
     const next = await saveRecord(
       tx,
       record,
@@ -388,7 +417,11 @@ export async function registerVoiceActions(
   app.post('/internal/voice/admit', (request) =>
     scoped(request, async (tx, now) => {
       const input = z
-        .object({ providerCallSid: providerCallSidSchema, accountSid: providerAccountSidSchema })
+        .object({
+          providerCallSid: providerCallSidSchema,
+          accountSid: providerAccountSidSchema,
+          openingMode: z.enum(['twilio', 'gpt_live']).optional(),
+        })
         .strict()
         .parse(request.body);
       if (input.accountSid !== config.voice.accountSid)
@@ -398,7 +431,7 @@ export async function registerVoiceActions(
       if (!record) {
         if ((await tx.countActiveVoiceCalls(now)) >= config.voice.maxConcurrentCalls)
           throw new VoiceError('CAPACITY_EXCEEDED', 429, 'The assistant is at capacity.');
-        record = await newRecord(tx, input.providerCallSid, now);
+        record = await newRecord(tx, input.providerCallSid, now, false, input.openingMode);
       }
       return {
         voiceCallId: record.id,
@@ -444,6 +477,8 @@ export async function registerVoiceActions(
         restaurant,
         configurationVersion: restaurant.version,
         outcome: next.outcome,
+        outcomeSpoken: next.readbackMode !== 'gpt_live',
+        openingMode: next.openingMode ?? 'twilio',
         actionsEnabled:
           config.voice.actionsEnabled && policy.requestsEnabled && call.inboxItemId === null,
         transfersEnabled: config.voice.transfersEnabled && policy.transfersEnabled,
@@ -469,7 +504,11 @@ export async function registerVoiceActions(
           policy.voiceEnabled &&
           (record.policyVersion ?? 1) === policy.version &&
           record.generation === input.generation &&
-          record.state === 'STREAMING' &&
+          (record.state === 'STREAMING' ||
+            (record.state === 'CONTROL_PENDING' &&
+              record.controlState === 'PREPARED' &&
+              record.controlKind === 'readback' &&
+              record.readbackMode === 'gpt_live')) &&
           remaining(record, now) > 0;
         return {
           allowed,
@@ -570,6 +609,7 @@ export async function registerVoiceActions(
           toolCallId: toolId,
           utteranceStartedAt: z.iso.datetime({ offset: true }),
           proposal: voiceProposalInputSchema,
+          readbackMode: z.enum(['twilio', 'gpt_live']).optional(),
         })
         .strict()
         .parse(request.body);
@@ -599,11 +639,14 @@ export async function registerVoiceActions(
         controlId = randomUUID();
       let twiml: string;
       try {
-        twiml = buildReadbackTwiml({
-          publicUrl: publicUrl(),
-          confirmationToken: grant,
-          readback: nextCall.proposal.readback,
-        });
+        twiml =
+          input.readbackMode === 'gpt_live'
+            ? buildSilentConfirmationTwiml({ publicUrl: publicUrl(), confirmationToken: grant })
+            : buildReadbackTwiml({
+                publicUrl: publicUrl(),
+                confirmationToken: grant,
+                readback: nextCall.proposal.readback,
+              });
       } catch (error) {
         if (error instanceof TelephonyInputError)
           throw new VoiceError(
@@ -614,7 +657,20 @@ export async function registerVoiceActions(
         throw error;
       }
       // Allow conservative speech/readback time before replacing the live stream.
-      const requiredSeconds = Math.ceil(nextCall.proposal.readback.length / 8) + 30;
+      const readbackText =
+        input.readbackMode === 'gpt_live'
+          ? renderLiveReadback(nextCall.proposal.readback)
+          : undefined;
+      // Live renders digits as words. Character length overestimates its speech
+      // time; reserve 150 words/minute, per-chunk drain time and a fixed margin.
+      const requiredSeconds = readbackText
+        ? Math.max(
+            45,
+            Math.ceil(readbackText.split(/\s+/u).length / 2.5) +
+              liveReadbackChunks(readbackText).length * 2 +
+              25,
+          )
+        : Math.ceil(nextCall.proposal.readback.length / 8) + 30;
       if (remaining(record, now) < requiredSeconds)
         throw new VoiceError(
           'CALL_BUDGET_EXCEEDED',
@@ -631,6 +687,7 @@ export async function registerVoiceActions(
           controlKind: 'readback',
           controlState: 'PREPARED',
           controlTwiml: twiml,
+          readbackMode: input.readbackMode ?? 'twilio',
           confirmationGrantHash: hash(grant),
           confirmationRetryGrantHash: null,
           confirmationExpiresAt: new Date(
@@ -642,11 +699,14 @@ export async function registerVoiceActions(
         },
         now,
       );
-      const result = { controlId, twiml };
+      const result = { controlId, twiml, ...(readbackText === undefined ? {} : { readbackText }) };
       await tx.putReceipt(key, fingerprint(input), result, record.id);
       stage('proposal_prepared', record.id);
       // Exact server-authored text, not a claim that it was dispatched or heard.
-      transcript(record, { kind: 'server_readback', text: nextCall.proposal.readback });
+      transcript(record, {
+        kind: 'server_readback',
+        text: readbackText ?? nextCall.proposal.readback,
+      });
       return result;
     }),
   );
@@ -702,6 +762,7 @@ export async function registerVoiceActions(
           state: 'TRANSFER_PENDING',
           controlId,
           controlKind: 'transfer',
+          readbackMode: 'twilio',
           controlState: 'PREPARED',
           controlTwiml: twiml,
           confirmationGrantHash: hash(grant),
@@ -735,7 +796,11 @@ export async function registerVoiceActions(
   app.post('/internal/voice/dispatch', (request) =>
     scoped(request, async (tx, now) => {
       const input = z
-        .object({ ...binding, controlId: z.uuid() })
+        .object({
+          ...binding,
+          controlId: z.uuid(),
+          readbackTranscript: z.string().min(1).max(3000).optional(),
+        })
         .strict()
         .parse(request.body);
       const record = await recordFor(tx, input.providerCallSid);
@@ -780,6 +845,7 @@ export async function registerVoiceActions(
         return abandon();
       let twiml = record.controlTwiml;
       if (record.controlKind === 'readback') {
+        const live = record.readbackMode === 'gpt_live';
         if (
           !config.voice.actionsEnabled ||
           !policy.requestsEnabled ||
@@ -787,9 +853,30 @@ export async function registerVoiceActions(
           call.proposal.id !== record.proposalId ||
           call.proposal.configVersion !== restaurant.version ||
           Date.parse(call.proposal.expiresAt) <= now.getTime() ||
-          remaining(record, now) < Math.ceil(call.proposal.readback.length / 8) + 30
+          remaining(record, now) < (live ? 20 : Math.ceil(call.proposal.readback.length / 8) + 30)
         )
           return abandon();
+        if (live) {
+          try {
+            // This is a validation-only domain result: dispatch does not save.
+            confirmVoiceProposal(call, record.proposalId!, restaurant, now);
+          } catch (error) {
+            if (!(error instanceof DomainError)) throw error;
+            return abandon();
+          }
+          if (
+            !input.readbackTranscript ||
+            !liveReadbackMatches(
+              renderLiveReadback(call.proposal.readback),
+              input.readbackTranscript,
+            )
+          )
+            throw new VoiceError(
+              'READBACK_MISMATCH',
+              409,
+              'The spoken readback did not match this request.',
+            );
+        }
       } else {
         if (!policy.transfersEnabled) return abandon();
         let destination: string;
@@ -820,6 +907,54 @@ export async function registerVoiceActions(
       return { dispatch: true, twiml, unavailable: false };
     }),
   );
+  app.post('/internal/voice/cancel-prepared', (request) =>
+    scoped(request, async (tx, now) => {
+      const input = z
+        .object({ ...binding, controlId: z.uuid() })
+        .strict()
+        .parse(request.body);
+      const record = await recordFor(tx, input.providerCallSid);
+      assertGeneration(record, input.generation);
+      if (
+        record.controlId !== input.controlId ||
+        record.controlKind !== 'readback' ||
+        record.readbackMode !== 'gpt_live'
+      )
+        throw new VoiceError('CONTROL_MISMATCH', 409, 'The phone action changed.');
+      if (
+        record.state === 'STREAMING' &&
+        record.controlState === 'COMPLETED' &&
+        record.confirmationGrantHash === null
+      )
+        return { state: record.state };
+      if (record.state !== 'CONTROL_PENDING' || record.controlState !== 'PREPARED')
+        throw new VoiceError(
+          'CANCELLATION_TOO_LATE',
+          409,
+          'The phone action is no longer awaiting readback.',
+        );
+      const outcome =
+        'The readback was interrupted. No new request was saved. Please review the details again.';
+      await clearProposal(tx, await callFor(tx, record), now, outcome);
+      const next = await saveRecord(
+        tx,
+        record,
+        {
+          state: 'STREAMING',
+          controlState: 'COMPLETED',
+          controlTwiml: null,
+          confirmationGrantHash: null,
+          confirmationRetryGrantHash: null,
+          confirmationExpiresAt: null,
+          proposalId: null,
+          outcome,
+        },
+        now,
+      );
+      return { state: next.state };
+    }),
+  );
+
   app.post('/internal/voice/dispatched', (request) =>
     scoped(request, async (tx, now) => {
       const input = z
@@ -1041,10 +1176,15 @@ export async function registerVoiceActions(
             );
             const retry = callbackResult(
               next,
-              buildConfirmationRetryTwiml({
-                publicUrl: publicUrl(),
-                confirmationToken: retryToken,
-              }),
+              record.readbackMode === 'gpt_live'
+                ? buildSilentConfirmationTwiml({
+                    publicUrl: publicUrl(),
+                    confirmationToken: retryToken,
+                  })
+                : buildConfirmationRetryTwiml({
+                    publicUrl: publicUrl(),
+                    confirmationToken: retryToken,
+                  }),
             );
             await tx.putReceipt(key, fingerprint(input), retry, record.id);
             stage('confirmation_retry', record.id);
@@ -1053,7 +1193,9 @@ export async function registerVoiceActions(
           } else {
             stage('confirmation_retry_exhausted', record.id);
             outcome =
-              'I could not clearly confirm your request. Nothing was saved. Please call again and press 1 after reviewing the details.';
+              record.readbackMode === 'gpt_live'
+                ? 'I could not clearly confirm your request. Nothing was saved. Please review the details again.'
+                : 'I could not clearly confirm your request. Nothing was saved. Please call again and press 1 after reviewing the details.';
             await clearProposal(tx, call, now, outcome);
           }
         } catch (error) {
