@@ -43,6 +43,7 @@ const readbackSchema = z
     readback: plainText(2000),
   })
   .strict();
+const confirmationRetrySchema = readbackSchema.omit({ readback: true });
 const transferSchema = z
   .object({
     publicUrl: originSchema,
@@ -67,6 +68,40 @@ function serialize(response: InstanceType<typeof twilio.twiml.VoiceResponse>): s
   return xml;
 }
 
+function appendConfirmationGather(
+  response: InstanceType<typeof twilio.twiml.VoiceResponse>,
+  publicUrl: string,
+  confirmationToken: string,
+  retry: boolean,
+): void {
+  response
+    .gather({
+      action: `${new URL(publicUrl).origin}/twilio/confirmation/${confirmationToken}`,
+      method: 'POST',
+      input: ['speech', 'dtmf'],
+      numDigits: 1,
+      timeout: 5,
+      speechTimeout: 'auto',
+      maxSpeechTime: 5,
+      hints: 'yes, no',
+      language: 'en-US',
+      actionOnEmptyResult: true,
+    })
+    .say(
+      { language: 'en-US' },
+      retry
+        ? 'I could not clearly confirm. Say yes or press 1 to save this request for staff review. Say no or press 2 to cancel.'
+        : 'Say yes or press 1 to save this unconfirmed request for staff review, or say no or press 2 to cancel. This does not book a table.',
+    );
+  // Defensive fallthrough, never a write. HTTP action failures still need a
+  // separately configured provider-hosted failure URL.
+  response.say(
+    { language: 'en-US' },
+    'I could not confirm that your request was saved. Please try again later.',
+  );
+  response.hangup();
+}
+
 /** The API supplies the immutable canonical readback and a server-issued bound token. */
 export function buildReadbackTwiml(input: {
   publicUrl: string;
@@ -79,29 +114,20 @@ export function buildReadbackTwiml(input: {
   const response = new twilio.twiml.VoiceResponse();
   // Outside Gather: recognition cannot interrupt or affirm a partly played readback.
   response.say({ language: 'en-US' }, readback);
-  response
-    .gather({
-      action: `${new URL(publicUrl).origin}/twilio/confirmation/${confirmationToken}`,
-      method: 'POST',
-      input: ['speech'],
-      timeout: 5,
-      speechTimeout: 'auto',
-      maxSpeechTime: 5,
-      hints: 'yes, no',
-      language: 'en-US',
-      actionOnEmptyResult: true,
-    })
-    .say(
-      { language: 'en-US' },
-      'Say yes to save this unconfirmed request for staff review, or say no to cancel. This does not book a table.',
-    );
-  // Defensive fallthrough, never a write. HTTP action failures still need a
-  // separately configured provider-hosted failure URL.
-  response.say(
-    { language: 'en-US' },
-    'I could not confirm that your request was saved. Please try again later.',
-  );
-  response.hangup();
+  appendConfirmationGather(response, publicUrl, confirmationToken, false);
+  return serialize(response);
+}
+
+/** A bounded clarification after canonical readback; never repeats caller-supplied fields. */
+export function buildConfirmationRetryTwiml(input: {
+  publicUrl: string;
+  confirmationToken: string;
+}): string {
+  const parsed = confirmationRetrySchema.safeParse(input);
+  if (!parsed.success) throw new TelephonyInputError();
+  const { publicUrl, confirmationToken } = parsed.data;
+  const response = new twilio.twiml.VoiceResponse();
+  appendConfirmationGather(response, publicUrl, confirmationToken, true);
   return serialize(response);
 }
 

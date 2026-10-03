@@ -2,7 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import RequestClient from 'twilio/lib/base/RequestClient.js';
 import RestException from 'twilio/lib/base/RestException.js';
 import type HttpResponse from 'twilio/lib/http/response.js';
-import { buildReadbackTwiml, buildTransferTwiml, TelephonyInputError } from '@hostline/connectors';
+import {
+  buildConfirmationRetryTwiml,
+  buildReadbackTwiml,
+  buildTransferTwiml,
+  TelephonyInputError,
+} from '@hostline/connectors';
 import {
   createCallController,
   type CallControlTransport,
@@ -30,23 +35,59 @@ afterEach(() => {
 });
 
 describe('provider-authored canonical call instructions', () => {
-  it('finishes canonical readback before speech collection and never commits on missing input', () => {
+  it('finishes canonical readback before speech or keypad collection and never commits on missing input', () => {
     const canonicalEnd = twiml.indexOf('</Say>');
     expect(twiml.slice(0, canonicalEnd)).toContain(readback);
     expect(canonicalEnd).toBeLessThan(twiml.indexOf('<Gather'));
     expect(twiml).toContain(`action="https://voice.example.test/twilio/confirmation/${token}"`);
     expect(twiml).toContain('method="POST"');
-    expect(twiml).toContain('input="speech"');
+    expect(twiml).toContain('input="speech dtmf"');
+    expect(twiml).toContain('numDigits="1"');
     expect(twiml).toContain('timeout="5"');
     expect(twiml).toContain('speechTimeout="auto"');
+    expect(twiml).toContain('maxSpeechTime="5"');
     expect(twiml).toContain('actionOnEmptyResult="true"');
-    expect(twiml).toContain('Say yes to save this unconfirmed request');
+    expect(twiml).toContain('Say yes or press 1 to save this unconfirmed request for staff review');
+    expect(twiml).toContain('say no or press 2 to cancel');
     expect(twiml).toContain('This does not book a table.');
     expect(twiml.slice(twiml.indexOf('</Gather>'))).toContain(
       'I could not confirm that your request was saved.',
     );
     expect(twiml).toContain('<Hangup/>');
     expect(twiml).not.toContain('input="dtmf"');
+  });
+
+  it('retries only confirmation with a fixed short prompt and the same bounded callback and fallthrough', () => {
+    const xml = buildConfirmationRetryTwiml({
+      publicUrl: configuration.publicUrl,
+      confirmationToken: token,
+    });
+    expect(xml.indexOf('<Gather')).toBeLessThan(xml.indexOf('<Say'));
+    expect(xml.match(/<Gather\b/g)).toHaveLength(1);
+    expect(xml).toContain(`action="https://voice.example.test/twilio/confirmation/${token}"`);
+    expect(xml).toContain('method="POST"');
+    expect(xml).toContain('input="speech dtmf"');
+    expect(xml).toContain('numDigits="1"');
+    expect(xml).toContain('timeout="5"');
+    expect(xml).toContain('speechTimeout="auto"');
+    expect(xml).toContain('maxSpeechTime="5"');
+    expect(xml).toContain('actionOnEmptyResult="true"');
+    expect(xml).toContain(
+      'I could not clearly confirm. Say yes or press 1 to save this request for staff review. Say no or press 2 to cancel.',
+    );
+    expect(xml).not.toContain(readback);
+    expect(xml.slice(xml.indexOf('</Gather>'))).toContain(
+      'I could not confirm that your request was saved. Please try again later.',
+    );
+    expect(xml).toContain('<Hangup/>');
+    expect(xml.length).toBeLessThan(1000);
+    expect(() =>
+      buildConfirmationRetryTwiml({
+        publicUrl: configuration.publicUrl,
+        confirmationToken: token,
+        readback: 'Injected repeated details',
+      } as Parameters<typeof buildConfirmationRetryTwiml>[0]),
+    ).toThrow(TelephonyInputError);
   });
 
   it('escapes canonical text and rejects untrusted callback targets or unusable payloads', () => {
@@ -67,6 +108,9 @@ describe('provider-authored canonical call instructions', () => {
       expect(() => buildReadbackTwiml({ publicUrl, confirmationToken: token, readback })).toThrow(
         TelephonyInputError,
       );
+      expect(() => buildConfirmationRetryTwiml({ publicUrl, confirmationToken: token })).toThrow(
+        TelephonyInputError,
+      );
     }
     for (const badToken of ['short', `/${token}`, `${token}?evil`, 'x'.repeat(64)]) {
       expect(() =>
@@ -74,6 +118,12 @@ describe('provider-authored canonical call instructions', () => {
           publicUrl: configuration.publicUrl,
           confirmationToken: badToken,
           readback,
+        }),
+      ).toThrow(TelephonyInputError);
+      expect(() =>
+        buildConfirmationRetryTwiml({
+          publicUrl: configuration.publicUrl,
+          confirmationToken: badToken,
         }),
       ).toThrow(TelephonyInputError);
     }

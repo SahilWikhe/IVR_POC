@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { voiceProposalInputSchema } from '@hostline/contracts';
+import type { VoiceTranscriptEvent } from '@hostline/observability';
 import {
   decodeAudio,
   type AudioPeer,
@@ -19,11 +20,29 @@ export interface LiveDelegationInput {
   signal: AbortSignal;
 }
 export type LiveDelegationResult =
-  | { kind: 'reply'; text: string }
+  | { kind: 'reply'; text: string; awaitingCaller?: boolean }
   | { kind: 'tool'; name: string; arguments: string; callId: string };
+export type LiveWorkflowStage =
+  | 'session_ready'
+  | 'delegation_requested'
+  | 'backend_started'
+  | 'backend_reply'
+  | 'backend_waiting_for_caller'
+  | 'backend_tool'
+  | 'backend_stale'
+  | 'backend_cancelled'
+  | 'backend_failed'
+  | 'tool_validation_rejected'
+  | 'date_handle_rejected'
+  | 'control_handoff_started'
+  | 'control_handoff_unavailable'
+  | 'control_handoff_accepted'
+  | 'control_handoff_failed';
 export interface LiveRelayOptions extends RelayOptions {
   opening: string;
   onDelegate(input: LiveDelegationInput): Promise<LiveDelegationResult>;
+  onStage?: (code: LiveWorkflowStage) => void;
+  onTranscript?: (event: VoiceTranscriptEvent) => void;
 }
 
 const identifier = z.string().min(1).max(128);
@@ -49,7 +68,9 @@ const appendText = z
   .min(1)
   .refine((text) => Buffer.byteLength(text) <= 480);
 const resultSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('reply'), text: appendText }).strict(),
+  z
+    .object({ kind: z.literal('reply'), text: appendText, awaitingCaller: z.boolean().optional() })
+    .strict(),
   z
     .object({
       kind: z.literal('tool'),
@@ -84,12 +105,12 @@ interface PendingFragment {
 }
 interface Delegation {
   id: string;
-  state: 'waiting' | 'running' | 'settled';
+  state: 'waiting' | 'running' | 'awaiting_caller' | 'settled';
 }
 const unavailable =
   'The server could not begin the controlled step. No request was saved and no transfer is confirmed. Ask the caller to clarify the details or ask another question.';
 
-/** Continuous Live protocol only. Transcript context is bounded, transient and never logged. */
+/** Continuous Live protocol. Context is transient; optional capture is owned by the caller. */
 export class LiveAudioRelay {
   private ready = false;
   private configured = false;
@@ -196,6 +217,7 @@ export class LiveAudioRelay {
         if (!this.configured) return this.close('provider_protocol_error');
         if (this.ready) return;
         this.ready = true;
+        this.stage('session_ready');
         for (const payload of this.pendingInput)
           this.appendInput(payload, Buffer.from(payload, 'base64').length);
         this.pendingInput = [];
@@ -263,7 +285,12 @@ export class LiveAudioRelay {
           const { delegation } = delegationSchema.parse(event);
           if (this.delegations.has(delegation.id)) return;
           if (this.delegations.size >= 80) return this.close('relay_buffer_limit');
+          // A new provider request supersedes unfinished local work. Keep one
+          // current task, so a repeated delegation cannot prepare two proposals.
+          for (const task of this.delegations.values()) task.state = 'settled';
+          this.cancelBackend();
           this.delegations.set(delegation.id, { id: delegation.id, state: 'waiting' });
+          this.stage('delegation_requested');
           this.scheduleDelegation();
           return;
         }
@@ -310,10 +337,14 @@ export class LiveAudioRelay {
       if (this.delegateTimer) clearTimeout(this.delegateTimer);
       this.delegateTimer = undefined;
       const active = this.activeDelegation;
-      if (active) {
-        active.controller.abort();
+      if (active && !active.controller.signal.aborted) {
         active.task.state = 'waiting';
+        this.cancelBackend();
       }
+      // Only an explicit backend clarification continues without another Live
+      // delegation. Arbitrary factual replies and silence never start work.
+      for (const task of this.delegations.values())
+        if (task.state === 'awaiting_caller') task.state = 'waiting';
     }
     this.flushTranscripts();
   }
@@ -346,6 +377,13 @@ export class LiveAudioRelay {
       // fragments. Approximate timing cannot reorder a speaker's words.
       if (Buffer.byteLength(JSON.stringify(this.fragments.map((value) => value.entry))) > 48 * 1024)
         return this.close('relay_buffer_limit');
+      this.capture({
+        kind: 'speech',
+        source: fragment.role === 'user' ? 'caller' : 'assistant',
+        text: fragment.text,
+        startMs: fragment.startMs,
+        endMs: fragment.endMs,
+      });
     }
     if (callerChanged) this.scheduleDelegation();
   }
@@ -387,9 +425,13 @@ export class LiveAudioRelay {
     const transcript = this.fragments.map((fragment) => Object.freeze({ ...fragment.entry }));
     Object.freeze(transcript);
     this.delegateDeadline = setTimeout(() => {
-      if (this.activeDelegation === active) this.close('provider_error');
+      if (this.activeDelegation === active) {
+        this.stage('backend_failed');
+        this.close('provider_error');
+      }
     }, 13_000);
     this.delegateDeadline.unref();
+    this.stage('backend_started');
     try {
       const result = resultSchema.parse(
         await this.options.onDelegate({ transcript, signal: controller.signal }),
@@ -399,10 +441,27 @@ export class LiveAudioRelay {
       if (this.delegateDeadline) clearTimeout(this.delegateDeadline);
       this.delegateDeadline = undefined;
       task.state = 'settled';
-      if (result.kind === 'reply') this.commentary(task.id, result.text);
-      else await this.handleTool(task.id, result, transcript);
+      if (result.kind === 'reply') {
+        this.stage('backend_reply');
+        if (result.awaitingCaller && this.options.actionsEnabled) {
+          task.state = 'awaiting_caller';
+          this.stage('backend_waiting_for_caller');
+        }
+        this.capture({
+          kind: 'backend_reply',
+          text: result.text,
+          awaitingCaller: task.state === 'awaiting_caller',
+        });
+        this.commentary(task.id, result.text);
+      } else {
+        this.stage('backend_tool');
+        await this.handleTool(task.id, result, transcript);
+      }
     } catch {
-      if (!this.closed && !controller.signal.aborted) this.close('provider_error');
+      if (!this.closed && !controller.signal.aborted) {
+        if (task.state === 'running') this.stage('backend_failed');
+        this.close('provider_error');
+      }
     } finally {
       if (this.activeDelegation === active) {
         if (this.delegateDeadline) clearTimeout(this.delegateDeadline);
@@ -427,6 +486,7 @@ export class LiveAudioRelay {
     if (this.toolCalls.size >= 80) return this.close('relay_buffer_limit');
     this.toolCalls.add(result.callId);
     let request: VoiceToolRequest;
+    let rejection: 'tool_validation_rejected' | 'date_handle_rejected' = 'tool_validation_rejected';
     try {
       if (!this.options.onTool) throw new Error('Unavailable action handler');
       const args: unknown = JSON.parse(result.arguments);
@@ -435,7 +495,10 @@ export class LiveAudioRelay {
         const reference = transcript.find(
           (entry) => entry.role === 'user' && entry.dateReference === date_utterance_id,
         );
-        if (!reference?.startedAt) throw new Error('Unknown date reference');
+        if (!reference?.startedAt) {
+          rejection = 'date_handle_rejected';
+          throw new Error('Unknown date reference');
+        }
         request = {
           toolCallId: result.callId,
           utteranceStartedAt: reference.startedAt,
@@ -444,7 +507,10 @@ export class LiveAudioRelay {
         };
       } else {
         const reference = transcript.findLast((entry) => entry.role === 'user');
-        if (!reference?.startedAt) throw new Error('Missing caller reference');
+        if (!reference?.startedAt) {
+          rejection = 'date_handle_rejected';
+          throw new Error('Missing caller reference');
+        }
         if (result.name === 'prepare_message' && this.options.actionsEnabled) {
           request = {
             toolCallId: result.callId,
@@ -466,6 +532,7 @@ export class LiveAudioRelay {
         } else throw new Error('Unavailable tool');
       }
     } catch {
+      this.stage(rejection);
       this.commentary(delegationId, unavailable);
       return;
     }
@@ -474,12 +541,34 @@ export class LiveAudioRelay {
     if (this.closed) return;
     // All model output/input is suppressed while deterministic server control
     // prepares the canonical readback. A model tool never confirms or saves.
-    const outcome = await this.options.onTool?.(request);
+    this.capture({
+      kind: 'tool_proposal',
+      tool:
+        request.kind === 'transfer'
+          ? 'request_staff_transfer'
+          : request.proposal.kind === 'reservation'
+            ? 'prepare_request'
+            : 'prepare_message',
+      text: JSON.stringify(request.kind === 'proposal' ? request.proposal : request.context),
+    });
+    this.stage('control_handoff_started');
+    let outcome;
+    try {
+      outcome = await this.options.onTool?.(request);
+    } catch {
+      if (!this.closed) this.stage('control_handoff_failed');
+      throw new Error('Voice control unavailable');
+    }
     if (this.closed) return;
     if (outcome === 'unavailable') {
+      this.stage('control_handoff_unavailable');
       this.controlled = false;
       this.commentary(delegationId, unavailable);
-    } else if (outcome !== 'controlled') this.close('provider_error');
+    } else if (outcome === 'controlled') this.stage('control_handoff_accepted');
+    else {
+      this.stage('control_handoff_failed');
+      this.close('provider_error');
+    }
   }
 
   private commentary(delegationId: string, content: string): void {
@@ -525,6 +614,33 @@ export class LiveAudioRelay {
     }
   }
 
+  private stage(code: LiveWorkflowStage): void {
+    try {
+      this.options.onStage?.(code);
+    } catch {
+      // Static observability cannot affect authorization, playback or cleanup.
+    }
+  }
+
+  private capture(event: VoiceTranscriptEvent): void {
+    if (!this.options.onTranscript) return;
+    try {
+      // A caller may supply an asynchronous sink despite the void callback
+      // contract. Do not await it on the audio loop or leak a rejected promise.
+      void Promise.resolve(this.options.onTranscript(event)).catch(() => {});
+    } catch {
+      // Optional capture cannot change audio, consent or control execution.
+    }
+  }
+
+  private cancelBackend(): void {
+    const active = this.activeDelegation;
+    if (!active || active.controller.signal.aborted) return;
+    this.stage('backend_stale');
+    this.stage('backend_cancelled');
+    active.controller.abort();
+  }
+
   close(reason?: RelayDiagnosticCode): void {
     if (this.closed) return;
     this.closed = true;
@@ -537,7 +653,10 @@ export class LiveAudioRelay {
     }
     if (this.delegateTimer) clearTimeout(this.delegateTimer);
     if (this.delegateDeadline) clearTimeout(this.delegateDeadline);
-    this.activeDelegation?.controller.abort();
+    if (this.activeDelegation && !this.activeDelegation.controller.signal.aborted) {
+      if (this.activeDelegation.task.state === 'running') this.stage('backend_cancelled');
+      this.activeDelegation.controller.abort();
+    }
     this.activeDelegation = undefined;
     if (this.marks.size > 0 && this.twilio.readyState === 1) {
       try {

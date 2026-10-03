@@ -42,6 +42,34 @@ const policyResponse = z
   })
   .strict();
 
+// Only documented application codes may cross into operational logs. Never
+// retain the response message, submitted fields, request ID or raw error body.
+const controlErrorCode = z.enum([
+  'INVALID_INPUT',
+  'INVALID_VOICE_PROPOSAL',
+  'INVALID_UTTERANCE_REFERENCE',
+  'INVALID_DATE',
+  'AMBIGUOUS_DATE',
+  'INVALID_LOCAL_TIME',
+  'INVALID_RESERVATION',
+  'PAST_RESERVATION',
+  'PARTY_TOO_LARGE',
+  'OUTSIDE_REQUEST_HORIZON',
+  'RESTAURANT_CLOSED',
+  'CALL_BUDGET_EXCEEDED',
+  'READBACK_TOO_LONG',
+  'ACTIONS_DISABLED',
+  'PHONE_POLICY_REVOKED',
+  'CALL_NOT_ACTIVE',
+  'STALE_GENERATION',
+]);
+export class VoiceControlError extends Error {
+  constructor(readonly code: z.infer<typeof controlErrorCode> | 'CONTROL_UNAVAILABLE') {
+    super('Voice control unavailable');
+    this.name = 'VoiceControlError';
+  }
+}
+
 export interface TransferContext {
   reason: 'requested_staff' | 'allergy_question' | 'other';
   summary: string;
@@ -85,6 +113,7 @@ export interface VoiceApiClient {
     providerCallSid: string;
     confirmationToken: string;
     speechResult?: string;
+    digits?: string;
     confidence?: number;
   }): Promise<z.infer<typeof callbackResponse>>;
   transferStatus(input: {
@@ -125,7 +154,7 @@ export function createVoiceApiClient(
         : AbortSignal.timeout(3000),
       redirect: 'error',
     });
-    if (!response.ok || !response.body) throw new Error('Voice control unavailable');
+    if (!response.body) throw new VoiceControlError('CONTROL_UNAVAILABLE');
     const reader = response.body.getReader();
     const chunks: Uint8Array[] = [];
     let size = 0;
@@ -134,11 +163,26 @@ export function createVoiceApiClient(
         const chunk = await reader.read();
         if (chunk.done) break;
         size += chunk.value.byteLength;
-        if (size > 128 * 1024) throw new Error('Voice control response limit');
+        if (size > (response.ok ? 128 * 1024 : 4096))
+          throw new VoiceControlError('CONTROL_UNAVAILABLE');
         chunks.push(chunk.value);
       }
     } finally {
       await reader.cancel();
+    }
+    if (!response.ok) {
+      let code: z.infer<typeof controlErrorCode> | 'CONTROL_UNAVAILABLE' = 'CONTROL_UNAVAILABLE';
+      if (response.status >= 400 && response.status < 500) {
+        try {
+          const error = z
+            .object({ error: z.object({ code: controlErrorCode }) })
+            .parse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+          code = error.error.code;
+        } catch {
+          /* Unknown or malformed errors stay generic. */
+        }
+      }
+      throw new VoiceControlError(code);
     }
     const result = schema.parse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
     if (

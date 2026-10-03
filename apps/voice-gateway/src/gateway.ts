@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyRequest } from 'fastify';
-import { logEvent, type OperationalEvent } from '@hostline/observability';
+import {
+  logEvent,
+  type OperationalEvent,
+  type VoiceTranscriptEvent,
+  type VoiceTranscriptSink,
+} from '@hostline/observability';
 import formbody from '@fastify/formbody';
 import websocket from '@fastify/websocket';
 import twilio from 'twilio';
@@ -17,9 +22,11 @@ import {
   LiveAudioRelay,
   type LiveDelegationInput,
   type LiveDelegationResult,
+  type LiveWorkflowStage,
 } from './live-relay.js';
 import { createLiveBackend } from './live-backend.js';
-import { createVoiceApiClient, type VoiceApiClient } from './client.js';
+import { MediaRateLimiter, type MediaRateLimitCode } from './media-rate.js';
+import { createVoiceApiClient, VoiceControlError, type VoiceApiClient } from './client.js';
 import { createCallController, type CallController, type CallControlResult } from './control.js';
 import {
   AudioRelay,
@@ -99,9 +106,11 @@ export interface VoiceDependencies {
   now?: () => number;
   onDiagnostic?: (event: OperationalEvent) => void;
   delegate?: (input: LiveDelegationInput) => Promise<LiveDelegationResult>;
+  voiceTranscripts?: VoiceTranscriptSink;
 }
 
 type StreamCloseCode =
+  | MediaRateLimitCode
   | 'stream_closed'
   | 'start_timeout'
   | 'provider_setup_timeout'
@@ -114,10 +123,28 @@ type StreamCloseCode =
   | 'provider_socket_error'
   | 'provider_setup_failed'
   | 'media_protocol_invalid'
-  | 'media_rate_limit'
   | 'input_buffer_limit'
   | 'caller_stopped'
   | 'media_socket_error';
+
+type GatewayWorkflowStage =
+  | 'stream_bound'
+  | 'proposal_started'
+  | 'proposal_failed'
+  | 'proposal_prepared'
+  | 'transfer_started'
+  | 'transfer_failed'
+  | 'transfer_prepared'
+  | 'dispatch_started'
+  | 'dispatch_failed'
+  | 'dispatch_unavailable'
+  | 'dispatch_already_owned'
+  | 'dispatch_admitted'
+  | 'dispatch_expired'
+  | 'dispatch_accepted'
+  | 'dispatch_rejected'
+  | 'dispatch_unknown'
+  | 'dispatch_receipt_failed';
 
 function signature(
   config: EnabledVoiceConfig,
@@ -265,9 +292,12 @@ export async function createVoiceGateway(
     if (!call) return reply.code(403).send({ error: 'Invalid provider callback' });
     const confidence =
       call.params.Confidence === undefined ? undefined : Number(call.params.Confidence);
+    const digits = call.params.Digits;
     if (
-      confidence !== undefined &&
-      (!Number.isFinite(confidence) || confidence < 0 || confidence > 1)
+      (confidence !== undefined &&
+        (!Number.isFinite(confidence) || confidence < 0 || confidence > 1)) ||
+      (digits !== undefined && !/^[0-9*#]?$/.test(digits)) ||
+      (Boolean(digits) && Boolean(call.params.SpeechResult))
     )
       return reply.code(400).send({ error: 'Invalid confirmation input' });
     try {
@@ -277,6 +307,7 @@ export async function createVoiceGateway(
         ...(call.params.SpeechResult === undefined
           ? {}
           : { speechResult: call.params.SpeechResult }),
+        ...(digits === undefined ? {} : { digits }),
         ...(confidence === undefined ? {} : { confidence }),
       });
       return reply.type('text/xml').send(result.twiml);
@@ -376,18 +407,38 @@ export async function createVoiceGateway(
         return;
       }
       sockets.add(socket);
-      // Correlation is local and random; never log provider IDs, grants or content.
-      const diagnosticId = randomUUID();
+      // Switch to the durable internal call UUID after authenticated redemption
+      // so API confirmation stages and resumed streams can be correlated.
+      let diagnosticId: string = randomUUID();
+      let transcriptCallId: string | undefined;
+      const capture = (event: VoiceTranscriptEvent) => {
+        if (!config.debugTranscripts || !transcriptCallId) return;
+        try {
+          void Promise.resolve(
+            dependencies.voiceTranscripts?.record(transcriptCallId, event, generation),
+          ).catch(() => {});
+        } catch {
+          /* Debug capture never controls the call. */
+        }
+      };
       const diagnose = (
-        event: 'voice.stream_closed' | 'voice.relay',
-        code: StreamCloseCode | RelayDiagnosticCode,
+        event: 'voice.stream_closed' | 'voice.relay' | 'voice.workflow' | 'voice.control_error',
+        code:
+          | StreamCloseCode
+          | RelayDiagnosticCode
+          | LiveWorkflowStage
+          | GatewayWorkflowStage
+          | VoiceControlError['code'],
       ) => {
+        capture({ kind: 'stage', code });
         try {
           (dependencies.onDiagnostic ?? logEvent)({ event, requestId: diagnosticId, code });
         } catch {
           // A diagnostic sink failure must not prevent stream cleanup.
         }
       };
+      const stage = (code: LiveWorkflowStage | GatewayWorkflowStage) =>
+        diagnose('voice.workflow', code);
       let closeCode: StreamCloseCode = 'stream_closed';
       const controlCancellation = new AbortController();
       let closed = false;
@@ -400,9 +451,7 @@ export async function createVoiceGateway(
       let relay: AudioRelay | LiveAudioRelay | undefined;
       let lastSequence = -1;
       let lastTimestamp = -1;
-      let windowStart = now();
-      let frameCount = 0;
-      let audioBytes = 0;
+      const mediaRate = new MediaRateLimiter();
       let pending: Array<{ payload: string; receivedAt: number }> = [];
       let pendingBytes = 0;
       let providerTimer: ReturnType<typeof setTimeout> | undefined;
@@ -645,6 +694,7 @@ export async function createVoiceGateway(
       ): Promise<'controlled' | 'unavailable'> => {
         if (closed || !callSid || !generation) return 'unavailable';
         const binding = { providerCallSid: callSid, generation };
+        stage(request.kind === 'proposal' ? 'proposal_started' : 'transfer_started');
         let preparation;
         try {
           preparation =
@@ -660,20 +710,32 @@ export async function createVoiceGateway(
                   toolCallId: request.toolCallId,
                   context: request.context,
                 });
-        } catch {
+        } catch (error) {
+          stage(request.kind === 'proposal' ? 'proposal_failed' : 'transfer_failed');
+          diagnose(
+            'voice.control_error',
+            error instanceof VoiceControlError ? error.code : 'CONTROL_UNAVAILABLE',
+          );
           return 'unavailable';
         }
+        stage(request.kind === 'proposal' ? 'proposal_prepared' : 'transfer_prepared');
         if (closed) return 'controlled';
         // Durable compare-and-set precedes the single non-idempotent provider update.
         // A lost response or repeat tool delivery is never a reason to issue it twice.
         let dispatch;
         try {
+          stage('dispatch_started');
           dispatch = await api.dispatch({ ...binding, controlId: preparation.controlId });
         } catch {
+          stage('dispatch_failed');
           close();
           return 'controlled';
         }
-        if (!dispatch.dispatch) return dispatch.unavailable ? 'unavailable' : 'controlled';
+        if (!dispatch.dispatch) {
+          stage(dispatch.unavailable ? 'dispatch_unavailable' : 'dispatch_already_owned');
+          return dispatch.unavailable ? 'unavailable' : 'controlled';
+        }
+        stage('dispatch_admitted');
         if (!dispatch.twiml) {
           close();
           return 'controlled';
@@ -681,6 +743,7 @@ export async function createVoiceGateway(
         // A fulfilled promise can run before an overdue timer. Recheck the
         // original authoritative deadline immediately before the provider write.
         if (closed || callExpiresAt === undefined || now() >= callExpiresAt) {
+          stage('dispatch_expired');
           try {
             await api.dispatched({
               ...binding,
@@ -699,6 +762,13 @@ export async function createVoiceGateway(
         } catch {
           result = { outcome: 'unknown' };
         }
+        stage(
+          result.outcome === 'accepted'
+            ? 'dispatch_accepted'
+            : result.outcome === 'rejected'
+              ? 'dispatch_rejected'
+              : 'dispatch_unknown',
+        );
         try {
           await api.dispatched({
             ...binding,
@@ -708,6 +778,7 @@ export async function createVoiceGateway(
         } catch {
           // The durable record still has an admitted dispatch. Hold rather than
           // continuing a call whose authoritative control result is unavailable.
+          stage('dispatch_receipt_failed');
           close();
           return 'controlled';
         }
@@ -744,7 +815,10 @@ export async function createVoiceGateway(
             streamSid: startStreamSid,
             streamGrant,
           });
+          diagnosticId = context.voiceCallId;
           generation = context.generation;
+          transcriptCallId = context.voiceCallId;
+          stage('stream_bound');
           if (closed || !streamSid) {
             await api.end({ providerCallSid: startCallSid, generation, reason: 'stream_closed' });
             return;
@@ -781,6 +855,8 @@ export async function createVoiceGateway(
               ? new LiveAudioRelay(socket, provider, streamSid, close, {
                   ...relayOptions,
                   opening: liveOpening(context.restaurant, capabilities),
+                  onStage: stage,
+                  onTranscript: capture,
                   onDelegate:
                     dependencies.delegate ??
                     createLiveBackend({
@@ -819,13 +895,13 @@ export async function createVoiceGateway(
           if (binary || Buffer.byteLength(data.toString()) > 8192)
             return fail('media_protocol_invalid');
           const tick = now();
-          if (tick - windowStart >= 1000) {
-            windowStart = tick;
-            frameCount = 0;
-            audioBytes = 0;
-          }
-          if (++frameCount > 250) return fail('media_rate_limit');
+          const messageLimit = mediaRate.message(tick);
+          if (messageLimit) return fail(messageLimit);
           const event = mediaEvent.parse(JSON.parse(data.toString()));
+          if (event.event !== 'media') {
+            const limit = mediaRate.event(event.event === 'mark' ? 'mark' : 'control', tick);
+            if (limit) return fail(limit);
+          }
           if (event.event === 'connected') {
             if (connected || streamSid) return fail('media_protocol_invalid');
             connected = true;
@@ -870,8 +946,8 @@ export async function createVoiceGateway(
             )
               return fail('media_protocol_invalid');
             lastTimestamp = timestamp;
-            audioBytes += audio.length;
-            if (audioBytes > 24_000) return fail('media_rate_limit');
+            const audioLimit = mediaRate.event('media', tick, audio.length);
+            if (audioLimit) return fail(audioLimit);
             if (relay) relay.input(event.media.payload, tick);
             else {
               pendingBytes += audio.length;

@@ -38,6 +38,7 @@ const schema = z.object({
   VOICE_PUBLIC_URL: z.url().optional(),
   VOICE_ACTIONS_ENABLED: z.enum(['true', 'false']).default('false'),
   VOICE_TRANSFERS_ENABLED: z.enum(['true', 'false']).default('false'),
+  VOICE_DEBUG_TRANSCRIPTS: z.enum(['true', 'false']).default('false'),
   VOICE_MAX_CONCURRENT_CALLS: z.coerce.number().int().min(1).max(10).default(2),
   VOICE_MAX_CALL_SECONDS: z.coerce.number().int().min(15).max(600).default(300),
 });
@@ -126,6 +127,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
   const liveVoice = value.LIVE_VOICE_ENABLED === 'true';
   const actionsEnabled = value.VOICE_ACTIONS_ENABLED === 'true';
   const transfersEnabled = value.VOICE_TRANSFERS_ENABLED === 'true';
+  const debugTranscripts = value.VOICE_DEBUG_TRANSCRIPTS === 'true';
+  if (debugTranscripts && (!liveVoice || value.AUTH_MODE !== 'demo'))
+    throw new Error('Voice debug transcripts require the local demo voice sandbox.');
   if (liveVoice || actionsEnabled || transfersEnabled) {
     if (
       !liveVoice ||
@@ -171,6 +175,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       enabled: liveVoice,
       actionsEnabled,
       transfersEnabled,
+      debugTranscripts,
       publicUrl: value.VOICE_PUBLIC_URL ? new URL(value.VOICE_PUBLIC_URL).origin : undefined,
       accountSid: value.TWILIO_ACCOUNT_SID,
       authToken: value.TWILIO_AUTH_TOKEN,

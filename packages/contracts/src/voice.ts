@@ -53,6 +53,9 @@ export const voiceCallRecordSchema = z
     controlState: voiceControlStateSchema.nullable(),
     controlTwiml: z.string().max(20_000).nullable(),
     confirmationGrantHash: sha256.nullable(),
+    // One additional, call/proposal-bound confirmation after uncertain input.
+    // Older records omit this field and have no retry authority.
+    confirmationRetryGrantHash: sha256.nullable().optional(),
     confirmationExpiresAt: instant.nullable(),
     proposalId: id.nullable(),
     transferDestination: phone.nullable(),

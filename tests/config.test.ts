@@ -18,6 +18,41 @@ const oidcEnvironment = {
 };
 
 describe('deployment auth and process configuration', () => {
+  it('keeps transcript capture explicitly opt-in and restricted to the local Live sandbox', () => {
+    const voiceEnvironment = {
+      LIVE_VOICE_ENABLED: 'true',
+      VOICE_MODE: 'sandbox',
+      TWILIO_ACCOUNT_SID: `AC${'a'.repeat(32)}`,
+      TWILIO_AUTH_TOKEN: 'synthetic-token-for-test',
+      TWILIO_PHONE_NUMBER: '+12125550142',
+      OPENAI_API_KEY: 'synthetic-openai-key',
+      VOICE_PUBLIC_URL: 'https://voice.example.test',
+      VOICE_SERVICE_TOKEN: 'synthetic-internal-service-token-for-tests',
+      VOICE_TENANT_ID: '11111111-1111-4111-8111-111111111111',
+    };
+    expect(loadConfig(voiceEnvironment).voice.debugTranscripts).toBe(false);
+    expect(loadVoiceConfig(voiceEnvironment)).toMatchObject({ debugTranscripts: false });
+    const enabled = { ...voiceEnvironment, VOICE_DEBUG_TRANSCRIPTS: 'true' };
+    expect(loadConfig(enabled).voice.debugTranscripts).toBe(true);
+    expect(loadVoiceConfig(enabled)).toMatchObject({ debugTranscripts: true });
+    for (const value of ['yes', '1', '']) {
+      expect(() => loadConfig({ ...voiceEnvironment, VOICE_DEBUG_TRANSCRIPTS: value })).toThrow();
+      expect(() =>
+        loadVoiceConfig({ ...voiceEnvironment, VOICE_DEBUG_TRANSCRIPTS: value }),
+      ).toThrow();
+    }
+    expect(() => loadConfig({ VOICE_DEBUG_TRANSCRIPTS: 'true' })).toThrow('local demo');
+    expect(() => loadConfig({ ...oidcEnvironment, ...enabled })).toThrow('local demo');
+    for (const override of [
+      { LIVE_VOICE_ENABLED: 'false' },
+      { AUTH_MODE: 'oidc' },
+      { VOICE_HOST: '0.0.0.0' },
+      { OPENAI_REALTIME_MODEL: 'gpt-realtime' },
+      { NODE_ENV: 'production' },
+    ])
+      expect(() => loadVoiceConfig({ ...enabled, ...override })).toThrow();
+  });
+
   it('keeps the synthetic demo isolated and runs its local internal worker by default', () => {
     const config = loadConfig({ NODE_ENV: 'test' });
     expect(config.auth.mode).toBe('demo');

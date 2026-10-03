@@ -1,3 +1,9 @@
+export {
+  createVoiceTranscriptRecorder,
+  type VoiceTranscriptEvent,
+  type VoiceTranscriptSink,
+} from './voice-transcript.js';
+
 /** Allowlisted operational events: never pass request bodies, headers, or caller data. */
 export interface OperationalEvent {
   event: string;

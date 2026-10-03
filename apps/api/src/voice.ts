@@ -18,9 +18,40 @@ import {
   prepareVoiceProposal,
   DomainError,
 } from '@hostline/domain';
-import { buildReadbackTwiml, buildTransferTwiml, TelephonyInputError } from '@hostline/connectors';
+import {
+  buildReadbackTwiml,
+  buildConfirmationRetryTwiml,
+  buildTransferTwiml,
+  TelephonyInputError,
+} from '@hostline/connectors';
 import type { AppConfig } from '@hostline/config';
 import type { Database, TenantTransaction } from '@hostline/database';
+import {
+  logEvent,
+  type OperationalEvent,
+  type VoiceTranscriptEvent,
+  type VoiceTranscriptSink,
+} from '@hostline/observability';
+
+type VoiceActionStage =
+  | 'proposal_prepared'
+  | 'confirmation_received'
+  | 'confirmation_replayed'
+  | 'confirmation_not_saved'
+  | 'confirmation_empty'
+  | 'confirmation_declined'
+  | 'confirmation_unclear'
+  | 'confirmation_policy_denied'
+  | 'confirmation_expired'
+  | 'confirmation_proposal_changed'
+  | 'confirmation_retry'
+  | 'confirmation_retry_exhausted'
+  | 'request_saved';
+type StageLog = (code: VoiceActionStage, callId: string) => void;
+type TranscriptLog = (
+  record: Pick<VoiceCallRecord, 'id' | 'generation'>,
+  event: VoiceTranscriptEvent,
+) => void;
 
 class VoiceError extends Error {
   constructor(
@@ -130,7 +161,12 @@ function eligibleCallback(record: VoiceCallRecord, grant: string, kind: 'readbac
     record.controlKind !== kind ||
     !record.controlId ||
     !record.confirmationGrantHash ||
-    !equal(record.confirmationGrantHash, hash(grant)) ||
+    !(
+      equal(record.confirmationGrantHash, hash(grant)) ||
+      (kind === 'readback' &&
+        record.confirmationRetryGrantHash &&
+        equal(record.confirmationRetryGrantHash, hash(grant)))
+    ) ||
     !['DISPATCHED', 'ACCEPTED', 'UNKNOWN', 'COMPLETED'].includes(record.controlState ?? '')
   )
     throw new VoiceError(
@@ -141,10 +177,29 @@ function eligibleCallback(record: VoiceCallRecord, grant: string, kind: 'readbac
 }
 
 /** Authority is the authenticated gateway plus durable call state, never model arguments. */
-export async function registerVoiceActions(app: FastifyInstance, config: AppConfig, db: Database) {
+export async function registerVoiceActions(
+  app: FastifyInstance,
+  config: AppConfig,
+  db: Database,
+  onDiagnostic: (event: OperationalEvent) => void = logEvent,
+  voiceTranscripts?: VoiceTranscriptSink,
+) {
+  const capture = (callId: string, event: VoiceTranscriptEvent, generation?: string) => {
+    if (!config.voice.debugTranscripts) return;
+    try {
+      void Promise.resolve(voiceTranscripts?.record(callId, event, generation)).catch(() => {});
+    } catch {
+      /* Debug capture cannot change call authority or a committed result. */
+    }
+  };
   const scoped = async <T>(
     request: FastifyRequest,
-    work: (tx: TenantTransaction, now: Date) => Promise<T>,
+    work: (
+      tx: TenantTransaction,
+      now: Date,
+      stage: StageLog,
+      transcript: TranscriptLog,
+    ) => Promise<T>,
   ) => {
     if (
       !config.voiceServiceToken ||
@@ -154,11 +209,41 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
       throw new VoiceError('UNAUTHORIZED', 401, 'Unauthorized.');
     if (!config.voice.enabled || !config.voice.publicUrl || !config.voice.accountSid)
       throw new VoiceError('VOICE_DISABLED', 403, 'Phone actions are disabled.');
-    return db.withTenant(config.voiceTenantId, async (tx) => {
+    const events: OperationalEvent[] = [];
+    const transcriptEvents: Array<{
+      callId: string;
+      generation: string;
+      event: VoiceTranscriptEvent;
+    }> = [];
+    const result = await db.withTenant(config.voiceTenantId, async (tx) => {
       // Lock restaurant admission before voice/call rows on every lifecycle path.
       await tx.lockVoiceAdmission();
-      return work(tx, new Date());
+      return work(
+        tx,
+        new Date(),
+        (code, callId) => {
+          // Internal call UUID only: no provider identifiers or caller fields.
+          if (events.length < 8) events.push({ event: 'voice.workflow', requestId: callId, code });
+        },
+        (record, event) => {
+          if (config.voice.debugTranscripts && voiceTranscripts && transcriptEvents.length < 8)
+            transcriptEvents.push({ callId: record.id, generation: record.generation, event });
+        },
+      );
     });
+    // Emit success stages only after commit. A failed/rolled-back write is
+    // never logged as saved, and a broken diagnostic sink cannot undo a save.
+    for (const event of events) {
+      if (event.requestId && event.code)
+        capture(event.requestId, { kind: 'stage', code: event.code });
+      try {
+        onDiagnostic(event);
+      } catch {
+        /* Diagnostics are not authority. */
+      }
+    }
+    for (const entry of transcriptEvents) capture(entry.callId, entry.event, entry.generation);
+    return result;
   };
   const boundRecord = async (tx: TenantTransaction, sid: string) => {
     const record = await tx.getVoiceCall(sid);
@@ -216,7 +301,10 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
         : streamTwiml(
             publicUrl(),
             grant,
-            'You are speaking with an AI restaurant assistant. Requests are subject to staff review and do not confirm a reservation.',
+            'You are speaking with an AI restaurant assistant. Requests are subject to staff review and do not confirm a reservation.' +
+              (config.voice.debugTranscripts
+                ? ' A transcript is saved locally for debugging.'
+                : ''),
           ),
       controlId: null,
       controlKind: null,
@@ -475,7 +563,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
   );
 
   app.post('/internal/voice/propose', (request) =>
-    scoped(request, async (tx, now) => {
+    scoped(request, async (tx, now, stage, transcript) => {
       const input = z
         .object({
           ...binding,
@@ -544,6 +632,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
           controlState: 'PREPARED',
           controlTwiml: twiml,
           confirmationGrantHash: hash(grant),
+          confirmationRetryGrantHash: null,
           confirmationExpiresAt: new Date(
             Math.min(Date.parse(nextCall.proposal.expiresAt), deadline(record)),
           ).toISOString(),
@@ -555,6 +644,9 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
       );
       const result = { controlId, twiml };
       await tx.putReceipt(key, fingerprint(input), result, record.id);
+      stage('proposal_prepared', record.id);
+      // Exact server-authored text, not a claim that it was dispatched or heard.
+      transcript(record, { kind: 'server_readback', text: nextCall.proposal.readback });
       return result;
     }),
   );
@@ -613,6 +705,7 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
           controlState: 'PREPARED',
           controlTwiml: twiml,
           confirmationGrantHash: hash(grant),
+          confirmationRetryGrantHash: null,
           confirmationExpiresAt: record.leaseExpiresAt,
           proposalId: null,
           transferDestination: destination,
@@ -793,15 +886,20 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
   );
 
   app.post('/internal/voice/confirmation', (request) =>
-    scoped(request, async (tx, now) => {
+    scoped(request, async (tx, now, stage, transcript) => {
       const parsed = z
         .object({
           providerCallSid: providerCallSidSchema,
           confirmationToken: tokenSchema,
           speechResult: z.string().max(2000).optional(),
           confidence: z.number().min(0).max(1).optional(),
+          digits: z
+            .string()
+            .regex(/^[0-9*#]?$/)
+            .optional(),
         })
         .strict()
+        .refine((value) => !(value.digits && value.speechResult?.length))
         .parse(request.body);
       const input = {
         ...parsed,
@@ -813,50 +911,154 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
       const record = await recordFor(tx, input.providerCallSid);
       eligibleCallback(record, input.confirmationToken, 'readback');
       if (record.state === 'ENDED') return callbackResult(record, hangup());
+      stage('confirmation_received', record.id);
       const key = `voice:confirmation:${hash(input.confirmationToken)}`;
       const receipt = await receiptResult(tx, key, input);
-      if (receipt) return callbackResultSchema.parse(receipt);
+      if (receipt) {
+        stage('confirmation_replayed', record.id);
+        // An old first-attempt receipt must never restart an already completed
+        // retry or play a stale prompt after authority has expired/revoked.
+        if (
+          record.confirmationRetryGrantHash &&
+          equal(record.confirmationGrantHash!, hash(input.confirmationToken))
+        ) {
+          const policy = await tx.getPhonePolicy();
+          if (
+            record.controlState === 'COMPLETED' ||
+            !config.voice.actionsEnabled ||
+            !(await tx.getTenantAccess()).enabled ||
+            !policy.voiceEnabled ||
+            !policy.requestsEnabled ||
+            (record.policyVersion ?? 1) !== policy.version ||
+            !record.confirmationExpiresAt ||
+            Date.parse(record.confirmationExpiresAt) <= now.getTime() ||
+            remaining(record, now) <= 0
+          )
+            return callbackResult(record, hangup('This confirmation has ended.'));
+          try {
+            confirmVoiceProposal(
+              await callFor(tx, record),
+              record.proposalId!,
+              await tx.getRestaurant(),
+              now,
+            );
+          } catch (error) {
+            if (!(error instanceof DomainError)) throw error;
+            return callbackResult(record, hangup('This confirmation has ended.'));
+          }
+        }
+        return callbackResultSchema.parse(receipt);
+      }
       if (record.controlState === 'COMPLETED')
         throw new VoiceError('CALLBACK_COMPLETED', 409, 'This confirmation has already completed.');
+      // Only a verified, bound, non-replayed callback can contribute caller text.
+      transcript(record, {
+        kind: 'confirmation',
+        text: parsed.speechResult ?? '',
+        ...(parsed.confidence === undefined ? {} : { confidence: parsed.confidence }),
+        ...(parsed.digits === undefined ? {} : { digits: parsed.digits }),
+      });
       const call = await callFor(tx, record),
         restaurant = await tx.getRestaurant();
       const policy = await tx.getPhonePolicy();
       let outcome = 'No new request was saved. You may repeat the details or ask for staff.';
-      const affirmed =
-        [
-          'yes',
-          'yes please',
-          'confirm',
-          'yes confirm',
-          'that is correct',
-          "that's correct",
-        ].includes(input.speechResult) &&
-        (input.confidence === undefined || input.confidence >= 0.8);
-      if (
-        affirmed &&
+      let saved = false;
+      const spokenAffirmative = [
+        'yes',
+        'yes please',
+        'confirm',
+        'yes confirm',
+        'that is correct',
+        "that's correct",
+      ].includes(input.speechResult);
+      // Twilio's optional recognition confidence is diagnostic metadata, not a
+      // calibrated consent signal. Exact speech is still gated by this callback's
+      // authenticated, current proposal authority and all checks below.
+      const affirmed = input.digits === '1' || spokenAffirmative;
+      const declined =
+        input.digits === '2' ||
+        ['no', 'no thanks', 'cancel', 'no cancel'].includes(input.speechResult);
+      const retryable = !affirmed && !declined && !input.speechResult;
+      const authorized =
         config.voice.actionsEnabled &&
         (await tx.getTenantAccess()).enabled &&
         policy.voiceEnabled &&
         policy.requestsEnabled &&
-        (record.policyVersion ?? 1) === policy.version &&
-        record.proposalId &&
-        call.proposal?.id === record.proposalId &&
+        (record.policyVersion ?? 1) === policy.version;
+      const currentProposal = !!record.proposalId && call.proposal?.id === record.proposalId;
+      const unexpired =
         record.confirmationExpiresAt &&
         Date.parse(record.confirmationExpiresAt) > now.getTime() &&
-        remaining(record, now) > 0
-      ) {
+        remaining(record, now) > 0;
+      const reason: VoiceActionStage | undefined = !authorized
+        ? 'confirmation_policy_denied'
+        : !currentProposal
+          ? 'confirmation_proposal_changed'
+          : !unexpired
+            ? 'confirmation_expired'
+            : declined
+              ? 'confirmation_declined'
+              : !affirmed
+                ? input.speechResult || input.digits
+                  ? 'confirmation_unclear'
+                  : 'confirmation_empty'
+                : undefined;
+      if (reason) stage(reason, record.id);
+      if (authorized && currentProposal && unexpired && (affirmed || retryable)) {
         try {
-          const result = confirmVoiceProposal(call, record.proposalId, restaurant, now);
-          await tx.insertInbox(result.item);
-          await tx.saveCall(result.call, call.version);
-          await tx.enqueue('inbox.created', result.item.id);
-          await tx.audit('system:voice', 'inbox.created', result.item.id);
-          outcome =
-            result.item.kind === 'reservation'
-              ? 'Your unconfirmed reservation request was saved for staff review. Your table is not booked.'
-              : 'Your message was saved to the restaurant staff inbox.';
+          // Revalidate the immutable proposal even before offering a retry.
+          // This pure domain result is persisted only after actual affirmation.
+          const result = confirmVoiceProposal(call, record.proposalId!, restaurant, now);
+          if (affirmed) {
+            await tx.insertInbox(result.item);
+            await tx.saveCall(result.call, call.version);
+            await tx.enqueue('inbox.created', result.item.id);
+            await tx.audit('system:voice', 'inbox.created', result.item.id);
+            saved = true;
+            outcome =
+              result.item.kind === 'reservation'
+                ? 'Your unconfirmed reservation request was saved for staff review. Your table is not booked.'
+                : 'Your message was saved to the restaurant staff inbox.';
+          } else if (
+            !record.confirmationRetryGrantHash &&
+            remaining(record, now) >= 20 &&
+            Date.parse(record.confirmationExpiresAt!) - now.getTime() >= 20_000
+          ) {
+            const retryToken = token();
+            outcome = 'Your request is not saved yet. Please confirm again or press 1 to save.';
+            const next = await saveRecord(
+              tx,
+              record,
+              {
+                // A verified Gather callback proves the readback control ran.
+                // Fence late transport acknowledgments before retaining it.
+                state: 'AWAITING_CONFIRMATION',
+                controlState: 'ACCEPTED',
+                confirmationRetryGrantHash: hash(retryToken),
+                outcome,
+              },
+              now,
+            );
+            const retry = callbackResult(
+              next,
+              buildConfirmationRetryTwiml({
+                publicUrl: publicUrl(),
+                confirmationToken: retryToken,
+              }),
+            );
+            await tx.putReceipt(key, fingerprint(input), retry, record.id);
+            stage('confirmation_retry', record.id);
+            transcript(record, { kind: 'server_outcome', text: outcome });
+            return retry;
+          } else {
+            stage('confirmation_retry_exhausted', record.id);
+            outcome =
+              'I could not clearly confirm your request. Nothing was saved. Please call again and press 1 after reviewing the details.';
+            await clearProposal(tx, call, now, outcome);
+          }
         } catch (error) {
           if (!(error instanceof DomainError)) throw error;
+          stage('confirmation_proposal_changed', record.id);
           outcome =
             'The request details changed or expired. No new request was saved. Please review them again or contact staff.';
           await clearProposal(tx, call, now, outcome);
@@ -864,6 +1066,8 @@ export async function registerVoiceActions(app: FastifyInstance, config: AppConf
       } else await clearProposal(tx, call, now, outcome);
       const result = await resume(tx, record, now, outcome);
       await tx.putReceipt(key, fingerprint(input), result, record.id);
+      stage(saved ? 'request_saved' : 'confirmation_not_saved', record.id);
+      transcript(record, { kind: 'server_outcome', text: outcome });
       return result;
     }),
   );

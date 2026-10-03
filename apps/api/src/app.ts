@@ -20,7 +20,7 @@ import {
 import { getIntegrationStatuses, type CallStatusReader } from '@hostline/connectors';
 import type { Database, TenantTransaction } from '@hostline/database';
 import type { AppConfig } from '@hostline/config';
-import { logEvent } from '@hostline/observability';
+import { logEvent, type OperationalEvent, type VoiceTranscriptSink } from '@hostline/observability';
 import { registerAuth } from './auth.js';
 import { registerVoiceActions } from './voice.js';
 import { registerPhoneOperations } from './phone-operations.js';
@@ -70,6 +70,8 @@ export async function createApp(
   dependencies: {
     callStatusReader?: CallStatusReader;
     recoveryGuard?: () => Promise<boolean>;
+    onVoiceDiagnostic?: (event: OperationalEvent) => void;
+    voiceTranscripts?: VoiceTranscriptSink;
   } = {},
 ) {
   const app = Fastify({
@@ -343,7 +345,13 @@ export async function createApp(
       return { tenantId: config.voiceTenantId, restaurant: await tx.getRestaurant() };
     });
   });
-  await registerVoiceActions(app, config, db);
+  await registerVoiceActions(
+    app,
+    config,
+    db,
+    dependencies.onVoiceDiagnostic,
+    dependencies.voiceTranscripts,
+  );
   await registerPhoneOperations(app, config, db, auth, dependencies);
   await registerDashboard(
     app,

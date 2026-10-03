@@ -1,11 +1,18 @@
 import { existsSync } from 'node:fs';
 import { loadConfig } from '@hostline/config';
 import { createDatabase, createRuntimeRecoveryGuard } from '@hostline/database';
-import { logEvent } from '@hostline/observability';
+import { createVoiceTranscriptRecorder, logEvent } from '@hostline/observability';
 import { createApp } from './app.js';
 
 if (existsSync('.env')) process.loadEnvFile('.env');
 const config = loadConfig();
+const voiceTranscripts = config.voice.debugTranscripts
+  ? await createVoiceTranscriptRecorder({
+      directory: '.data/voice-transcripts',
+      source: 'api',
+      onDiagnostic: (code) => logEvent({ event: 'voice.transcript', code }),
+    })
+  : undefined;
 const db = await createDatabase(
   config.databaseUrl
     ? {
@@ -17,7 +24,10 @@ const db = await createDatabase(
 if (config.auth.mode === 'demo') await db.seedDemo();
 const recoveryGuard =
   config.auth.mode === 'oidc' ? createRuntimeRecoveryGuard(db) : async () => true;
-const app = await createApp(config, db, { recoveryGuard });
+const app = await createApp(config, db, {
+  recoveryGuard,
+  ...(voiceTranscripts ? { voiceTranscripts } : {}),
+});
 let running = false;
 const jobs = config.runInternalJobs
   ? setInterval(() => {
@@ -41,6 +51,7 @@ async function stop() {
   const deadline = setTimeout(() => process.exit(1), 15000);
   deadline.unref();
   await app.close();
+  await voiceTranscripts?.close();
   await db.close();
   clearTimeout(deadline);
 }

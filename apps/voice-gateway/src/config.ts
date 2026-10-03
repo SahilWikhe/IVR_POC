@@ -47,6 +47,7 @@ const activeSchema = z.object({
   backendModel: z.literal('gpt-6-luna'),
   actionsEnabled: z.boolean(),
   transfersEnabled: z.boolean(),
+  debugTranscripts: z.boolean(),
   maxConcurrentCalls: z.coerce.number().int().min(1).max(10),
   maxCallSeconds: z.coerce.number().int().min(15).max(600),
 });
@@ -63,10 +64,26 @@ export function loadVoiceConfig(env: NodeJS.ProcessEnv = process.env): VoiceConf
   const enabled = enabledSchema.safeParse(env.LIVE_VOICE_ENABLED ?? 'false');
   const actions = enabledSchema.safeParse(env.VOICE_ACTIONS_ENABLED ?? 'false');
   const transfers = enabledSchema.safeParse(env.VOICE_TRANSFERS_ENABLED ?? 'false');
+  const transcripts = enabledSchema.safeParse(env.VOICE_DEBUG_TRANSCRIPTS ?? 'false');
   const port = portSchema.safeParse(env.VOICE_PORT ?? env.PORT ?? '3002');
   const host = hostSchema.safeParse(env.VOICE_HOST ?? '127.0.0.1');
-  if (!enabled.success || !port.success || !host.success || !actions.success || !transfers.success)
+  if (
+    !enabled.success ||
+    !port.success ||
+    !host.success ||
+    !actions.success ||
+    !transfers.success ||
+    !transcripts.success
+  )
     throw new Error('Invalid voice activation flags, VOICE_HOST, or VOICE_PORT');
+  if (
+    transcripts.data === 'true' &&
+    (enabled.data !== 'true' ||
+      (env.AUTH_MODE ?? 'demo') !== 'demo' ||
+      !['127.0.0.1', 'localhost', '::1'].includes(host.data) ||
+      (env.OPENAI_REALTIME_MODEL ?? 'gpt-live-1') !== 'gpt-live-1')
+  )
+    throw new Error('Voice debug transcripts require the loopback GPT-Live demo sandbox.');
   if (enabled.data === 'false') return { enabled: false, port: port.data, host: host.data };
   if (env.NODE_ENV === 'production')
     throw new Error('Production voice activation is unavailable: sandbox verification is required');
@@ -82,6 +99,7 @@ export function loadVoiceConfig(env: NodeJS.ProcessEnv = process.env): VoiceConf
     tenantId: env.VOICE_TENANT_ID,
     actionsEnabled: actions.data === 'true',
     transfersEnabled: transfers.data === 'true',
+    debugTranscripts: transcripts.data === 'true',
     model: env.OPENAI_REALTIME_MODEL ?? 'gpt-live-1',
     backendModel: env.OPENAI_VOICE_BACKEND_MODEL ?? 'gpt-6-luna',
     maxConcurrentCalls: env.VOICE_MAX_CONCURRENT_CALLS ?? '2',

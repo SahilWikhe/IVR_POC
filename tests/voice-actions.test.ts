@@ -4,7 +4,7 @@ import {
   type AudioPeer,
   type VoiceToolRequest,
 } from '../apps/voice-gateway/src/relay.js';
-import { createVoiceApiClient } from '../apps/voice-gateway/src/client.js';
+import { createVoiceApiClient, VoiceControlError } from '../apps/voice-gateway/src/client.js';
 import { loadVoiceConfig, type EnabledVoiceConfig } from '../apps/voice-gateway/src/config.js';
 
 const environment = {
@@ -345,6 +345,34 @@ describe('bounded scoped internal voice client', () => {
         }),
       ).rejects.toThrow();
     }
+  });
+  it.each([
+    [
+      409,
+      { error: { code: 'CALL_BUDGET_EXCEEDED', message: 'private caller details' } },
+      'CALL_BUDGET_EXCEEDED',
+    ],
+    [
+      400,
+      { error: { code: 'AMBIGUOUS_DATE', message: 'private caller details' } },
+      'AMBIGUOUS_DATE',
+    ],
+    [400, { error: { code: 'private caller details' } }, 'CONTROL_UNAVAILABLE'],
+    [500, { error: { code: 'AMBIGUOUS_DATE' } }, 'CONTROL_UNAVAILABLE'],
+    [400, 'malformed', 'CONTROL_UNAVAILABLE'],
+    [400, 'x'.repeat(4097), 'CONTROL_UNAVAILABLE'],
+  ])('keeps only an allowlisted code from control rejection %s', async (status, body, expected) => {
+    const transport = vi.fn(
+      async () => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status }),
+    );
+    const api = createVoiceApiClient(config(), transport);
+    const error = await api
+      .policy({ providerCallSid: `CA${'b'.repeat(32)}`, generation: environment.VOICE_TENANT_ID })
+      .catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(VoiceControlError);
+    expect(error).toMatchObject({ code: expected, message: 'Voice control unavailable' });
+    expect(JSON.stringify(error)).not.toContain('private caller details');
+    expect(transport).toHaveBeenCalledOnce();
   });
   it('requires exact boolean strings for each activation flag even while voice is disabled', () => {
     expect(() => loadVoiceConfig({ VOICE_ACTIONS_ENABLED: 'yes' })).toThrow(

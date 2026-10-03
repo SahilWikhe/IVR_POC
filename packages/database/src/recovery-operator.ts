@@ -419,6 +419,7 @@ export async function quarantineRestoredDatabase(
                 controlState: null,
                 controlTwiml: null,
                 confirmationGrantHash: null,
+                confirmationRetryGrantHash: null,
                 confirmationExpiresAt: null,
                 proposalId: null,
                 transferDestination: null,

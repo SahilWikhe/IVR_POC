@@ -13,6 +13,7 @@ import {
 import { loadConfig } from '@hostline/config';
 import { createDatabase, type Database, type TenantTransaction } from '@hostline/database';
 import { createApp } from '../apps/api/src/app.js';
+import type { OperationalEvent, VoiceTranscriptSink } from '../packages/observability/src/index.js';
 
 const accountSid = `AC${'a'.repeat(32)}`;
 const phoneNumber = '+12125550190';
@@ -83,17 +84,26 @@ describe('durable phone actions through the authenticated API', () => {
   let originalRestaurant: Restaurant;
   let testClient = 0;
   const providerCalls = new Set<string>();
+  const diagnostics: OperationalEvent[] = [];
+  let failDiagnostics = false;
 
   beforeAll(async () => {
     database = await createDatabase();
     await database.seedDemo();
     originalRestaurant = await database.withTenant(DEMO_TENANTS.harbor, (tx) => tx.getRestaurant());
-    app = await createApp(loadConfig(environment), database);
+    app = await createApp(loadConfig(environment), database, {
+      onVoiceDiagnostic: (event) => {
+        if (failDiagnostics) throw new Error('Synthetic log sink failure');
+        diagnostics.push(event);
+      },
+    });
     await app.ready();
   });
 
   beforeEach(() => {
     testClient += 1;
+    diagnostics.length = 0;
+    failDiagnostics = false;
   });
 
   afterEach(async () => {
@@ -488,6 +498,18 @@ describe('durable phone actions through the authenticated API', () => {
     const result = callbackSchema.parse(confirmations[0]?.json());
     expect(result.outcome).toMatch(/saved/i);
     expect(await items(call)).toHaveLength(1);
+    expect(diagnostics.filter((event) => event.code === 'request_saved')).toEqual([
+      { event: 'voice.workflow', requestId: call.voiceCallId, code: 'request_saved' },
+    ]);
+    expect(diagnostics.some((event) => event.code === 'confirmation_replayed')).toBe(true);
+    const logged = JSON.stringify(diagnostics);
+    for (const privateValue of [
+      call.providerCallSid,
+      control.token,
+      'Taylor Example',
+      '+12125550141',
+    ])
+      expect(logged).not.toContain(privateValue);
     expect(await database.processJobs(100)).toBe(1);
     expect(await database.processJobs(100)).toBe(0);
     const before = await voice(call);
@@ -527,11 +549,81 @@ describe('durable phone actions through the authenticated API', () => {
     expect(await items(call)).toHaveLength(1);
   });
 
-  it('requires an unambiguous affirmative result with adequate confidence', async () => {
+  it.each([0, 0.575, 0.636, 1, undefined])(
+    'saves one exact confirmed reservation regardless of optional recognition confidence: %s',
+    async (confidence) => {
+      const call = await start();
+      const reservation = {
+        dateExpression: 'tomorrow',
+        time: '19:00',
+        partySize: 4,
+        name: 'Taylor Example',
+        callbackNumber: '+12125550141',
+        notes: 'Patio if available',
+      };
+      const control = await prepare(call, { kind: 'reservation', reservation });
+      const proposed = await database.withTenant(DEMO_TENANTS.harbor, (tx) =>
+        tx.getCall(call.voiceCallId),
+      );
+      await accepted(call, control);
+      const payload = {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: control.token,
+        speechResult: 'Yes.',
+        ...(confidence === undefined ? {} : { confidence }),
+      };
+      const responses = await Promise.all([
+        post('confirmation', payload),
+        post('confirmation', payload),
+      ]);
+      expect(responses.map((response) => response.statusCode)).toEqual([200, 200]);
+      expect(responses[0]?.json()).toEqual(responses[1]?.json());
+      expect(callbackSchema.parse(responses[0]?.json()).outcome).toBe(
+        'Your unconfirmed reservation request was saved for staff review. Your table is not booked.',
+      );
+      const saved = await items(call);
+      expect(saved).toHaveLength(1);
+      expect(saved[0]).toMatchObject({
+        kind: 'reservation',
+        state: 'PENDING_STAFF_REVIEW',
+        name: reservation.name,
+        callbackNumber: reservation.callbackNumber,
+      });
+      expect(saved[0]?.reservation).toEqual(proposed?.proposal?.reservation);
+      expect((await voice(call)).confirmationRetryGrantHash).toBeNull();
+      expect(diagnostics.filter((event) => event.code === 'request_saved')).toHaveLength(1);
+      expect(await database.processJobs(100)).toBe(1);
+      expect(await database.processJobs(100)).toBe(0);
+    },
+  );
+
+  it('rejects invalid confidence metadata without consuming confirmation authority', async () => {
+    const call = await start();
+    const control = await prepare(call);
+    await accepted(call, control);
+    const original = await voice(call);
+    for (const confidence of [-0.01, 1.01, '0.9', null]) {
+      const response = await post('confirmation', {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: control.token,
+        speechResult: 'yes',
+        confidence,
+      });
+      expect(response.statusCode).toBe(400);
+      expect(await items(call)).toEqual([]);
+      expect(await voice(call)).toEqual(original);
+    }
+    expect((await confirmation(call, control)).statusCode).toBe(200);
+    expect(await items(call)).toHaveLength(1);
+  });
+
+  it('requires an unambiguous affirmative result regardless of recognition confidence', async () => {
     for (const answer of [
       { speechResult: 'maybe yes, I need to change the date', confidence: 0.99 },
-      { speechResult: 'yes', confidence: 0.2 },
+      { speechResult: 'yes but change the date', confidence: 0 },
       { speechResult: 'no', confidence: 0.99 },
+      { speechResult: 'no', confidence: 0 },
+      { speechResult: 'cancel' },
       {},
     ]) {
       const call = await start();
@@ -544,6 +636,189 @@ describe('durable phone actions through the authenticated API', () => {
       });
       expect(response.statusCode).toBe(200);
       expect(await items(call)).toEqual([]);
+      await post('end', { providerCallSid: call.providerCallSid, reason: 'provider_terminal' });
+    }
+  });
+
+  it.each([
+    { first: { digits: '9' }, final: { digits: '1' } },
+    { first: {}, final: { speechResult: 'yes', confidence: 0.575 } },
+  ])(
+    'retries uncertain confirmation once and saves the same proposal: %j',
+    async ({ first, final }) => {
+      const call = await start();
+      const control = await prepare(call);
+      await dispatch(call, control);
+      const original = await database.withTenant(DEMO_TENANTS.harbor, (tx) =>
+        tx.getCall(call.voiceCallId),
+      );
+      const payload = {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: control.token,
+        ...first,
+      };
+      const uncertain = await post('confirmation', payload);
+      expect(uncertain.statusCode).toBe(200);
+      const retry = callbackSchema.parse(uncertain.json());
+      const retryToken = controlToken(retry.twiml, 'confirmation');
+      expect(retryToken).not.toBe(control.token);
+      expect(retry.twiml).toContain('<Gather');
+      expect(retry.twiml).not.toContain('<Connect>');
+      expect(await items(call)).toEqual([]);
+      const pending = await voice(call);
+      expect(pending).toMatchObject({
+        state: 'AWAITING_CONFIRMATION',
+        controlState: 'ACCEPTED',
+        confirmationGrantHash: createHash('sha256').update(control.token).digest('hex'),
+        confirmationRetryGrantHash: createHash('sha256').update(retryToken).digest('hex'),
+      });
+      expect(
+        await database.withTenant(DEMO_TENANTS.harbor, (tx) => tx.getCall(call.voiceCallId)),
+      ).toEqual(original);
+      expect((await post('confirmation', payload)).json()).toEqual(retry);
+      expect(await voice(call)).toEqual(pending);
+      expect((await post('confirmation', { ...payload, digits: '1' })).statusCode).toBe(409);
+      for (const outcome of ['unknown', 'rejected'] as const) {
+        expect(
+          (
+            await post('dispatched', {
+              providerCallSid: call.providerCallSid,
+              generation: call.generation,
+              controlId: control.controlId,
+              outcome,
+            })
+          ).statusCode,
+        ).toBe(200);
+        expect(await voice(call)).toEqual(pending);
+      }
+      const acceptedPayload = {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: retryToken,
+        ...final,
+      };
+      const confirmations = await Promise.all([
+        post('confirmation', acceptedPayload),
+        post('confirmation', acceptedPayload),
+      ]);
+      expect(confirmations.map((response) => response.statusCode)).toEqual([200, 200]);
+      expect(confirmations[0]?.json()).toEqual(confirmations[1]?.json());
+      const saved = await items(call);
+      expect(saved).toHaveLength(1);
+      expect(saved[0]).toMatchObject({
+        kind: original?.proposal?.kind,
+        name: original?.proposal?.message?.name,
+        callbackNumber: original?.proposal?.message?.callbackNumber,
+        message: original?.proposal?.message?.message,
+      });
+      expect(
+        diagnostics.filter(
+          (event) => event.requestId === call.voiceCallId && event.code === 'request_saved',
+        ),
+      ).toHaveLength(1);
+      const completed = await voice(call);
+      const lateInitial = await post('confirmation', payload);
+      expect(lateInitial.statusCode).toBe(200);
+      expect(callbackSchema.parse(lateInitial.json()).twiml).not.toMatch(/<(?:Gather|Connect)/);
+      expect(await voice(call)).toEqual(completed);
+      expect(await items(call)).toHaveLength(1);
+    },
+  );
+
+  it('does not turn retry exhaustion, corrections or conflicting channels into consent', async () => {
+    for (const answer of [
+      { speechResult: 'maybe', confidence: 0.99 },
+      { digits: '2' },
+      { speechResult: 'yes but change the date', confidence: 0.99 },
+      {},
+      { digits: '9' },
+      { digits: '1', speechResult: 'yes', confidence: 0.99 },
+    ]) {
+      const call = await start();
+      const control = await prepare(call);
+      await accepted(call, control);
+      const initial = await post('confirmation', {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: control.token,
+      });
+      expect(initial.statusCode).toBe(200);
+      const retryToken = controlToken(callbackSchema.parse(initial.json()).twiml, 'confirmation');
+      const response = await post('confirmation', {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: retryToken,
+        ...answer,
+      });
+      expect(response.statusCode).toBeLessThan(500);
+      expect(await items(call)).toEqual([]);
+      if (response.statusCode === 200) {
+        expect(callbackSchema.parse(response.json()).twiml).not.toContain('<Gather');
+        expect((await voice(call)).controlState).toBe('COMPLETED');
+      }
+      expect((await voice(call)).confirmationRetryGrantHash).toBe(
+        createHash('sha256').update(retryToken).digest('hex'),
+      );
+      await post('end', { providerCallSid: call.providerCallSid, reason: 'provider_terminal' });
+    }
+  });
+
+  it('rechecks policy, configuration, expiry and hangup before saving retry consent', async () => {
+    for (const gate of ['policy', 'configuration', 'expiry', 'deadline', 'hangup'] as const) {
+      const call = await start();
+      const control = await prepare(call);
+      await accepted(call, control);
+      const initial = await post('confirmation', {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: control.token,
+      });
+      expect(initial.statusCode).toBe(200);
+      const retryToken = controlToken(callbackSchema.parse(initial.json()).twiml, 'confirmation');
+      if (gate === 'policy') {
+        const version = await database.withTenant(
+          DEMO_TENANTS.harbor,
+          async (tx) => (await tx.getPhonePolicy()).version,
+        );
+        await changeVoice(call, { policyVersion: version + 1 });
+      } else if (gate === 'configuration') {
+        await settings({ address: '12 Synthetic Retry Lane' });
+      } else if (gate === 'expiry') {
+        await changeVoice(call, {
+          confirmationExpiresAt: new Date(Date.now() - 1000).toISOString(),
+        });
+      } else if (gate === 'deadline') {
+        await changeVoice(call, { createdAt: new Date(Date.now() - 601_000).toISOString() });
+      } else {
+        await post('end', { providerCallSid: call.providerCallSid, reason: 'provider_terminal' });
+      }
+      const response = await post('confirmation', {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: retryToken,
+        digits: '1',
+      });
+      expect(response.statusCode).toBe(200);
+      expect(await items(call)).toEqual([]);
+      expect(callbackSchema.parse(response.json()).twiml).not.toContain('<Gather');
+      await post('end', { providerCallSid: call.providerCallSid, reason: 'provider_terminal' });
+    }
+  });
+
+  it('does not issue a retry without twenty seconds of both call and confirmation authority', async () => {
+    for (const gate of ['call', 'confirmation'] as const) {
+      const call = await start();
+      const control = await prepare(call);
+      await accepted(call, control);
+      await changeVoice(
+        call,
+        gate === 'call'
+          ? { createdAt: new Date(Date.now() - 581_000).toISOString() }
+          : { confirmationExpiresAt: new Date(Date.now() + 19_000).toISOString() },
+      );
+      const response = await post('confirmation', {
+        providerCallSid: call.providerCallSid,
+        confirmationToken: control.token,
+      });
+      expect(response.statusCode).toBe(200);
+      expect(await items(call)).toEqual([]);
+      expect(callbackSchema.parse(response.json()).twiml).not.toContain('<Gather');
+      expect((await voice(call)).confirmationRetryGrantHash).toBeNull();
       await post('end', { providerCallSid: call.providerCallSid, reason: 'provider_terminal' });
     }
   });
@@ -958,7 +1233,20 @@ describe('durable phone actions through the authenticated API', () => {
         );
       },
     };
-    const failingApp = await createApp(loadConfig(environment), failingDatabase);
+    const rolledBackEvents: OperationalEvent[] = [];
+    const rolledBackTranscripts: Parameters<VoiceTranscriptSink['record']>[] = [];
+    const failingApp = await createApp(
+      loadConfig({ ...environment, VOICE_DEBUG_TRANSCRIPTS: 'true' }),
+      failingDatabase,
+      {
+        voiceTranscripts: {
+          record: (...entry) => {
+            rolledBackTranscripts.push(entry);
+          },
+        },
+        onVoiceDiagnostic: (event) => rolledBackEvents.push(event),
+      },
+    );
     try {
       await failingApp.ready();
       const response = await failingApp.inject({
@@ -973,6 +1261,8 @@ describe('durable phone actions through the authenticated API', () => {
         },
       });
       expect(response.statusCode).toBe(500);
+      expect(rolledBackEvents).toEqual([]);
+      expect(rolledBackTranscripts).toEqual([]);
       expect(response.body).not.toContain('Synthetic enqueue failure');
       expect(await items(call)).toEqual([]);
       expect(await voice(call)).toEqual(before);
@@ -990,6 +1280,124 @@ describe('durable phone actions through the authenticated API', () => {
     expect(await items(call)).toHaveLength(1);
     expect(await database.processJobs(100)).toBe(1);
   });
+
+  it('commits exactly one confirmed request even when the diagnostic sink fails', async () => {
+    const call = await start();
+    const control = await prepare(call);
+    await accepted(call, control);
+    failDiagnostics = true;
+    try {
+      expect((await confirmation(call, control)).statusCode).toBe(200);
+      expect((await confirmation(call, control)).statusCode).toBe(200);
+      expect(await items(call)).toHaveLength(1);
+    } finally {
+      failDiagnostics = false;
+    }
+  });
+
+  it.each([false, true])(
+    'captures committed readback and bound confirmation only when opted in: %s',
+    async (enabled) => {
+      const capture: Parameters<VoiceTranscriptSink['record']>[] = [];
+      const originalApp = app;
+      app = await createApp(
+        loadConfig({ ...environment, VOICE_DEBUG_TRANSCRIPTS: String(enabled) }),
+        database,
+        {
+          onVoiceDiagnostic: () => {},
+          voiceTranscripts: {
+            record: (...entry) => {
+              capture.push(entry);
+            },
+          },
+        },
+      );
+      try {
+        await app.ready();
+        const call = await start();
+        expect(call.twiml.includes('A transcript is saved locally for debugging.')).toBe(enabled);
+        const control = await prepare(call);
+        const proposed = await database.withTenant(DEMO_TENANTS.harbor, (tx) =>
+          tx.getCall(call.voiceCallId),
+        );
+        await accepted(call, control);
+        const before = capture.length;
+        const invalid = await post('confirmation', {
+          providerCallSid: call.providerCallSid,
+          confirmationToken: '0'.repeat(64),
+          speechResult: 'UNBOUND TEXT',
+        });
+        expect(invalid.statusCode).not.toBe(200);
+        expect(capture).toHaveLength(before);
+        expect((await confirmation(call, control, 'Yes!')).statusCode).toBe(200);
+        expect((await confirmation(call, control, 'Yes!')).statusCode).toBe(200);
+        expect(await items(call)).toHaveLength(1);
+        if (enabled) {
+          expect(capture.filter(([, event]) => event.kind === 'server_readback')).toEqual([
+            [
+              call.voiceCallId,
+              { kind: 'server_readback', text: proposed?.proposal?.readback },
+              call.generation,
+            ],
+          ]);
+          expect(capture.filter(([, event]) => event.kind === 'confirmation')).toEqual([
+            [
+              call.voiceCallId,
+              { kind: 'confirmation', text: 'Yes!', confidence: 0.99 },
+              call.generation,
+            ],
+          ]);
+          expect(capture.filter(([, event]) => event.kind === 'server_outcome')).toHaveLength(1);
+          expect(
+            capture.filter(([, event]) => event.kind === 'stage' && event.code === 'request_saved'),
+          ).toHaveLength(1);
+          for (const forbidden of [
+            call.providerCallSid,
+            control.token,
+            serviceToken,
+            'UNBOUND TEXT',
+            '<Response>',
+          ])
+            expect(JSON.stringify(capture)).not.toContain(forbidden);
+        } else expect(capture).toEqual([]);
+      } finally {
+        await app.close();
+        app = originalApp;
+      }
+    },
+  );
+
+  it.each(['throw', 'reject'])(
+    'preserves confirmed saves when transcript capture fails with %s',
+    async (failure) => {
+      const originalApp = app;
+      app = await createApp(
+        loadConfig({ ...environment, VOICE_DEBUG_TRANSCRIPTS: 'true' }),
+        database,
+        {
+          onVoiceDiagnostic: () => {},
+          voiceTranscripts: {
+            record: () => {
+              if (failure === 'throw') throw new Error('Synthetic capture failure');
+              return Promise.reject(new Error('Synthetic capture rejection'));
+            },
+          },
+        },
+      );
+      try {
+        await app.ready();
+        const call = await start();
+        const control = await prepare(call);
+        await accepted(call, control);
+        expect((await confirmation(call, control)).statusCode).toBe(200);
+        expect((await confirmation(call, control)).statusCode).toBe(200);
+        expect(await items(call)).toHaveLength(1);
+      } finally {
+        await app.close();
+        app = originalApp;
+      }
+    },
+  );
 
   it('enforces one durable admission slot for simultaneous incoming calls', async () => {
     const bounded = await createApp(

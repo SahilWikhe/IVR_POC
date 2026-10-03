@@ -4,6 +4,7 @@ import {
   type LiveDelegationInput,
   type LiveDelegationResult,
   type LiveRelayOptions,
+  type LiveWorkflowStage,
 } from '../apps/voice-gateway/src/live-relay.js';
 import type {
   AudioPeer,
@@ -39,6 +40,7 @@ function fixture(options: Partial<LiveRelayOptions> = {}, start = true) {
     provider = new Peer();
   const closed = vi.fn();
   const diagnostic = vi.fn<(code: RelayDiagnosticCode) => void>();
+  const stage = vi.fn<(code: LiveWorkflowStage) => void>();
   const onDelegate = vi.fn<LiveRelayOptions['onDelegate']>(async () => ({
     kind: 'reply',
     text: 'Please provide the requested date.',
@@ -51,6 +53,7 @@ function fixture(options: Partial<LiveRelayOptions> = {}, start = true) {
     onTool,
     now: () => now,
     onDiagnostic: diagnostic,
+    onStage: stage,
     ...options,
   });
   const event = (value: object) => relay.providerEvent(JSON.stringify(value));
@@ -93,6 +96,7 @@ function fixture(options: Partial<LiveRelayOptions> = {}, start = true) {
     relay,
     closed,
     diagnostic,
+    stage,
     onDelegate,
     onTool,
     event,
@@ -107,6 +111,279 @@ function fixture(options: Partial<LiveRelayOptions> = {}, start = true) {
   };
 }
 afterEach(() => vi.useRealTimers());
+
+type CapturedTranscriptEvent = Parameters<NonNullable<LiveRelayOptions['onTranscript']>>[0];
+
+describe('optional Live transcript capture', () => {
+  it.each([false, true])(
+    'captures only when a hook is configured (enabled=%s)',
+    async (enabled) => {
+      vi.useFakeTimers();
+      const capture = vi.fn<NonNullable<LiveRelayOptions['onTranscript']>>();
+      const f = fixture(enabled ? { onTranscript: capture } : {});
+      f.input();
+      f.transcript('caller1', ' What time? ', 0, 100);
+      f.transcript('assistant1', ' At seven. ', 100, 200, 'assistant');
+      f.audio();
+      f.delegate();
+      await vi.advanceTimersByTimeAsync(700);
+      expect(f.closed).not.toHaveBeenCalled();
+      expect(f.telephone.events.some((event) => event.event === 'media')).toBe(true);
+      expect(f.provider.events.at(-1)).toMatchObject({ type: 'session.commentary.append' });
+      expect(capture.mock.calls).toEqual(
+        enabled
+          ? [
+              [{ kind: 'speech', source: 'caller', text: ' What time? ', startMs: 0, endMs: 100 }],
+              [
+                {
+                  kind: 'speech',
+                  source: 'assistant',
+                  text: ' At seven. ',
+                  startMs: 100,
+                  endMs: 200,
+                },
+              ],
+              [
+                {
+                  kind: 'backend_reply',
+                  text: 'Please provide the requested date.',
+                  awaitingCaller: false,
+                },
+              ],
+            ]
+          : [],
+      );
+      f.dispose();
+    },
+  );
+
+  it('preserves exact speaker text, timing and admission order once, including deferred fragments', () => {
+    const events: CapturedTranscriptEvent[] = [];
+    const f = fixture({
+      onTranscript: (event) => {
+        events.push(event);
+      },
+    });
+    f.input();
+    f.transcript('private-event1', 'My number is ', 0, 100);
+    f.transcript('private-event1', 'Duplicate must not be retained', 0, 100);
+    f.transcript('private-event2', ' two', 420, 440);
+    f.transcript('private-event3', ' I heard that.', 200, 300, 'assistant');
+    expect(events).toHaveLength(1);
+    f.input(320);
+    expect(events).toEqual([
+      { kind: 'speech', source: 'caller', text: 'My number is ', startMs: 0, endMs: 100 },
+      { kind: 'speech', source: 'caller', text: ' two', startMs: 420, endMs: 440 },
+      { kind: 'speech', source: 'assistant', text: ' I heard that.', startMs: 200, endMs: 300 },
+    ]);
+    expect(JSON.stringify(events)).not.toMatch(/private-event|dateReference|startedAt|streamSid/);
+    f.dispose();
+    f.transcript('late', 'Closed speech must not be retained.', 300, 400);
+    f.event({ type: 'session.closed' });
+    expect(events).toHaveLength(3);
+  });
+
+  it.each([
+    { delta: '', start_ms: 0, end_ms: 100 },
+    { delta: 'Private malformed text', start_ms: -1, end_ms: 100 },
+    { delta: 'Private future text', start_ms: 1401, end_ms: 1440 },
+  ])('does not capture a rejected transcript fragment %j', (fragment) => {
+    const capture = vi.fn<NonNullable<LiveRelayOptions['onTranscript']>>();
+    const f = fixture({ onTranscript: capture });
+    f.input();
+    f.event({ type: 'session.input_transcript.delta', event_id: 'invalid', ...fragment });
+    expect(f.closed).toHaveBeenCalledOnce();
+    expect(capture).not.toHaveBeenCalled();
+    f.dispose();
+  });
+
+  it('captures only the current accepted backend reply, never stale or late results', async () => {
+    vi.useFakeTimers();
+    const events: CapturedTranscriptEvent[] = [];
+    const pending: Array<(result: LiveDelegationResult) => void> = [];
+    const f = fixture({
+      actionsEnabled: true,
+      onTranscript: (event) => {
+        events.push(event);
+      },
+      onDelegate: () => new Promise((resolve) => pending.push(resolve)),
+    });
+    f.input();
+    f.transcript('date1', 'Tomorrow');
+    f.delegate();
+    await vi.advanceTimersByTimeAsync(700);
+    f.transcript('date2', 'Actually Friday', 100, 200);
+    pending[0]?.({ kind: 'reply', text: 'Stale question', awaitingCaller: true });
+    await vi.advanceTimersByTimeAsync(700);
+    pending[1]?.({ kind: 'reply', text: 'What time on Friday?', awaitingCaller: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(events.filter((event) => event.kind === 'backend_reply')).toEqual([
+      { kind: 'backend_reply', text: 'What time on Friday?', awaitingCaller: true },
+    ]);
+    f.transcript('time', 'Seven', 200, 300);
+    await vi.advanceTimersByTimeAsync(700);
+    f.dispose();
+    pending[2]?.({ kind: 'reply', text: 'Late result after close' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(events.filter((event) => event.kind === 'backend_reply')).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toMatch(/Stale question|Late result/);
+  });
+
+  it.each(['prepare_request', 'prepare_message', 'request_staff_transfer'] as const)(
+    'captures one normalized %s proposal without control identities before handoff',
+    async (tool) => {
+      vi.useFakeTimers();
+      const events: CapturedTranscriptEvent[] = [];
+      const f = fixture({
+        actionsEnabled: true,
+        transfersEnabled: true,
+        onTranscript: (event) => {
+          events.push(event);
+        },
+        onDelegate: async ({ transcript }) => ({
+          kind: 'tool',
+          name: tool,
+          callId: 'private-provider-call-id',
+          arguments: JSON.stringify(
+            tool === 'prepare_request'
+              ? {
+                  ...reservation,
+                  notes: '  Window please  ',
+                  date_utterance_id: transcript[0]?.dateReference,
+                }
+              : tool === 'prepare_message'
+                ? {
+                    name: ' Synthetic Guest ',
+                    callbackNumber: reservation.callbackNumber,
+                    message: ' Please call back. ',
+                  }
+                : { reason: 'requested_staff', summary: '  Caller requests staff  ' },
+          ),
+        }),
+        onTool: async () => {
+          expect(events.filter((event) => event.kind === 'tool_proposal')).toHaveLength(1);
+          return 'controlled';
+        },
+      });
+      f.input();
+      f.transcript('private-caller-event-id', 'Tomorrow');
+      f.delegate('private-delegation-id');
+      await vi.advanceTimersByTimeAsync(700);
+      f.delegate('private-delegation-id');
+      f.delegate('late-delegation');
+      f.transcript('late', 'Controlled speech', 100, 200);
+      await vi.advanceTimersByTimeAsync(700);
+      expect(events.filter((event) => event.kind === 'tool_proposal')).toEqual([
+        {
+          kind: 'tool_proposal',
+          tool,
+          text: JSON.stringify(
+            tool === 'prepare_request'
+              ? { kind: 'reservation', reservation: { ...reservation, notes: 'Window please' } }
+              : tool === 'prepare_message'
+                ? {
+                    kind: 'message',
+                    message: {
+                      name: 'Synthetic Guest',
+                      callbackNumber: reservation.callbackNumber,
+                      message: 'Please call back.',
+                    },
+                  }
+                : { reason: 'requested_staff', summary: 'Caller requests staff' },
+          ),
+        },
+      ]);
+      expect(JSON.stringify(events)).not.toMatch(
+        /private-|late-delegation|date_utterance_id|dateReference|toolCallId|utteranceStartedAt|streamSid/,
+      );
+      f.dispose();
+    },
+  );
+
+  it.each(['invalid_arguments', 'forged_date', 'stale_result'] as const)(
+    'does not capture rejected or stale tool payloads (%s)',
+    async (reason) => {
+      vi.useFakeTimers();
+      const events: CapturedTranscriptEvent[] = [];
+      let resolve: ((result: LiveDelegationResult) => void) | undefined;
+      let input: LiveDelegationInput | undefined;
+      const f = fixture({
+        actionsEnabled: true,
+        onTranscript: (event) => {
+          events.push(event);
+        },
+        onDelegate: (value) => {
+          input = value;
+          return new Promise((release) => {
+            resolve = release;
+          });
+        },
+      });
+      f.input();
+      f.transcript('u1', 'Tomorrow');
+      f.delegate();
+      await vi.advanceTimersByTimeAsync(700);
+      if (reason === 'stale_result') f.transcript('u2', 'Actually Friday', 100, 200);
+      resolve?.({
+        kind: 'tool',
+        name: 'prepare_request',
+        callId: 'discarded-tool',
+        arguments: JSON.stringify({
+          ...reservation,
+          date_utterance_id:
+            reason === 'forged_date'
+              ? '22222222-2222-4222-8222-222222222222'
+              : input?.transcript[0]?.dateReference,
+          ...(reason === 'invalid_arguments' ? { providerCallSid: 'not-authorized' } : {}),
+        }),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events.filter((event) => event.kind === 'tool_proposal')).toEqual([]);
+      expect(f.onTool).not.toHaveBeenCalled();
+      f.dispose();
+    },
+  );
+
+  it.each(['sync', 'async'] as const)(
+    'contains a %s capture failure without changing playback or control',
+    async (mode) => {
+      vi.useFakeTimers();
+      const onTool = vi.fn<NonNullable<LiveRelayOptions['onTool']>>(async () => 'controlled');
+      const f = fixture({
+        actionsEnabled: true,
+        onTranscript:
+          mode === 'sync'
+            ? () => {
+                throw new Error('Synthetic capture failure');
+              }
+            : async () => {
+                throw new Error('Synthetic async capture failure');
+              },
+        onTool,
+        onDelegate: async ({ transcript }) => ({
+          kind: 'tool',
+          name: 'prepare_request',
+          callId: 'valid-tool',
+          arguments: JSON.stringify({
+            ...reservation,
+            date_utterance_id: transcript[0]?.dateReference,
+          }),
+        }),
+      });
+      f.input();
+      f.transcript('date', 'Tomorrow');
+      f.audio();
+      expect(f.telephone.events.some((event) => event.event === 'media')).toBe(true);
+      f.delegate();
+      await vi.advanceTimersByTimeAsync(700);
+      expect(onTool).toHaveBeenCalledOnce();
+      expect(f.closed).not.toHaveBeenCalled();
+      expect(f.telephone.events.at(-1)).toEqual({ event: 'clear', streamSid });
+      f.dispose();
+      expect(f.closed).toHaveBeenCalledOnce();
+    },
+  );
+});
 
 describe('Live continuous audio protocol', () => {
   it('starts client delegation without storage, preserves PCMU silence and appends one greeting', () => {
@@ -127,6 +404,7 @@ describe('Live continuous audio protocol', () => {
     ]);
     f.event({ type: 'session.started' });
     f.event({ type: 'session.started' });
+    expect(f.stage.mock.calls).toEqual([['session_ready']]);
     expect(
       f.provider.events.filter((event) => event.type === 'session.instructions.append'),
     ).toEqual([
@@ -307,6 +585,7 @@ describe('Live delegated action boundaries', () => {
     expect(first).toBeDefined();
     f.transcript('u2', 'Actually, Friday', 100, 200);
     expect(first?.input.signal.aborted).toBe(true);
+    expect(f.stage.mock.calls.slice(-2)).toEqual([['backend_stale'], ['backend_cancelled']]);
     first?.resolve({
       kind: 'tool',
       name: 'prepare_request',
@@ -435,6 +714,9 @@ describe('Live delegated action boundaries', () => {
       delegation_id: 'delegation1',
     });
     expect(f.closed).not.toHaveBeenCalled();
+    expect(f.stage).toHaveBeenCalledWith(
+      kind === 'forged_reference' ? 'date_handle_rejected' : 'tool_validation_rejected',
+    );
     f.dispose();
   });
 
@@ -580,11 +862,261 @@ describe('Live delegated action boundaries', () => {
     await vi.advanceTimersByTimeAsync(13_000);
     expect(pending?.signal.aborted).toBe(true);
     expect(f.closed).toHaveBeenCalledOnce();
+    expect(f.stage.mock.calls.slice(-2)).toEqual([['backend_failed'], ['backend_cancelled']]);
     release?.({ kind: 'reply', text: 'Unusable late result' });
     await vi.advanceTimersByTimeAsync(0);
     expect(f.provider.events.some((event) => event.type === 'session.commentary.append')).toBe(
       false,
     );
     f.dispose();
+  });
+});
+
+describe('Live incomplete task continuation and workflow diagnostics', () => {
+  it('continues the original clarification into one proposal using the corrected date fragment', async () => {
+    vi.useFakeTimers();
+    const delegate = vi
+      .fn<LiveRelayOptions['onDelegate']>()
+      .mockResolvedValueOnce({ kind: 'reply', text: 'Which day?', awaitingCaller: true })
+      .mockImplementation(async ({ transcript }) => ({
+        kind: 'tool',
+        name: 'prepare_request',
+        callId: 'current-tool',
+        arguments: JSON.stringify({
+          ...reservation,
+          dateExpression: 'Friday',
+          date_utterance_id: transcript.at(-1)?.dateReference,
+        }),
+      }));
+    const f = fixture({ actionsEnabled: true, onDelegate: delegate });
+    f.input();
+    f.transcript('intent', 'I would like to make a request.');
+    f.delegate();
+    await vi.advanceTimersByTimeAsync(700);
+    f.transcript('date', 'Tomorrow, with the remaining details.', 100, 200);
+    f.transcript('correction', 'Actually Friday.', 200, 300);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(delegate).toHaveBeenCalledTimes(2);
+    expect(f.onTool).toHaveBeenCalledExactlyOnceWith({
+      toolCallId: 'current-tool',
+      utteranceStartedAt: new Date(initialTime + 200).toISOString(),
+      kind: 'proposal',
+      proposal: { kind: 'reservation', reservation: { ...reservation, dateExpression: 'Friday' } },
+    });
+    f.transcript('late', 'Do not execute anything again.', 300, 400);
+    f.delegate('late-delegation');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(delegate).toHaveBeenCalledTimes(2);
+    expect(f.onTool).toHaveBeenCalledOnce();
+    f.dispose();
+  });
+
+  it('continues only an explicit clarification on new caller details, then settles cancellation', async () => {
+    vi.useFakeTimers();
+    const delegate = vi
+      .fn<LiveRelayOptions['onDelegate']>()
+      .mockResolvedValueOnce({ kind: 'reply', text: 'Which day?', awaitingCaller: true })
+      .mockResolvedValueOnce({ kind: 'reply', text: 'What time on Friday?', awaitingCaller: true })
+      .mockResolvedValueOnce({ kind: 'reply', text: 'Okay, no request has been saved.' });
+    const f = fixture({ actionsEnabled: true, onDelegate: delegate });
+    f.input();
+    f.transcript('intent', 'I would like to make a request.');
+    f.delegate();
+    await vi.advanceTimersByTimeAsync(700);
+    f.transcript('question', 'Which day?', 0, 100, 'assistant');
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(delegate).toHaveBeenCalledOnce();
+    f.transcript('date', 'Tomorrow', 100, 200);
+    f.transcript('correction', ' actually Friday', 200, 300);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(delegate).toHaveBeenCalledTimes(2);
+    expect(delegate.mock.calls[1]?.[0].transcript.map((entry) => entry.text)).toEqual([
+      'I would like to make a request.',
+      'Which day?',
+      'Tomorrow',
+      ' actually Friday',
+    ]);
+    f.transcript('cancel', 'Never mind, cancel this request.', 300, 400);
+    await vi.advanceTimersByTimeAsync(700);
+    f.input();
+    f.transcript('faq', 'What are your hours?', 400, 500);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(delegate).toHaveBeenCalledTimes(3);
+    expect(f.onTool).not.toHaveBeenCalled();
+    expect(
+      f.provider.events
+        .filter((event) => event.type === 'session.commentary.append')
+        .map((event) => event.delegation_id),
+    ).toEqual(['delegation1', 'delegation1', 'delegation1']);
+    expect(f.stage.mock.calls.map(([code]) => code)).toEqual([
+      'session_ready',
+      'delegation_requested',
+      'backend_started',
+      'backend_reply',
+      'backend_waiting_for_caller',
+      'backend_started',
+      'backend_reply',
+      'backend_waiting_for_caller',
+      'backend_started',
+      'backend_reply',
+    ]);
+    f.dispose();
+  });
+
+  it.each(['waiting', 'running'] as const)(
+    'supersedes %s continuation with a fresh delegation and executes only its current proposal',
+    async (phase) => {
+      vi.useFakeTimers();
+      const pending: Array<{
+        input: LiveDelegationInput;
+        resolve(result: LiveDelegationResult): void;
+      }> = [];
+      const delegate = vi
+        .fn<LiveRelayOptions['onDelegate']>()
+        .mockResolvedValueOnce({ kind: 'reply', text: 'Which day?', awaitingCaller: true })
+        .mockImplementation((input) => new Promise((resolve) => pending.push({ input, resolve })));
+      const f = fixture({ actionsEnabled: true, onDelegate: delegate });
+      const proposal = (input: LiveDelegationInput, id: string): LiveDelegationResult => ({
+        kind: 'tool',
+        name: 'prepare_request',
+        callId: id,
+        arguments: JSON.stringify({
+          ...reservation,
+          date_utterance_id: input.transcript.at(-1)?.dateReference,
+        }),
+      });
+      f.input();
+      f.transcript('intent', 'Please take a request.');
+      f.delegate('original');
+      await vi.advanceTimersByTimeAsync(700);
+      f.transcript('date', 'Tomorrow', 100, 200);
+      if (phase === 'running') await vi.advanceTimersByTimeAsync(700);
+      f.delegate('replacement');
+      f.delegate('replacement');
+      if (phase === 'running') {
+        expect(pending[0]?.input.signal.aborted).toBe(true);
+        pending[0]?.resolve(proposal(pending[0].input, 'discarded-tool'));
+      }
+      await vi.advanceTimersByTimeAsync(700);
+      const current = pending.at(-1)!;
+      current.resolve(proposal(current.input, 'current-tool'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.onTool).toHaveBeenCalledOnce();
+      expect(f.onTool.mock.calls[0]?.[0].toolCallId).toBe('current-tool');
+      expect(f.stage.mock.calls.filter(([code]) => code === 'delegation_requested')).toHaveLength(
+        2,
+      );
+      expect(
+        f.stage.mock.calls.filter(([code]) => code === 'control_handoff_accepted'),
+      ).toHaveLength(1);
+      f.dispose();
+    },
+  );
+
+  it('does not continue a clarification marker when request actions are disabled', async () => {
+    vi.useFakeTimers();
+    const delegate = vi.fn<LiveRelayOptions['onDelegate']>(async () => ({
+      kind: 'reply',
+      text: 'Which day?',
+      awaitingCaller: true,
+    }));
+    const f = fixture({ onDelegate: delegate });
+    f.input();
+    f.transcript('intent', 'A question');
+    f.delegate();
+    await vi.advanceTimersByTimeAsync(700);
+    f.transcript('answer', 'Tomorrow', 100, 200);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(delegate).toHaveBeenCalledOnce();
+    expect(f.stage).not.toHaveBeenCalledWith('backend_waiting_for_caller');
+    f.dispose();
+  });
+
+  it('bounds ongoing clarification by the existing total backend-attempt budget', async () => {
+    vi.useFakeTimers();
+    const delegate = vi.fn<LiveRelayOptions['onDelegate']>(async () => ({
+      kind: 'reply',
+      text: 'Please clarify.',
+      awaitingCaller: true,
+    }));
+    const f = fixture({ actionsEnabled: true, onDelegate: delegate });
+    f.input();
+    f.delegate();
+    for (let index = 0; index <= 80; index += 1) {
+      f.transcript(`answer-${index}`, 'Synthetic detail');
+      await vi.advanceTimersByTimeAsync(700);
+    }
+    expect(delegate).toHaveBeenCalledTimes(80);
+    expect(f.closed).toHaveBeenCalledOnce();
+    expect(f.diagnostic).toHaveBeenCalledWith('relay_buffer_limit');
+    f.dispose();
+  });
+
+  it.each(['controlled', 'unavailable', 'failed'] as const)(
+    'reports only static stages for a %s control handoff',
+    async (outcome) => {
+      vi.useFakeTimers();
+      const privateText = 'Synthetic Guest +12125550111 SYNTHETIC_API_KEY private provider error';
+      const f = fixture({
+        actionsEnabled: true,
+        onDelegate: async ({ transcript }) => ({
+          kind: 'tool',
+          name: 'prepare_request',
+          callId: 'private-provider-tool-id',
+          arguments: JSON.stringify({
+            ...reservation,
+            date_utterance_id: transcript[0]?.dateReference,
+          }),
+        }),
+        onTool: async () => {
+          if (outcome === 'failed') throw new Error(privateText);
+          return outcome;
+        },
+      });
+      f.input();
+      f.transcript('private-provider-event-id', privateText);
+      f.delegate('private-delegation-id');
+      await vi.advanceTimersByTimeAsync(700);
+      expect(f.stage.mock.calls.map(([code]) => code)).toEqual([
+        'session_ready',
+        'delegation_requested',
+        'backend_started',
+        'backend_tool',
+        'control_handoff_started',
+        outcome === 'controlled'
+          ? 'control_handoff_accepted'
+          : outcome === 'unavailable'
+            ? 'control_handoff_unavailable'
+            : 'control_handoff_failed',
+      ]);
+      expect(f.stage.mock.calls.every((args) => args.length === 1)).toBe(true);
+      const diagnostics = JSON.stringify([f.stage.mock.calls, f.diagnostic.mock.calls]);
+      for (const content of [
+        privateText,
+        'private-provider-tool-id',
+        'private-provider-event-id',
+        'private-delegation-id',
+        streamSid,
+      ])
+        expect(diagnostics).not.toContain(content);
+      f.dispose();
+    },
+  );
+
+  it('keeps a throwing stage sink from affecting normal backend replies or cleanup', async () => {
+    vi.useFakeTimers();
+    const f = fixture({
+      onStage: () => {
+        throw new Error('Synthetic logging failure');
+      },
+    });
+    f.input();
+    f.transcript('u1', 'What time?');
+    f.delegate();
+    await vi.advanceTimersByTimeAsync(700);
+    expect(f.provider.events.at(-1)).toMatchObject({ type: 'session.commentary.append' });
+    expect(f.closed).not.toHaveBeenCalled();
+    f.dispose();
+    expect(f.closed).toHaveBeenCalledOnce();
   });
 });
