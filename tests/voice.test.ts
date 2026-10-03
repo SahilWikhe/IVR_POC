@@ -2,8 +2,18 @@ import { createHmac, randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
 import { loadVoiceConfig, type EnabledVoiceConfig } from '../apps/voice-gateway/src/config.js';
-import { createVoiceGateway, type ProviderSocket } from '../apps/voice-gateway/src/gateway.js';
-import { AudioRelay, type AudioPeer } from '../apps/voice-gateway/src/relay.js';
+import {
+  createVoiceGateway,
+  type ProviderSocket,
+  type VoiceDependencies,
+} from '../apps/voice-gateway/src/gateway.js';
+import {
+  AudioRelay,
+  type AudioPeer,
+  type RelayOptions,
+  type RelayDiagnosticCode,
+} from '../apps/voice-gateway/src/relay.js';
+import type { OperationalEvent } from '../packages/observability/src/index.js';
 import type { VoiceApiClient } from '../apps/voice-gateway/src/client.js';
 import type { CallController } from '../apps/voice-gateway/src/control.js';
 import { CallRegistry } from '../apps/voice-gateway/src/registry.js';
@@ -14,6 +24,7 @@ const account = `AC${'a'.repeat(32)}`;
 const call = `CA${'b'.repeat(32)}`;
 const stream = `MZ${'c'.repeat(32)}`;
 const environment = {
+  OPENAI_REALTIME_MODEL: 'gpt-realtime',
   LIVE_VOICE_ENABLED: 'true',
   VOICE_MODE: 'sandbox',
   TWILIO_ACCOUNT_SID: account,
@@ -208,14 +219,18 @@ async function openTestStream(
   clock?: () => number,
   cfg = config(),
   controller?: CallController,
+  delegate?: VoiceDependencies['delegate'],
 ) {
   const provider = new Peer();
   const connect = vi.fn(() => provider);
+  const diagnostics: OperationalEvent[] = [];
   const app = await createVoiceGateway(cfg, {
     api,
     connectProvider: connect,
+    onDiagnostic: (event) => diagnostics.push(event),
     ...(clock ? { now: clock } : {}),
     ...(controller ? { controller } : {}),
+    ...(delegate ? { delegate } : {}),
   });
   await app.ready();
   const admission = await app.inject(callback());
@@ -226,7 +241,11 @@ async function openTestStream(
   socket.send(JSON.stringify(start(grant(admission.body))));
   await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
   provider.emit('open');
-  provider.emit('message', JSON.stringify({ type: 'session.updated' }), false);
+  provider.emit(
+    'message',
+    JSON.stringify({ type: cfg.model === 'gpt-live-1' ? 'session.started' : 'session.updated' }),
+    false,
+  );
   const response = (id = 'policy-response') =>
     provider.emit('message', JSON.stringify({ type: 'response.created', response: { id } }), false);
   const audio = (bytes = 800, id = 'policy-response') =>
@@ -241,8 +260,171 @@ async function openTestStream(
       }),
       false,
     );
-  return { app, socket, provider, connect, playback, response, audio };
+  return { app, socket, provider, connect, playback, response, audio, diagnostics };
 }
+
+describe('GPT-Live gateway policy and request handoff', () => {
+  it.each([true, false])(
+    'checks continuous audio before releasing it (allowed=%s)',
+    async (allowed) => {
+      const api = fixtureApi();
+      let finish: ((value: Awaited<ReturnType<VoiceApiClient['policy']>>) => void) | undefined;
+      const original = api.policy;
+      let checks = 0;
+      api.policy = vi.fn<VoiceApiClient['policy']>(async (binding, signal) => {
+        if (++checks === 1) return original(binding, signal);
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      });
+      let clock = Date.now();
+      const f = await openTestStream(api, () => clock, { ...config(), model: 'gpt-live-1' });
+      try {
+        expect(f.provider.events[0]).toMatchObject({
+          type: 'session.start',
+          session: { model: 'gpt-live-1', store: false },
+        });
+        clock += 1001;
+        f.provider.emit(
+          'message',
+          JSON.stringify({
+            type: 'session.output_audio.delta',
+            delta: Buffer.alloc(800, 255).toString('base64'),
+          }),
+          false,
+        );
+        await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+        expect(f.playback).toHaveLength(0);
+        finish?.({
+          allowed,
+          configurationVersion: 1,
+          actionsEnabled: true,
+          transfersEnabled: true,
+        });
+        if (allowed)
+          await vi.waitFor(() =>
+            expect(f.playback.some((event) => event.event === 'media')).toBe(true),
+          );
+        else {
+          await vi.waitFor(() =>
+            expect(f.provider.events.some((event) => event.type === 'session.close')).toBe(true),
+          );
+          f.provider.emit('message', JSON.stringify({ type: 'session.closed' }), false);
+          await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
+          expect(f.playback).toHaveLength(0);
+        }
+        expect(api.policy).toHaveBeenCalledTimes(2);
+        expect(f.provider.events.some((event) => event.type === 'response.create')).toBe(false);
+      } finally {
+        await f.app.close();
+      }
+    },
+  );
+
+  it('routes a delegated proposal through the existing canonical control API', async () => {
+    const api = fixtureApi();
+    const redeem = api.redeem;
+    api.redeem = vi.fn(async (input) => ({ ...(await redeem(input)), actionsEnabled: true }));
+    const controlId = randomUUID();
+    api.propose = vi.fn(async () => ({ controlId, twiml: '<Response/>' }));
+    api.dispatch = vi.fn(async () => ({
+      dispatch: true,
+      twiml: '<Response><Say>Canonical readback</Say><Gather/></Response>',
+      unavailable: false,
+    }));
+    const controller: CallController = {
+      dispatch: vi.fn(async () => ({ outcome: 'accepted' as const })),
+    };
+    const delegate = vi.fn<NonNullable<VoiceDependencies['delegate']>>(async ({ transcript }) => ({
+      kind: 'tool',
+      name: 'prepare_request',
+      callId: 'live-call-tool',
+      arguments: JSON.stringify({
+        dateExpression: 'tomorrow',
+        date_utterance_id: transcript.find((part) => part.role === 'user')?.dateReference,
+        time: '19:00',
+        partySize: 4,
+        name: 'Synthetic Guest',
+        callbackNumber: '+12125550111',
+        notes: '',
+      }),
+    }));
+    const f = await openTestStream(
+      api,
+      undefined,
+      { ...config(), model: 'gpt-live-1', actionsEnabled: true },
+      controller,
+      delegate,
+    );
+    try {
+      f.socket.send(
+        JSON.stringify({
+          event: 'media',
+          sequenceNumber: '2',
+          streamSid: stream,
+          media: {
+            track: 'inbound',
+            timestamp: '0',
+            chunk: '1',
+            payload: Buffer.alloc(3200, 255).toString('base64'),
+          },
+        }),
+      );
+      await vi.waitFor(() =>
+        expect(f.provider.events.some((event) => event.type === 'session.input_audio.append')).toBe(
+          true,
+        ),
+      );
+      f.provider.emit(
+        'message',
+        JSON.stringify({
+          type: 'session.input_transcript.delta',
+          event_id: 'live-input-1',
+          delta: 'Tomorrow at seven for four, Synthetic Guest, 2125550111.',
+          start_ms: 0,
+          end_ms: 300,
+        }),
+        false,
+      );
+      f.provider.emit(
+        'message',
+        JSON.stringify({
+          type: 'session.delegation.created',
+          event_id: 'live-delegate-1',
+          offset_ms: 350,
+          delegation: { id: 'live-task-1', type: 'delegation', target: 'client' },
+        }),
+        false,
+      );
+      await vi.waitFor(() => expect(controller.dispatch).toHaveBeenCalledOnce());
+      expect(api.propose).toHaveBeenCalledWith(
+        expect.objectContaining({
+          providerCallSid: call,
+          toolCallId: 'live-call-tool',
+          proposal: {
+            kind: 'reservation',
+            reservation: {
+              dateExpression: 'tomorrow',
+              time: '19:00',
+              partySize: 4,
+              name: 'Synthetic Guest',
+              callbackNumber: '+12125550111',
+              notes: '',
+            },
+          },
+        }),
+      );
+      expect(api.confirmation).not.toHaveBeenCalled();
+      expect(api.dispatched).toHaveBeenCalledWith(
+        expect.objectContaining({ controlId, outcome: 'accepted' }),
+      );
+      f.provider.emit('message', JSON.stringify({ type: 'session.closed' }), false);
+      await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
+    } finally {
+      await f.app.close();
+    }
+  });
+});
 
 describe('current phone policy and knowledge boundaries', () => {
   it.each(['revoked', 'revision', 'outage'] as const)(
@@ -275,6 +457,13 @@ describe('current phone policy and knowledge boundaries', () => {
         expect(api.end).toHaveBeenCalledWith(
           expect.objectContaining({ providerCallSid: call, reason: 'stream_closed' }),
         );
+        expect(f.diagnostics).toEqual([
+          {
+            event: 'voice.stream_closed',
+            code: scenario === 'outage' ? 'policy_unavailable' : 'policy_denied',
+            requestId: expect.any(String),
+          },
+        ]);
         const providerEvents = f.provider.events.length;
         const checks = policyChecks;
         f.response('late-response');
@@ -316,63 +505,99 @@ describe('current phone policy and knowledge boundaries', () => {
     }
   });
 
-  it.each(['allowed', 'denied', 'terminal', 'overflow', 'interrupted'] as const)(
-    'buffers a new response until current policy resolves (%s)',
-    async (scenario) => {
-      let clock = Date.now();
-      const api = fixtureApi();
-      const originalPolicy = api.policy;
-      let release: ((policy: Awaited<ReturnType<VoiceApiClient['policy']>>) => void) | undefined;
-      let pendingSignal: AbortSignal | undefined;
-      let checks = 0;
-      api.policy = vi.fn<VoiceApiClient['policy']>(async (binding, signal) => {
-        if (++checks === 1) return originalPolicy(binding, signal);
-        pendingSignal = signal;
-        return new Promise<Awaited<ReturnType<VoiceApiClient['policy']>>>((resolve) => {
-          release = resolve;
-        });
+  it.each([
+    'allowed',
+    'denied',
+    'terminal',
+    'overflow',
+    'interrupted',
+    'completed_before_interrupt',
+  ] as const)('buffers a new response until current policy resolves (%s)', async (scenario) => {
+    let clock = Date.now();
+    const api = fixtureApi();
+    const originalPolicy = api.policy;
+    let release: ((policy: Awaited<ReturnType<VoiceApiClient['policy']>>) => void) | undefined;
+    let pendingSignal: AbortSignal | undefined;
+    let checks = 0;
+    api.policy = vi.fn<VoiceApiClient['policy']>(async (binding, signal) => {
+      if (++checks === 1) return originalPolicy(binding, signal);
+      pendingSignal = signal;
+      return new Promise<Awaited<ReturnType<VoiceApiClient['policy']>>>((resolve) => {
+        release = resolve;
       });
-      const f = await openTestStream(api, () => clock);
-      try {
-        clock += 1001;
-        f.response();
-        f.audio(scenario === 'overflow' ? 16_001 : 800);
-        if (scenario === 'overflow') {
-          await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
-          expect(f.playback.some((event) => event.event === 'media')).toBe(false);
-          return;
-        }
-        await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    });
+    const f = await openTestStream(api, () => clock);
+    try {
+      clock += 1001;
+      f.response();
+      f.audio(scenario === 'overflow' ? 16_001 : 800);
+      if (scenario === 'overflow') {
+        await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
         expect(f.playback.some((event) => event.event === 'media')).toBe(false);
-        expect(api.policy).toHaveBeenCalledTimes(2);
-        if (scenario === 'terminal') {
-          await f.app.inject(
-            callback('/twilio/status', { ...callbackParams(), CallStatus: 'completed' }),
-          );
-          expect(pendingSignal?.aborted).toBe(true);
-        }
-        if (scenario === 'interrupted') {
+        expect(f.diagnostics).toContainEqual({
+          event: 'voice.stream_closed',
+          code: 'response_buffer_limit',
+          requestId: expect.any(String),
+        });
+        return;
+      }
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+      expect(f.playback.some((event) => event.event === 'media')).toBe(false);
+      expect(api.policy).toHaveBeenCalledTimes(2);
+      if (scenario === 'terminal') {
+        await f.app.inject(
+          callback('/twilio/status', { ...callbackParams(), CallStatus: 'completed' }),
+        );
+        expect(pendingSignal?.aborted).toBe(true);
+      }
+      if (scenario === 'interrupted' || scenario === 'completed_before_interrupt') {
+        if (scenario === 'completed_before_interrupt')
           f.provider.emit(
             'message',
-            JSON.stringify({ type: 'input_audio_buffer.speech_started' }),
+            JSON.stringify({
+              type: 'response.done',
+              response: { id: 'policy-response', status: 'completed' },
+            }),
             false,
           );
-          expect(f.provider.events).toContainEqual({
-            type: 'response.cancel',
-            response_id: 'policy-response',
-          });
-        }
-        release?.({
-          allowed: scenario !== 'denied',
-          configurationVersion: 1,
-          actionsEnabled: true,
-          transfersEnabled: true,
+        f.provider.emit(
+          'message',
+          JSON.stringify({ type: 'input_audio_buffer.speech_started' }),
+          false,
+        );
+        expect(f.provider.events).toContainEqual({
+          type: 'response.cancel',
+          response_id: 'policy-response',
+          event_id: expect.any(String),
         });
-        if (scenario === 'allowed')
-          await vi.waitFor(() =>
-            expect(f.playback.some((event) => event.event === 'media')).toBe(true),
+        if (scenario === 'completed_before_interrupt')
+          f.provider.emit(
+            'message',
+            JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'invalid_request_error',
+                code: 'response_cancel_not_active',
+                event_id: f.provider.events.find((event) => event.type === 'response.cancel')
+                  ?.event_id,
+                message: `Private provider diagnostic ${account} ${call} +12125550199`,
+              },
+            }),
+            false,
           );
-        else if (scenario === 'interrupted') {
+      }
+      release?.({
+        allowed: scenario !== 'denied',
+        configurationVersion: 1,
+        actionsEnabled: true,
+        transfersEnabled: true,
+      });
+      if (scenario === 'allowed')
+        await vi.waitFor(() =>
+          expect(f.playback.some((event) => event.event === 'media')).toBe(true),
+        );
+      else if (scenario === 'interrupted' || scenario === 'completed_before_interrupt') {
+        if (scenario === 'interrupted')
           f.provider.emit(
             'message',
             JSON.stringify({
@@ -381,19 +606,32 @@ describe('current phone policy and knowledge boundaries', () => {
             }),
             false,
           );
-          await new Promise<void>((resolve) => setImmediate(resolve));
-          await vi.waitFor(() => expect(f.provider.readyState).toBe(1));
-          expect(f.playback.some((event) => event.event === 'media')).toBe(false);
-        } else {
-          await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
-          expect(f.playback.some((event) => event.event === 'media')).toBe(false);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await vi.waitFor(() => expect(f.provider.readyState).toBe(1));
+        expect(f.playback.some((event) => event.event === 'media')).toBe(false);
+        if (scenario === 'completed_before_interrupt') {
+          expect(f.diagnostics).toEqual([
+            {
+              event: 'voice.relay',
+              code: 'provider_cancel_not_active',
+              requestId: expect.any(String),
+            },
+          ]);
+          f.response('next-response');
+          f.audio(800, 'next-response');
+          await vi.waitFor(() =>
+            expect(f.playback.some((event) => event.event === 'media')).toBe(true),
+          );
         }
-        expect(api.policy).toHaveBeenCalledTimes(2);
-      } finally {
-        await f.app.close();
+      } else {
+        await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
+        expect(f.playback.some((event) => event.event === 'media')).toBe(false);
       }
-    },
-  );
+      expect(api.policy).toHaveBeenCalledTimes(2);
+    } finally {
+      await f.app.close();
+    }
+  });
 
   it('bounds an unresponsive policy check and aborts remaining work on close', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true, advanceTimeDelta: 10 });
@@ -1036,11 +1274,15 @@ describe('voice admission and limits', () => {
   });
 });
 
-function relayFixture() {
+function relayFixture(options: RelayOptions = {}) {
   const telephone = new Peer();
   const provider = new Peer();
   const close = vi.fn();
-  const relay = new AudioRelay(telephone, provider, stream, close);
+  const diagnostic = vi.fn<(code: RelayDiagnosticCode) => void>();
+  const relay = new AudioRelay(telephone, provider, stream, close, {
+    ...options,
+    onDiagnostic: diagnostic,
+  });
   relay.configure('Synthetic approved facts only');
   const event = (value: object) => relay.providerEvent(JSON.stringify(value));
   event({ type: 'session.updated' });
@@ -1053,10 +1295,91 @@ function relayFixture() {
       content_index: 0,
       delta: Buffer.alloc(bytes).toString('base64'),
     });
-  return { telephone, provider, close, relay, event, created, audio };
+  return { telephone, provider, close, relay, event, created, audio, diagnostic };
 }
 
 describe('voice audio protocol', () => {
+  it.each([null, 'Request saved for staff review; table not confirmed.'])(
+    'keeps the full session instructions for the first response (outcome=%s)',
+    (outcome) => {
+      const telephone = new Peer();
+      const provider = new Peer();
+      const relay = new AudioRelay(telephone, provider, stream, vi.fn());
+      const instructions = voiceInstructions(restaurant, {
+        actionsEnabled: false,
+        transfersEnabled: false,
+        outcome,
+      });
+      relay.configure(instructions);
+      relay.providerEvent(JSON.stringify({ type: 'session.updated' }));
+      relay.providerEvent(JSON.stringify({ type: 'session.updated' }));
+      expect(provider.events.find((event) => event.type === 'session.update')).toMatchObject({
+        session: { instructions },
+      });
+      // A response override would replace language, knowledge and capability rules.
+      expect(provider.events.filter((event) => event.type === 'response.create')).toEqual([
+        { type: 'response.create' },
+      ]);
+      expect(instructions).toContain('English is the default language');
+      expect(instructions).toContain('only when the caller explicitly asks');
+      expect(instructions).toContain('No tools are available');
+      if (outcome) {
+        expect(instructions).toContain(outcome);
+        expect(instructions).toContain('Do not repeat the opening greeting');
+        expect(instructions).not.toContain('Thanks for calling Synthetic Harbor');
+      } else {
+        expect(instructions).toContain(
+          "Thanks for calling Synthetic Harbor. I'm the AI receptionist. How can I help?",
+        );
+        expect(instructions).toContain('then wait for the caller');
+      }
+      relay.close();
+    },
+  );
+
+  it('reports a static gateway failure reason without exposing provider or caller data', async () => {
+    const f = await openTestStream(fixtureApi());
+    try {
+      f.provider.emit(
+        'message',
+        JSON.stringify({
+          type: 'error',
+          event_id: 'private-provider-event-id',
+          error: {
+            type: 'server_error',
+            code: 'untrusted-provider-code',
+            message: `${account} ${call} ${stream} +12125550199 ${environment.OPENAI_API_KEY} ${environment.TWILIO_AUTH_TOKEN}`,
+          },
+        }),
+        false,
+      );
+      await vi.waitFor(() => expect(f.provider.readyState).toBe(3));
+      expect(f.diagnostics).toContainEqual({
+        event: 'voice.relay',
+        code: 'provider_error',
+        requestId: expect.any(String),
+      });
+      expect(f.diagnostics).toHaveLength(2);
+      const serialized = JSON.stringify(f.diagnostics);
+      for (const privateValue of [
+        account,
+        call,
+        stream,
+        '+12125550199',
+        'private-provider-event-id',
+        'untrusted-provider-code',
+        environment.OPENAI_API_KEY,
+        environment.TWILIO_AUTH_TOKEN,
+      ])
+        expect(serialized).not.toContain(privateValue);
+      for (const diagnostic of f.diagnostics)
+        expect(Object.keys(diagnostic).sort()).toEqual(['code', 'event', 'requestId']);
+      expect(f.diagnostics[0]?.requestId).toBe(f.diagnostics[1]?.requestId);
+    } finally {
+      await f.app.close();
+    }
+  });
+
   it('forwards μ-law input, emits media/marks and truncates only acknowledged playback', () => {
     const { telephone, provider, relay, event, created, audio } = relayFixture();
     const payload = Buffer.alloc(160).toString('base64');
@@ -1068,7 +1391,11 @@ describe('voice audio protocol', () => {
     relay.played('p1'); // 100 ms heard; 100 ms still in Twilio's queue.
     event({ type: 'input_audio_buffer.speech_started' });
     expect(telephone.events.at(-1)).toEqual({ event: 'clear', streamSid: stream });
-    expect(provider.events).toContainEqual({ type: 'response.cancel', response_id: 'r1' });
+    expect(provider.events).toContainEqual({
+      type: 'response.cancel',
+      response_id: 'r1',
+      event_id: expect.any(String),
+    });
     expect(provider.events).toContainEqual({
       type: 'conversation.item.truncate',
       item_id: 'item1',
@@ -1158,6 +1485,231 @@ describe('voice audio protocol', () => {
     interrupted.audio('next-response');
     expect(interrupted.telephone.events.some((event) => event.event === 'media')).toBe(true);
     interrupted.relay.close();
+  });
+
+  it('drains a token-limited FAQ answer and accepts another turn without automatic continuation', () => {
+    const f = relayFixture();
+    f.created('limited-response');
+    f.audio('limited-response');
+    const output = [...f.telephone.events];
+    const requests = f.provider.events.filter((event) => event.type === 'response.create').length;
+    f.event({
+      type: 'response.done',
+      response: {
+        id: 'limited-response',
+        status: 'incomplete',
+        status_details: { type: 'incomplete', reason: 'max_output_tokens' },
+      },
+    });
+    expect(f.close).not.toHaveBeenCalled();
+    expect(f.diagnostic.mock.calls).toEqual([['provider_response_limit']]);
+    expect(f.telephone.events).toEqual(output); // Queued speech is not cleared.
+    expect(f.provider.events.filter((event) => event.type === 'response.create')).toHaveLength(
+      requests,
+    );
+    f.relay.played('p1');
+    f.relay.played('p2');
+    f.event({ type: 'input_audio_buffer.speech_started' });
+    expect(f.provider.events.some((event) => event.type === 'response.cancel')).toBe(false);
+    expect(f.provider.events.some((event) => event.type === 'conversation.item.truncate')).toBe(
+      false,
+    );
+    f.created('next-response');
+    f.audio('next-response', 'next-item', 800);
+    expect(f.telephone.events.filter((event) => event.event === 'media')).toHaveLength(3);
+    expect(f.relay.isReady).toBe(true);
+    f.relay.close();
+  });
+
+  it.each([
+    { options: {}, reason: 'content_filter', id: 'r1' },
+    { options: {}, reason: undefined, id: 'r1' },
+    { options: {}, reason: 'max_output_tokens', id: 'unknown-response' },
+    { options: { actionsEnabled: true }, reason: 'max_output_tokens', id: 'r1' },
+    { options: { transfersEnabled: true }, reason: 'max_output_tokens', id: 'r1' },
+  ])('keeps incomplete-response failure boundaries for %j', ({ options, reason, id }) => {
+    const f = relayFixture(options);
+    f.created('r1');
+    f.audio('r1');
+    f.event({
+      type: 'response.done',
+      response: { id, status: 'incomplete', status_details: { reason } },
+    });
+    expect(f.close).toHaveBeenCalledOnce();
+    expect(f.diagnostic.mock.calls).toEqual([['provider_response_incomplete']]);
+    expect(f.telephone.events.at(-1)).toEqual({ event: 'clear', streamSid: stream });
+  });
+
+  it('tolerates only the correlated cancellation race without disturbing a newer response', () => {
+    const f = relayFixture();
+    f.created('r1');
+    f.audio('r1');
+    f.event({ type: 'input_audio_buffer.speech_started' });
+    const cancellation = f.provider.events.find((event) => event.type === 'response.cancel');
+    f.event({ type: 'response.done', response: { id: 'r1', status: 'completed' } });
+    f.created('r2');
+    f.event({
+      type: 'error',
+      event_id: 'provider-error-id',
+      error: {
+        type: 'invalid_request_error',
+        code: 'response_cancel_not_active',
+        event_id: cancellation?.event_id,
+        message: 'Sensitive provider error: +12125550199',
+      },
+    });
+    const count = f.telephone.events.length;
+    f.audio('r1'); // Late cancelled audio stays suppressed after recovery.
+    expect(f.telephone.events).toHaveLength(count);
+    f.audio('r2', 'item2');
+    expect(f.telephone.events.length).toBeGreaterThan(count);
+    expect(f.close).not.toHaveBeenCalled();
+    expect(f.diagnostic.mock.calls).toEqual([['provider_cancel_not_active']]);
+    f.relay.close();
+  });
+
+  it('keeps a newer cancellation pending when an older correlated error arrives late', () => {
+    const f = relayFixture({ actionsEnabled: true });
+    f.relay.input(Buffer.alloc(3200).toString('base64'));
+    const utterance = (id: string, startMs: number) => {
+      f.event({ type: 'input_audio_buffer.speech_started', item_id: id, audio_start_ms: startMs });
+      f.event({
+        type: 'input_audio_buffer.speech_stopped',
+        item_id: id,
+        audio_end_ms: startMs + 100,
+      });
+      f.event({ type: 'conversation.item.added', item: { id, role: 'user' } });
+    };
+    const cancellationError = (eventId: unknown) =>
+      f.event({
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          code: 'response_cancel_not_active',
+          event_id: eventId,
+        },
+      });
+    f.created('r1');
+    utterance('u1', 0);
+    const first = f.provider.events.find((event) => event.type === 'response.cancel');
+    f.event({ type: 'response.done', response: { id: 'r1', status: 'completed' } });
+    f.created('r2');
+    utterance('u2', 100);
+    const second = f.provider.events.filter((event) => event.type === 'response.cancel').at(-1);
+    const requests = () =>
+      f.provider.events.filter((event) => event.type === 'response.create').length;
+    const before = requests();
+    cancellationError(first?.event_id);
+    expect(requests()).toBe(before);
+    cancellationError(second?.event_id);
+    expect(requests()).toBe(before + 1);
+    f.event({ type: 'response.done', response: { id: 'r2', status: 'completed' } });
+    expect(requests()).toBe(before + 1);
+    expect(f.close).not.toHaveBeenCalled();
+    f.relay.close();
+  });
+
+  it.each(['before_rejection', 'after_rejection'] as const)(
+    'resumes once after a correlated cancellation error and safe tool rejection (%s)',
+    async (order) => {
+      let release: ((result: 'controlled' | 'unavailable') => void) | undefined;
+      const f = relayFixture({
+        transfersEnabled: true,
+        onTool: () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      });
+      f.relay.input(Buffer.alloc(3200).toString('base64'));
+      f.event({ type: 'input_audio_buffer.speech_started', item_id: 'u1', audio_start_ms: 0 });
+      f.event({ type: 'input_audio_buffer.speech_stopped', item_id: 'u1', audio_end_ms: 100 });
+      f.event({ type: 'conversation.item.added', item: { id: 'u1', role: 'user' } });
+      f.created('r1');
+      f.event({
+        type: 'response.function_call_arguments.done',
+        response_id: 'r1',
+        call_id: 'tool1',
+        name: 'request_staff_transfer',
+        arguments: '{}',
+      });
+      const cancellation = f.provider.events.find((event) => event.type === 'response.cancel');
+      expect(cancellation).toBeDefined();
+      const requests = () =>
+        f.provider.events.filter((event) => event.type === 'response.create').length;
+      const before = requests();
+      const cancellationError = () =>
+        f.event({
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            code: 'response_cancel_not_active',
+            event_id: cancellation?.event_id,
+          },
+        });
+      if (order === 'before_rejection') cancellationError();
+      expect(requests()).toBe(before); // Deterministic control still owns the call.
+      release?.('unavailable');
+      await vi.waitFor(() =>
+        expect(JSON.stringify(f.provider.events)).toContain('No request has been saved'),
+      );
+      if (order === 'after_rejection') {
+        expect(requests()).toBe(before);
+        cancellationError();
+      }
+      expect(requests()).toBe(before + 1);
+      f.event({ type: 'response.done', response: { id: 'r1', status: 'completed' } });
+      expect(requests()).toBe(before + 1);
+      expect(f.close).not.toHaveBeenCalled();
+      f.relay.close();
+    },
+  );
+
+  it.each(['missing', 'unknown', 'outer_only', 'wrong_type', 'wrong_code', 'replay'] as const)(
+    'does not suppress an unverified cancellation error (%s)',
+    (scenario) => {
+      const f = relayFixture();
+      f.created('r1');
+      f.event({ type: 'input_audio_buffer.speech_started' });
+      const cancellation = f.provider.events.find((event) => event.type === 'response.cancel');
+      const error = {
+        type: scenario === 'wrong_type' ? 'server_error' : 'invalid_request_error',
+        code: scenario === 'wrong_code' ? 'server_error' : 'response_cancel_not_active',
+        event_id:
+          scenario === 'missing' || scenario === 'outer_only'
+            ? undefined
+            : scenario === 'unknown'
+              ? 'not-a-local-cancellation'
+              : cancellation?.event_id,
+        message: 'Sensitive caller and provider content must never enter diagnostics',
+      };
+      const event = { type: 'error', event_id: cancellation?.event_id, error };
+      if (scenario === 'replay') {
+        f.event(event);
+        expect(f.close).not.toHaveBeenCalled();
+      }
+      f.event(event);
+      expect(f.close).toHaveBeenCalledOnce();
+      expect(f.diagnostic.mock.calls).toEqual(
+        scenario === 'replay'
+          ? [['provider_cancel_not_active'], ['provider_error']]
+          : [['provider_error']],
+      );
+    },
+  );
+
+  it('bounds retained cancellation correlation even when completion wins every race', () => {
+    const f = relayFixture();
+    for (let index = 0; index < 1000; index += 1) {
+      const id = `response-${index}`;
+      f.created(id);
+      f.event({ type: 'input_audio_buffer.speech_started' });
+      f.event({ type: 'response.done', response: { id, status: 'completed' } });
+    }
+    expect(f.close).not.toHaveBeenCalled();
+    f.created('over-limit');
+    f.event({ type: 'input_audio_buffer.speech_started' });
+    expect(f.close).toHaveBeenCalledOnce();
+    expect(f.diagnostic.mock.calls).toEqual([['relay_buffer_limit']]);
   });
 
   it('bounds pre-configuration input and ignores model tool proposals', () => {

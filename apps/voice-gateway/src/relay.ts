@@ -18,6 +18,17 @@ const responseDoneEvent = z.object({
   response: z.object({
     id: identifier,
     status: z.enum(['completed', 'cancelled', 'failed', 'incomplete']),
+    status_details: z
+      .object({ reason: z.string().max(128).optional() })
+      .nullable()
+      .optional(),
+  }),
+});
+const cancelNotActiveEvent = z.object({
+  error: z.object({
+    type: z.literal('invalid_request_error'),
+    code: z.literal('response_cancel_not_active'),
+    event_id: identifier,
   }),
 });
 const audioEvent = z.object({
@@ -56,15 +67,24 @@ export type VoiceToolRequest = { toolCallId: string; utteranceStartedAt: string 
   | { kind: 'proposal'; proposal: VoiceProposalInput }
   | { kind: 'transfer'; context: TransferContext }
 );
+export type RelayDiagnosticCode =
+  | 'provider_response_limit'
+  | 'provider_response_failed'
+  | 'provider_response_incomplete'
+  | 'provider_error'
+  | 'provider_cancel_not_active'
+  | 'provider_protocol_error'
+  | 'relay_buffer_limit'
+  | 'relay_transport_unavailable';
 export interface RelayOptions {
   actionsEnabled?: boolean;
   transfersEnabled?: boolean;
-  outcome?: string | null;
   now?: () => number;
   onTool?: (request: VoiceToolRequest) => Promise<'controlled' | 'unavailable'>;
+  onDiagnostic?: (code: RelayDiagnosticCode) => void;
 }
 
-function toolsFor(options: RelayOptions): RealtimeFunctionTool[] {
+export function toolsFor(options: RelayOptions): RealtimeFunctionTool[] {
   const result: RealtimeFunctionTool[] = [];
   if (options.actionsEnabled) {
     result.push({
@@ -122,6 +142,7 @@ export class AudioRelay {
   private awaitingCancelledResponse: string | undefined;
   private responseRequested = false;
   private readonly cancelledResponses = new Set<string>();
+  private readonly cancellationEvents = new Map<string, string>();
   private readonly playback = new Map<string, Playback>();
   private readonly marks = new Map<string, { key: string; endMs: number }>();
   private markCounter = 0;
@@ -181,11 +202,12 @@ export class AudioRelay {
   input(payload: string, receivedAt = (this.options.now ?? Date.now)()): void {
     if (this.closed || this.controlled) return;
     const audio = decodeAudio(payload, 3200);
-    if (!audio) return this.close();
+    if (!audio) return this.close('provider_protocol_error');
     this.firstInputAt ??= receivedAt;
     if (!this.ready) {
       this.pendingInputBytes += audio.length;
-      if (this.pendingInputBytes > 16_000 || this.pendingInput.length >= 150) return this.close();
+      if (this.pendingInputBytes > 16_000 || this.pendingInput.length >= 150)
+        return this.close('relay_buffer_limit');
       this.pendingInput.push(payload);
       return;
     }
@@ -195,7 +217,7 @@ export class AudioRelay {
 
   providerEvent(raw: string): void {
     if (this.closed) return;
-    if (Buffer.byteLength(raw) > 192 * 1024) return this.close();
+    if (Buffer.byteLength(raw) > 192 * 1024) return this.close('relay_buffer_limit');
     try {
       const event = providerEnvelope.parse(JSON.parse(raw));
       if (this.controlled && !['response.done', 'error'].includes(event.type)) return;
@@ -209,57 +231,57 @@ export class AudioRelay {
           }
           this.pendingInput = [];
           this.pendingInputBytes = 0;
-          this.sendProvider({
-            type: 'response.create',
-            response: {
-              instructions: this.options.outcome
-                ? `Briefly explain the authoritative server result: ${JSON.stringify(this.options.outcome)}. Then ask how else you can help. Never claim a confirmed table unless the result explicitly says so.`
-                : 'Briefly greet the caller as the restaurant AI test receptionist and ask how you can help. Explain only currently enabled capabilities and never promise a confirmed table.',
-            },
-          });
+          // Per-response instructions replace the session prompt. Keep the full
+          // language, knowledge and outcome rules for the opening response too.
+          this.sendProvider({ type: 'response.create' });
           break;
         case 'response.created': {
           const response = responseEvent.parse(event);
           if (this.activeResponse && this.activeResponse !== response.response.id)
-            return this.close();
+            return this.close('provider_protocol_error');
           this.activeResponse = response.response.id;
           this.responseUtteranceAt = this.currentUtteranceAt;
           break;
         }
         case 'response.done': {
           const response = responseDoneEvent.parse(event);
+          if (response.response.status === 'failed') return this.close('provider_response_failed');
+          if (response.response.status === 'incomplete') {
+            const faqResponseLimit =
+              !this.options.actionsEnabled &&
+              !this.options.transfersEnabled &&
+              response.response.status_details?.reason === 'max_output_tokens' &&
+              (this.activeResponse === response.response.id ||
+                this.cancelledResponses.has(response.response.id));
+            if (!faqResponseLimit) return this.close('provider_response_incomplete');
+            // The bounded FAQ answer can finish playing. The next caller turn,
+            // rather than an automatic continuation, requests another answer.
+            this.diagnose('provider_response_limit');
+          }
           if (
-            response.response.status === 'failed' ||
-            response.response.status === 'incomplete' ||
-            (response.response.status === 'cancelled' &&
-              !this.cancelledResponses.has(response.response.id))
+            response.response.status === 'cancelled' &&
+            !this.cancelledResponses.has(response.response.id)
           )
-            return this.close();
+            return this.close('provider_protocol_error');
           if (this.activeResponse === response.response.id) this.activeResponse = undefined;
           if (this.awaitingCancelledResponse === response.response.id)
             this.awaitingCancelledResponse = undefined;
           this.prunePlayedItems();
-          if (
-            this.responseRequested &&
-            !this.controlled &&
-            !this.activeResponse &&
-            !this.awaitingCancelledResponse
-          ) {
-            this.responseRequested = false;
-            this.sendProvider({ type: 'response.create' });
-          }
+          this.resumeRequestedResponse();
           break;
         }
         case 'response.output_audio.delta': {
           const delta = audioEvent.parse(event);
           if (this.cancelledResponses.has(delta.response_id)) return;
-          if (!this.ready || this.activeResponse !== delta.response_id) return this.close();
+          if (!this.ready || this.activeResponse !== delta.response_id)
+            return this.close('provider_protocol_error');
           const audio = decodeAudio(delta.delta, 96 * 1024);
-          if (!audio) return this.close();
+          if (!audio) return this.close('provider_protocol_error');
           const key = `${delta.item_id}:${delta.content_index}`;
           const existing = this.playback.get(key);
-          if (!existing && this.playback.size >= 16) return this.close();
-          if (existing && existing.responseId !== delta.response_id) return this.close();
+          if (!existing && this.playback.size >= 16) return this.close('relay_buffer_limit');
+          if (existing && existing.responseId !== delta.response_id)
+            return this.close('provider_protocol_error');
           const item: Playback = existing ?? {
             itemId: delta.item_id,
             contentIndex: delta.content_index,
@@ -271,7 +293,7 @@ export class AudioRelay {
           // G.711 μ-law is 8 kHz, one byte/sample. Marks every <=100 ms bound
           // conservative playback accounting without guessing from wall time.
           for (let offset = 0; offset < audio.length; offset += 800) {
-            if (this.marks.size >= 200) return this.close();
+            if (this.marks.size >= 200) return this.close('relay_buffer_limit');
             const part = audio.subarray(offset, offset + 800);
             item.sentMs += part.length / 8;
             const mark = `p${++this.markCounter}`;
@@ -361,16 +383,29 @@ export class AudioRelay {
         case 'response.function_call_arguments.done':
           this.handleTool(event);
           break;
-        case 'error':
+        case 'error': {
           // Provider error bodies can contain sensitive data; never log or forward them.
-          this.close();
+          const cancellation = cancelNotActiveEvent.safeParse(event);
+          const responseId = cancellation.success
+            ? this.cancellationEvents.get(cancellation.data.error.event_id)
+            : undefined;
+          if (!cancellation.success || !responseId) return this.close('provider_error');
+          this.cancellationEvents.delete(cancellation.data.error.event_id);
+          if (this.awaitingCancelledResponse === responseId)
+            this.awaitingCancelledResponse = undefined;
+          // A completion can race with our cancellation. Its correlated error
+          // says only that this cancellation was unnecessary, not that a newer
+          // response or the provider session has failed.
+          this.diagnose('provider_cancel_not_active');
+          this.resumeRequestedResponse();
           break;
+        }
         default:
           // Transcription, tool, and non-audio content is neither retained nor executed.
           break;
       }
     } catch {
-      this.close();
+      this.close('provider_protocol_error');
     }
   }
 
@@ -464,6 +499,18 @@ export class AudioRelay {
     else this.sendProvider({ type: 'response.create' });
   }
 
+  private resumeRequestedResponse(): void {
+    if (
+      this.responseRequested &&
+      !this.controlled &&
+      !this.activeResponse &&
+      !this.awaitingCancelledResponse
+    ) {
+      this.responseRequested = false;
+      this.sendProvider({ type: 'response.create' });
+    }
+  }
+
   played(mark: string): void {
     const sent = this.marks.get(mark);
     if (!sent || this.closed) return;
@@ -482,10 +529,19 @@ export class AudioRelay {
 
   private interrupt(): void {
     if (this.activeResponse) {
-      if (this.cancelledResponses.size >= 1000) return this.close();
+      if (this.cancelledResponses.size >= 1000 || this.cancellationEvents.size >= 1000)
+        return this.close('relay_buffer_limit');
       this.cancelledResponses.add(this.activeResponse);
       this.awaitingCancelledResponse = this.activeResponse;
-      this.sendProvider({ type: 'response.cancel', response_id: this.activeResponse });
+      const eventId = randomUUID();
+      // Retain correlation after response.done: a cancellation error may arrive
+      // later. Both this map and the cancelled-response history are bounded.
+      this.cancellationEvents.set(eventId, this.activeResponse);
+      this.sendProvider({
+        type: 'response.cancel',
+        response_id: this.activeResponse,
+        event_id: eventId,
+      });
       this.activeResponse = undefined;
     }
     if (this.marks.size > 0) this.send(this.twilio, { event: 'clear', streamSid: this.streamSid });
@@ -511,16 +567,26 @@ export class AudioRelay {
 
   private send(peer: AudioPeer, event: object): void {
     if (this.closed) return;
-    if (peer.readyState !== 1 || peer.bufferedAmount > 256 * 1024) return this.close();
+    if (peer.readyState !== 1) return this.close('relay_transport_unavailable');
+    if (peer.bufferedAmount > 256 * 1024) return this.close('relay_buffer_limit');
     try {
       peer.send(JSON.stringify(event));
     } catch {
-      this.close();
+      this.close('relay_transport_unavailable');
     }
   }
 
-  close(): void {
+  private diagnose(code: RelayDiagnosticCode): void {
+    try {
+      this.options.onDiagnostic?.(code);
+    } catch {
+      // Observability must not alter relay control or expose provider payloads.
+    }
+  }
+
+  close(reason?: RelayDiagnosticCode): void {
     if (this.closed) return;
+    if (reason) this.diagnose(reason);
     // Closing a stream does not prove Twilio has discarded queued playback.
     // Clear before setting closed so stale speech is removed on policy failure.
     if (this.marks.size > 0 && this.twilio.readyState === 1) {
@@ -536,6 +602,7 @@ export class AudioRelay {
     this.playback.clear();
     this.marks.clear();
     this.cancelledResponses.clear();
+    this.cancellationEvents.clear();
     this.utterances.clear();
     this.dateReferences.clear();
     this.toolCalls.clear();

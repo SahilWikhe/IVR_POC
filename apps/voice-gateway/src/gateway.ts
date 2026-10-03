@@ -1,14 +1,33 @@
+import { randomUUID } from 'node:crypto';
 import Fastify, { type FastifyRequest } from 'fastify';
+import { logEvent, type OperationalEvent } from '@hostline/observability';
 import formbody from '@fastify/formbody';
 import websocket from '@fastify/websocket';
 import twilio from 'twilio';
 import WebSocket from 'ws';
 import { z } from 'zod';
 import type { EnabledVoiceConfig, VoiceConfig } from './config.js';
-import { voiceInstructions } from './context.js';
+import {
+  voiceInstructions,
+  liveVoiceInstructions,
+  liveBackendInstructions,
+  liveOpening,
+} from './context.js';
+import {
+  LiveAudioRelay,
+  type LiveDelegationInput,
+  type LiveDelegationResult,
+} from './live-relay.js';
+import { createLiveBackend } from './live-backend.js';
 import { createVoiceApiClient, type VoiceApiClient } from './client.js';
 import { createCallController, type CallController, type CallControlResult } from './control.js';
-import { AudioRelay, decodeAudio, type AudioPeer, type VoiceToolRequest } from './relay.js';
+import {
+  AudioRelay,
+  decodeAudio,
+  type AudioPeer,
+  type RelayDiagnosticCode,
+  type VoiceToolRequest,
+} from './relay.js';
 
 const callSidSchema = z.string().regex(/^CA[0-9a-fA-F]{32}$/);
 const streamSidSchema = z.string().regex(/^MZ[0-9a-fA-F]{32}$/);
@@ -78,7 +97,27 @@ export interface VoiceDependencies {
   controller?: CallController;
   connectProvider?: (config: EnabledVoiceConfig) => ProviderSocket;
   now?: () => number;
+  onDiagnostic?: (event: OperationalEvent) => void;
+  delegate?: (input: LiveDelegationInput) => Promise<LiveDelegationResult>;
 }
+
+type StreamCloseCode =
+  | 'stream_closed'
+  | 'start_timeout'
+  | 'provider_setup_timeout'
+  | 'duration_limit'
+  | 'policy_denied'
+  | 'policy_unavailable'
+  | 'provider_protocol_invalid'
+  | 'response_buffer_limit'
+  | 'provider_closed'
+  | 'provider_socket_error'
+  | 'provider_setup_failed'
+  | 'media_protocol_invalid'
+  | 'media_rate_limit'
+  | 'input_buffer_limit'
+  | 'caller_stopped'
+  | 'media_socket_error';
 
 function signature(
   config: EnabledVoiceConfig,
@@ -124,7 +163,9 @@ function signedCall(
 function openProvider(config: EnabledVoiceConfig): WebSocket {
   // Fixed provider host, no model-selected URLs, redirects, or client credentials.
   return new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(config.model)}`,
+    config.model === 'gpt-live-1'
+      ? 'wss://api.openai.com/v1/live/sessions'
+      : `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(config.model)}`,
     {
       headers: { Authorization: `Bearer ${config.openaiKey}` },
       handshakeTimeout: 5000,
@@ -157,6 +198,8 @@ export async function createVoiceGateway(
     liveVoiceEnabled: config.enabled,
     mode: config.enabled ? 'sandbox' : 'disabled',
     productionReady: false,
+    voiceModel: config.enabled ? config.model : null,
+    taskModel: config.enabled && config.model === 'gpt-live-1' ? config.backendModel : null,
     reservationRequestsEnabled: config.enabled && config.actionsEnabled,
     reservationWritesEnabled: false,
     transfersEnabled: config.enabled && config.transfersEnabled,
@@ -333,6 +376,19 @@ export async function createVoiceGateway(
         return;
       }
       sockets.add(socket);
+      // Correlation is local and random; never log provider IDs, grants or content.
+      const diagnosticId = randomUUID();
+      const diagnose = (
+        event: 'voice.stream_closed' | 'voice.relay',
+        code: StreamCloseCode | RelayDiagnosticCode,
+      ) => {
+        try {
+          (dependencies.onDiagnostic ?? logEvent)({ event, requestId: diagnosticId, code });
+        } catch {
+          // A diagnostic sink failure must not prevent stream cleanup.
+        }
+      };
+      let closeCode: StreamCloseCode = 'stream_closed';
       const controlCancellation = new AbortController();
       let closed = false;
       let connected = false;
@@ -341,7 +397,7 @@ export async function createVoiceGateway(
       let callExpiresAt: number | undefined;
       let streamSid: string | undefined;
       let provider: ProviderSocket | undefined;
-      let relay: AudioRelay | undefined;
+      let relay: AudioRelay | LiveAudioRelay | undefined;
       let lastSequence = -1;
       let lastTimestamp = -1;
       let windowStart = now();
@@ -365,6 +421,7 @@ export async function createVoiceGateway(
       const close = () => {
         if (closed) return;
         closed = true;
+        diagnose('voice.stream_closed', closeCode);
         controlCancellation.abort();
         clearTimeout(startTimer);
         if (providerTimer) clearTimeout(providerTimer);
@@ -378,7 +435,7 @@ export async function createVoiceGateway(
         relay?.close();
         // terminate a pending connection instead of leaving handshake work alive.
         if (provider?.readyState === WebSocket.CONNECTING) provider.terminate();
-        else provider?.close(1000, 'Session ended');
+        else if (config.model !== 'gpt-live-1' || !relay) provider?.close(1000, 'Session ended');
         socket.close(1000, 'Session ended');
         if (callSid) {
           const registered = activeCalls.get(callSid);
@@ -393,7 +450,11 @@ export async function createVoiceGateway(
             });
         }
       };
-      const startTimer = setTimeout(close, 5000);
+      const fail = (code: StreamCloseCode) => {
+        closeCode = code;
+        close();
+      };
+      const startTimer = setTimeout(() => fail('start_timeout'), 5000);
       startTimer.unref();
 
       const checkPolicy = (force = false): Promise<boolean> => {
@@ -433,7 +494,7 @@ export async function createVoiceGateway(
               (policyCapabilities?.actionsEnabled && !policy.actionsEnabled) ||
               (policyCapabilities?.transfersEnabled && !policy.transfersEnabled)
             ) {
-              close();
+              fail('policy_denied');
               return false;
             }
             policyCheckedAt = now();
@@ -442,7 +503,7 @@ export async function createVoiceGateway(
           .catch(() => {
             // A heartbeat that began during audio must not cancel a control
             // already owned and reauthorized by the API's dispatch boundary.
-            if (!controlOwned) close();
+            if (!controlOwned) fail('policy_unavailable');
             return false;
           })
           .finally(() => {
@@ -469,9 +530,14 @@ export async function createVoiceGateway(
       };
 
       const receiveProviderEvent = (raw: string) => {
-        if (closed) return;
+        if (closed) {
+          // Only the Live relay's bounded finalization listener remains active.
+          // Its closed state discards content and accepts session.closed alone.
+          if (config.model === 'gpt-live-1') relay?.providerEvent(raw);
+          return;
+        }
         const bytes = Buffer.byteLength(raw);
-        if (bytes > 192 * 1024) return close();
+        if (bytes > 192 * 1024) return fail('provider_protocol_invalid');
         let type: string;
         try {
           const event = z
@@ -479,6 +545,51 @@ export async function createVoiceGateway(
             .passthrough()
             .parse(JSON.parse(raw));
           type = event.type;
+          if (config.model === 'gpt-live-1') {
+            // Live has continuous output rather than Realtime response boundaries.
+            // Caller fragments bypass this output queue so newer corrections can
+            // invalidate backend work even while permission is being refreshed.
+            if (type === 'session.input_transcript.delta' || type === 'error') {
+              relay?.providerEvent(raw);
+              return;
+            }
+            if (
+              validatingResponse ||
+              type === 'session.output_audio.delta' ||
+              type === 'session.delegation.created'
+            ) {
+              responseQueueBytes += bytes;
+              if (type === 'session.output_audio.delta') {
+                const audio = z.object({ delta: z.string().max(128 * 1024) }).parse(event);
+                const decoded = decodeAudio(audio.delta, 96 * 1024);
+                if (!decoded) return fail('provider_protocol_invalid');
+                responseQueueAudioBytes += decoded.length;
+              }
+              if (
+                responseQueue.length >= 64 ||
+                responseQueueBytes > 192 * 1024 ||
+                responseQueueAudioBytes > 16_000
+              )
+                return fail('response_buffer_limit');
+              responseQueue.push(raw);
+              if (!validatingResponse) {
+                validatingResponse = true;
+                void checkPolicy().then((allowed) => {
+                  if (!allowed || closed) return;
+                  const events = responseQueue;
+                  responseQueue = [];
+                  responseQueueBytes = 0;
+                  responseQueueAudioBytes = 0;
+                  validatingResponse = false;
+                  for (const eventRaw of events) {
+                    if (closed) break;
+                    relay?.providerEvent(eventRaw);
+                  }
+                });
+              }
+              return;
+            }
+          }
           if (validatingResponse && type === 'input_audio_buffer.speech_started') {
             // Barge-in must clear/cancel promptly even while output permission
             // is being checked. The response metadata was registered below.
@@ -510,7 +621,7 @@ export async function createVoiceGateway(
             if (type === 'response.output_audio.delta') {
               const audio = z.object({ delta: z.string().max(128 * 1024) }).parse(event);
               const decoded = decodeAudio(audio.delta, 96 * 1024);
-              if (!decoded) return close();
+              if (!decoded) return fail('provider_protocol_invalid');
               responseQueueAudioBytes += decoded.length;
             }
             if (
@@ -518,12 +629,12 @@ export async function createVoiceGateway(
               responseQueueBytes > 192 * 1024 ||
               responseQueueAudioBytes > 16_000
             )
-              return close();
+              return fail('response_buffer_limit');
             responseQueue.push(raw);
             return;
           }
         } catch {
-          return close();
+          return fail('provider_protocol_invalid');
         }
         relay?.providerEvent(raw);
         if (relay?.isReady && providerTimer) clearTimeout(providerTimer);
@@ -645,9 +756,12 @@ export async function createVoiceGateway(
             transfersEnabled: config.transfersEnabled && context.transfersEnabled,
           };
           const remainingMs = callExpiresAt - now();
-          if (remainingMs <= 0) return close();
+          if (remainingMs <= 0) return fail('duration_limit');
           if (durationTimer) clearTimeout(durationTimer);
-          durationTimer = setTimeout(close, Math.min(remainingMs, config.maxCallSeconds * 1000));
+          durationTimer = setTimeout(
+            () => fail('duration_limit'),
+            Math.min(remainingMs, config.maxCallSeconds * 1000),
+          );
           durationTimer.unref();
           if (!(await checkPolicy(true)) || closed) return;
           schedulePolicy();
@@ -656,25 +770,45 @@ export async function createVoiceGateway(
             outcome: context.outcome,
           };
           provider = connect(config);
-          relay = new AudioRelay(socket, provider, streamSid, close, {
+          const relayOptions = {
             ...capabilities,
             now,
             onTool: executeTool,
-          });
+            onDiagnostic: (code: RelayDiagnosticCode) => diagnose('voice.relay', code),
+          };
+          relay =
+            config.model === 'gpt-live-1'
+              ? new LiveAudioRelay(socket, provider, streamSid, close, {
+                  ...relayOptions,
+                  opening: liveOpening(context.restaurant, capabilities),
+                  onDelegate:
+                    dependencies.delegate ??
+                    createLiveBackend({
+                      ...capabilities,
+                      apiKey: config.openaiKey,
+                      model: config.backendModel,
+                      instructions: liveBackendInstructions(context.restaurant, capabilities),
+                    }),
+                })
+              : new AudioRelay(socket, provider, streamSid, close, relayOptions);
           for (const input of pending) relay.input(input.payload, input.receivedAt);
           pending = [];
           pendingBytes = 0;
           provider.on('open', () =>
-            relay?.configure(voiceInstructions(context.restaurant, capabilities)),
+            relay?.configure(
+              config.model === 'gpt-live-1'
+                ? liveVoiceInstructions(context.restaurant, capabilities)
+                : voiceInstructions(context.restaurant, capabilities),
+            ),
           );
           provider.on('message', (data, binary) => {
-            if (binary) return close();
+            if (binary) return fail('provider_protocol_invalid');
             receiveProviderEvent(data.toString());
           });
-          provider.on('close', close);
-          provider.on('error', close);
+          provider.on('close', () => fail('provider_closed'));
+          provider.on('error', () => fail('provider_socket_error'));
         } catch {
-          close();
+          fail('provider_setup_failed');
         }
       };
 
@@ -682,22 +816,23 @@ export async function createVoiceGateway(
       socket.on('message', (data, binary) => {
         if (closed) return;
         try {
-          if (binary || Buffer.byteLength(data.toString()) > 8192) return close();
+          if (binary || Buffer.byteLength(data.toString()) > 8192)
+            return fail('media_protocol_invalid');
           const tick = now();
           if (tick - windowStart >= 1000) {
             windowStart = tick;
             frameCount = 0;
             audioBytes = 0;
           }
-          if (++frameCount > 250) return close();
+          if (++frameCount > 250) return fail('media_rate_limit');
           const event = mediaEvent.parse(JSON.parse(data.toString()));
           if (event.event === 'connected') {
-            if (connected || streamSid) return close();
+            if (connected || streamSid) return fail('media_protocol_invalid');
             connected = true;
             return;
           }
           const currentSequence = Number(event.sequenceNumber);
-          if (currentSequence <= lastSequence) return close();
+          if (currentSequence <= lastSequence) return fail('media_protocol_invalid');
           lastSequence = currentSequence;
           if (event.event === 'start') {
             if (
@@ -706,16 +841,16 @@ export async function createVoiceGateway(
               event.start.accountSid !== config.accountSid ||
               event.start.streamSid !== event.streamSid
             )
-              return close();
+              return fail('media_protocol_invalid');
             callSid = event.start.callSid;
             const registered = activeCalls.get(callSid) ?? new Set<() => void>();
             registered.add(close);
             activeCalls.set(callSid, registered);
             streamSid = event.streamSid;
             clearTimeout(startTimer);
-            durationTimer = setTimeout(close, config.maxCallSeconds * 1000);
+            durationTimer = setTimeout(() => fail('duration_limit'), config.maxCallSeconds * 1000);
             durationTimer.unref();
-            providerTimer = setTimeout(close, 10_000);
+            providerTimer = setTimeout(() => fail('provider_setup_timeout'), 10_000);
             providerTimer.unref();
             void startProvider(
               event.start.callSid,
@@ -724,7 +859,7 @@ export async function createVoiceGateway(
             );
             return;
           }
-          if (!streamSid || event.streamSid !== streamSid) return close();
+          if (!streamSid || event.streamSid !== streamSid) return fail('media_protocol_invalid');
           if (event.event === 'media') {
             const audio = decodeAudio(event.media.payload, 3200);
             const timestamp = Number(event.media.timestamp);
@@ -733,32 +868,32 @@ export async function createVoiceGateway(
               timestamp < lastTimestamp ||
               timestamp > config.maxCallSeconds * 1000 + 1000
             )
-              return close();
+              return fail('media_protocol_invalid');
             lastTimestamp = timestamp;
             audioBytes += audio.length;
-            if (audioBytes > 24_000) return close();
+            if (audioBytes > 24_000) return fail('media_rate_limit');
             if (relay) relay.input(event.media.payload, tick);
             else {
               pendingBytes += audio.length;
-              if (pendingBytes > 16_000 || pending.length >= 150) return close();
+              if (pendingBytes > 16_000 || pending.length >= 150) return fail('input_buffer_limit');
               pending.push({ payload: event.media.payload, receivedAt: tick });
             }
           } else if (event.event === 'mark') relay?.played(event.mark.name);
           else if (event.event === 'stop') {
             if (event.stop.callSid !== callSid || event.stop.accountSid !== config.accountSid)
-              return close();
-            close();
+              return fail('media_protocol_invalid');
+            fail('caller_stopped');
           }
           // DTMF grants no authority and never executes a command.
         } catch {
-          close();
+          fail('media_protocol_invalid');
         }
       });
       socket.on('close', () => {
         sockets.delete(socket);
         close();
       });
-      socket.on('error', close);
+      socket.on('error', () => fail('media_socket_error'));
     },
   );
 

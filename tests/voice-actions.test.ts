@@ -8,6 +8,7 @@ import { createVoiceApiClient } from '../apps/voice-gateway/src/client.js';
 import { loadVoiceConfig, type EnabledVoiceConfig } from '../apps/voice-gateway/src/config.js';
 
 const environment = {
+  OPENAI_REALTIME_MODEL: 'gpt-realtime',
   LIVE_VOICE_ENABLED: 'true',
   VOICE_MODE: 'sandbox',
   VOICE_ACTIONS_ENABLED: 'true',
